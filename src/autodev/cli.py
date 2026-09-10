@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .orchestrator import AutonomousRunner
+from .dashboard import DashboardController, serve_dashboard
 from .providers import OllamaProvider, RoleModelProvider, ScriptedProvider
 from .state_store import StateStore
 from .tools import WorkspaceTools
@@ -153,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_requirement = requirement_commands.add_parser("add")
     add_requirement.add_argument("workspace", type=Path)
     add_requirement.add_argument("text")
+    dashboard = commands.add_parser("dashboard", help="serve a local status and control dashboard")
+    dashboard.add_argument("workspace", type=Path)
+    dashboard.add_argument("--config", type=Path)
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8765)
     return parser
 
 
@@ -173,6 +179,11 @@ def main(argv: list[str] | None = None) -> int:
             runner = make_runner(workspace, AppConfig(), scripted=True)
             runner.add_requirement(args.text)
             print(format_status(workspace))
+            return 0
+        if args.command == "dashboard":
+            config = load_config(args.config)
+            runner = make_runner(workspace, config)
+            serve_dashboard(StateStore(workspace), DashboardController(runner), args.host, args.port)
             return 0
         if args.command in {"pause", "stop"}:
             runner = make_runner(workspace, AppConfig(), scripted=True)
