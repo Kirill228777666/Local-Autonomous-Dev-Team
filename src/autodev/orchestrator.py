@@ -9,7 +9,7 @@ from typing import Callable
 
 from .agents import RoleAgents
 from .git import GitError, GitRepository
-from .models import ProjectState, Task, TaskStatus
+from .models import Heartbeat, ProjectState, Task, TaskStatus
 from .providers import LLMProvider, ProviderError
 from .regression import RegressionRunner
 from .state_store import StateStore
@@ -49,6 +49,7 @@ class AutonomousRunner:
         if state.status in {"PAUSED", "STOPPED", "COMPLETE"}:
             return state
         state.status = "RUNNING"
+        self._mark(state, "MANAGER", "PLANNING", "Autonomous run started")
         if not state.tasks:
             self._plan(state)
         if state.status == "BLOCKED":
@@ -72,7 +73,9 @@ class AutonomousRunner:
         if blocked:
             state.status = "BLOCKED"
             state.run_history.append("Completion blocked by unresolved tasks: " + ", ".join(task.title for task in blocked))
+            self._mark(state, "SYSTEM", "BLOCKED", "Completion blocked by unresolved tasks")
             return
+        self._mark(state, "FINAL_QA", "REGRESSION", "Running full regression")
         regression = self.regression_runner.run()
         state.regression_history.append(regression.summary)
         state.run_history.append(regression.summary)
@@ -80,8 +83,10 @@ class AutonomousRunner:
             state.tasks.append(Task.create("Restore full regression", regression.summary))
             state.final_qa_status = "NOT_RUN"
             state.run_history.append("Regression failed; created corrective task")
+            self._mark(state, "MANAGER", "CORRECTIVE", "Regression failed; corrective task created")
             return
         try:
+            self._mark(state, "FINAL_QA", "REVIEW", "Final QA evaluating completed project")
             reply = self.agents.final_qa(state, regression.summary + "\nGit diff:\n" + self._git_diff()).data
         except ProviderError as error:
             state.status = "BLOCKED"
@@ -94,6 +99,7 @@ class AutonomousRunner:
             state.final_qa_findings = []
             state.status = "COMPLETE"
             state.run_history.append("Final QA passed; project complete")
+            self._mark(state, "FINAL_QA", "COMPLETE", "Final QA passed; project complete")
             return
         if status != "FAIL" or not isinstance(findings, list):
             state.status = "BLOCKED"
@@ -113,6 +119,7 @@ class AutonomousRunner:
             state.run_history.append("Final QA failed without actionable findings")
             return
         state.run_history.append("Final QA failed; created corrective tasks")
+        self._mark(state, "MANAGER", "CORRECTIVE", "Final QA failed; corrective tasks created")
 
     def pause(self) -> ProjectState:
         return self._set_control_status("PAUSED")
@@ -124,6 +131,19 @@ class AutonomousRunner:
         state = self._required_state()
         if state.status == "STOPPED":
             raise ValueError("stopped projects cannot resume; start a new run explicitly")
+        interrupted = next(
+            (
+                task
+                for task in state.tasks
+                if task.id == state.current_task_id and task.status in {TaskStatus.RUNNING, TaskStatus.TESTING, TaskStatus.REVIEW}
+            ),
+            None,
+        )
+        if interrupted is not None:
+            interrupted.status = TaskStatus.PENDING
+            state.current_task_id = None
+            state.run_history.append(f"Recovered interrupted task: {interrupted.title}")
+            state.record_event("SYSTEM", "RECOVERY", f"Recovered interrupted task: {interrupted.title}", interrupted.id)
         state.status = "READY"
         state.run_history.append("Run resumed")
         self.store.save(state)
@@ -182,6 +202,7 @@ class AutonomousRunner:
         task.status = TaskStatus.RUNNING
         state.current_task_id = task.id
         task.attempts += 1
+        self._mark(state, "CODER", "IMPLEMENTING", f"Coder started attempt {task.attempts}: {task.title}", task)
         try:
             actions = self.agents.code(state, task).data.get("actions")
             if not isinstance(actions, list):
@@ -200,6 +221,7 @@ class AutonomousRunner:
 
         task.status = TaskStatus.TESTING
         try:
+            self._mark(state, "TESTER", "TESTING", f"Tester verifying: {task.title}", task)
             reply = self.agents.test(state, task).data
             command = reply.get("command")
             if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
@@ -215,6 +237,7 @@ class AutonomousRunner:
 
         task.status = TaskStatus.REVIEW
         try:
+            self._mark(state, "REVIEWER", "REVIEW", f"Reviewer evaluating: {task.title}", task)
             evidence = self._result_log(task, result) + "\nGit diff:\n" + self._git_diff()
             review = self.agents.review(state, task, evidence).data
             if review.get("approved") is not True:
@@ -233,6 +256,7 @@ class AutonomousRunner:
         task.status = TaskStatus.DONE
         state.current_task_id = None
         state.run_history.append(f"Task approved and checkpointed: {task.title}")
+        self._mark(state, "GIT", "CHECKPOINT", f"Task approved and checkpointed: {task.title}", task)
 
     def _execute_action(self, action: object) -> None:
         if not isinstance(action, dict):
@@ -294,3 +318,15 @@ class AutonomousRunner:
             return GitRepository(self.workspace).diff()
         except GitError:
             return "Git diff unavailable"
+
+    def _mark(self, state: ProjectState, agent: str, phase: str, message: str, task: Task | None = None) -> None:
+        state.heartbeat = Heartbeat(
+            agent=agent,
+            phase=phase,
+            task_id=task.id if task is not None else state.current_task_id,
+            last_successful_action=message,
+            consecutive_failures=sum(1 for item in (task.errors if task is not None else []) if item),
+            attempt=task.attempts if task is not None else 0,
+        )
+        state.record_event(agent, phase, message, task.id if task is not None else state.current_task_id)
+        self.store.save(state)

@@ -41,6 +41,7 @@ def test_final_qa_pass_is_required_before_runner_completes(tmp_path: Path) -> No
 
     assert state.status == "COMPLETE"
     assert state.final_qa_status == "PASS"
+    assert state.heartbeat.phase == "COMPLETE"
     assert any("Final QA passed" in event for event in state.run_history)
 
 

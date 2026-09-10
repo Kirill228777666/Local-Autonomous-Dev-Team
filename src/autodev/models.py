@@ -12,6 +12,62 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+@dataclass(slots=True)
+class Heartbeat:
+    timestamp: str = field(default_factory=utc_now)
+    agent: str = "IDLE"
+    phase: str = "IDLE"
+    task_id: str | None = None
+    last_successful_action: str = ""
+    last_model_response: str = ""
+    last_tool_execution: str = ""
+    consecutive_failures: int = 0
+    attempt: int = 0
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> Heartbeat:
+        return cls(
+            timestamp=str(value.get("timestamp", utc_now())),
+            agent=str(value.get("agent", "IDLE")),
+            phase=str(value.get("phase", "IDLE")),
+            task_id=str(value["task_id"]) if value.get("task_id") else None,
+            last_successful_action=str(value.get("last_successful_action", "")),
+            last_model_response=str(value.get("last_model_response", "")),
+            last_tool_execution=str(value.get("last_tool_execution", "")),
+            consecutive_failures=int(value.get("consecutive_failures", 0)),
+            attempt=int(value.get("attempt", 0)),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ActivityEvent:
+    timestamp: str
+    agent: str
+    phase: str
+    message: str
+    task_id: str | None = None
+
+    @classmethod
+    def create(cls, agent: str, phase: str, message: str, task_id: str | None = None) -> ActivityEvent:
+        return cls(utc_now(), agent, phase, message, task_id)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> ActivityEvent:
+        return cls(
+            timestamp=str(value.get("timestamp", utc_now())),
+            agent=str(value.get("agent", "SYSTEM")),
+            phase=str(value.get("phase", "INFO")),
+            message=str(value.get("message", "")),
+            task_id=str(value["task_id"]) if value.get("task_id") else None,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 class TaskStatus(StrEnum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -69,6 +125,8 @@ class ProjectState:
     final_qa_status: str = "NOT_RUN"
     final_qa_findings: list[str] = field(default_factory=list)
     regression_history: list[str] = field(default_factory=list)
+    heartbeat: Heartbeat = field(default_factory=Heartbeat)
+    events: list[ActivityEvent] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
     run_history: list[str] = field(default_factory=list)
 
@@ -96,6 +154,8 @@ class ProjectState:
             final_qa_status=str(value.get("final_qa_status", "NOT_RUN")),
             final_qa_findings=[str(finding) for finding in value.get("final_qa_findings", [])],  # type: ignore[arg-type]
             regression_history=[str(result) for result in value.get("regression_history", [])],  # type: ignore[arg-type]
+            heartbeat=Heartbeat.from_dict(value.get("heartbeat", {})),  # type: ignore[arg-type]
+            events=[ActivityEvent.from_dict(event) for event in value.get("events", [])],  # type: ignore[arg-type]
             decisions=[str(decision) for decision in value.get("decisions", [])],  # type: ignore[arg-type]
             run_history=[str(entry) for entry in value.get("run_history", [])],  # type: ignore[arg-type]
         )
@@ -113,6 +173,12 @@ class ProjectState:
             "final_qa_status": self.final_qa_status,
             "final_qa_findings": self.final_qa_findings,
             "regression_history": self.regression_history,
+            "heartbeat": self.heartbeat.to_dict(),
+            "events": [event.to_dict() for event in self.events[-500:]],
             "decisions": self.decisions,
             "run_history": self.run_history,
         }
+
+    def record_event(self, agent: str, phase: str, message: str, task_id: str | None = None) -> None:
+        self.events.append(ActivityEvent.create(agent, phase, message, task_id))
+        self.events = self.events[-500:]

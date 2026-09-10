@@ -67,3 +67,8 @@ class StateStore:
         (self.directory / "logs" / "events.log").write_text(
             "\n".join(state.run_history) + "\n", encoding="utf-8"
         )
+        activity = "\n".join(
+            f"{event.timestamp} {event.agent.title():<10} {event.phase:<10} {event.message}"
+            for event in state.events
+        )
+        (self.directory / "activity.log").write_text(activity + "\n", encoding="utf-8")
