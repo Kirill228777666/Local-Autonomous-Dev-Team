@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from .models import ProjectState, utc_now
+from .metrics import write_metrics
 
 
 class StateStore:
@@ -33,6 +34,7 @@ class StateStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         state.updated_at = utc_now()
         self._write_projections(state)
+        write_metrics(self.directory, state)
         temporary_path = self.path.with_suffix(".json.tmp")
         temporary_path.write_text(
             json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n",
