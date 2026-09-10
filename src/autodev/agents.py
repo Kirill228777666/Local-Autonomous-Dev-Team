@@ -13,6 +13,7 @@ ROLE_PROMPTS = {
     "CODER": "You are Coder. Return only a JSON object with an actions array. Use only requested task scope.",
     "TESTER": "You are Tester. Return only JSON with a command array that independently verifies the task.",
     "REVIEWER": "You are Reviewer. Return only JSON: approved boolean and optional reasons array. Do not add scope.",
+    "FINAL_QA": "You are Final QA. Independently compare the completed product against the original specification. Return only JSON with status PASS or FAIL and a findings array. Do not add scope.",
 }
 
 
@@ -57,6 +58,17 @@ class RoleAgents:
 
     def diagnose(self, state: ProjectState, task: Task) -> AgentReply:
         return self._ask("ARCHITECT", self.context.for_task(state, task, []))
+
+    def final_qa(self, state: ProjectState, evidence: str) -> AgentReply:
+        completed = [task.title for task in state.tasks if task.status.value == "DONE"]
+        blocked = [task.title for task in state.tasks if task.status.value == "BLOCKED"]
+        prompt = (
+            f"Original specification:\n{state.original_spec}\n\nCompleted tasks: {completed}\n"
+            f"Blocked tasks: {blocked}\nDecisions: {state.decisions[-8:]}\n\n"
+            f"Independent evidence:\n{evidence}\n\n"
+            "Return {\"status\":\"PASS\"|\"FAIL\",\"findings\":[{\"title\":str,\"description\":str}]}."
+        )
+        return self._ask("FINAL_QA", prompt)
 
     def _ask(self, role: str, prompt: str) -> AgentReply:
         return self.provider.complete(AgentRequest(role=role, prompt=prompt, system_prompt=ROLE_PROMPTS[role]))

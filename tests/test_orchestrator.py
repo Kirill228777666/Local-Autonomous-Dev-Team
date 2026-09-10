@@ -62,6 +62,7 @@ def test_runner_completes_multiple_tasks_and_repairs_a_failed_test(tmp_path: Pat
                 AgentReply({"command": ["py", "-3", "-c", "from pathlib import Path; assert Path('second.txt').read_text() == 'done'"]}),
             ],
             "REVIEWER": [AgentReply({"approved": True}), AgentReply({"approved": True})],
+            "FINAL_QA": [AgentReply({"status": "PASS", "findings": []})],
         }
     )
     runner = AutonomousRunner(

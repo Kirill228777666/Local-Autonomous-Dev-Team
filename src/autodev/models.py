@@ -66,6 +66,9 @@ class ProjectState:
     updated_at: str = field(default_factory=utc_now)
     current_task_id: str | None = None
     last_checkpoint: str | None = None
+    final_qa_status: str = "NOT_RUN"
+    final_qa_findings: list[str] = field(default_factory=list)
+    regression_history: list[str] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
     run_history: list[str] = field(default_factory=list)
 
@@ -90,6 +93,9 @@ class ProjectState:
             last_checkpoint=(
                 str(value["last_checkpoint"]) if value.get("last_checkpoint") else None
             ),
+            final_qa_status=str(value.get("final_qa_status", "NOT_RUN")),
+            final_qa_findings=[str(finding) for finding in value.get("final_qa_findings", [])],  # type: ignore[arg-type]
+            regression_history=[str(result) for result in value.get("regression_history", [])],  # type: ignore[arg-type]
             decisions=[str(decision) for decision in value.get("decisions", [])],  # type: ignore[arg-type]
             run_history=[str(entry) for entry in value.get("run_history", [])],  # type: ignore[arg-type]
         )
@@ -104,6 +110,9 @@ class ProjectState:
             "updated_at": self.updated_at,
             "current_task_id": self.current_task_id,
             "last_checkpoint": self.last_checkpoint,
+            "final_qa_status": self.final_qa_status,
+            "final_qa_findings": self.final_qa_findings,
+            "regression_history": self.regression_history,
             "decisions": self.decisions,
             "run_history": self.run_history,
         }

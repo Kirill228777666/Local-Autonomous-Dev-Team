@@ -11,6 +11,7 @@ from .agents import RoleAgents
 from .git import GitError, GitRepository
 from .models import ProjectState, Task, TaskStatus
 from .providers import LLMProvider, ProviderError
+from .regression import RegressionRunner
 from .state_store import StateStore
 from .tools import CommandResult, ToolPolicyError, WorkspaceTools
 
@@ -23,12 +24,14 @@ class AutonomousRunner:
         tools: WorkspaceTools,
         provider: LLMProvider,
         max_attempts: int = 3,
+        regression_runner: RegressionRunner | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.store = store
         self.tools = tools
         self.agents = RoleAgents(provider)
         self.max_attempts = max_attempts
+        self.regression_runner = regression_runner or RegressionRunner(self.workspace, tools)
 
     def initialize(self, original_spec: str) -> ProjectState:
         existing = self.store.load()
@@ -55,12 +58,61 @@ class AutonomousRunner:
                 break
             task = self._select_next_task(state)
             if task is None:
-                state.status = "COMPLETE" if all(task.status is TaskStatus.DONE for task in state.tasks) else "NEEDS_ATTENTION"
+                self._finish_or_continue(state)
                 self.store.save(state)
-                break
+                if state.status != "RUNNING":
+                    break
+                continue
             self._run_task(state, task)
             self.store.save(state)
         return state
+
+    def _finish_or_continue(self, state: ProjectState) -> None:
+        blocked = [task for task in state.tasks if task.status is TaskStatus.BLOCKED]
+        if blocked:
+            state.status = "BLOCKED"
+            state.run_history.append("Completion blocked by unresolved tasks: " + ", ".join(task.title for task in blocked))
+            return
+        regression = self.regression_runner.run()
+        state.regression_history.append(regression.summary)
+        state.run_history.append(regression.summary)
+        if not regression.passed:
+            state.tasks.append(Task.create("Restore full regression", regression.summary))
+            state.final_qa_status = "NOT_RUN"
+            state.run_history.append("Regression failed; created corrective task")
+            return
+        try:
+            reply = self.agents.final_qa(state, regression.summary + "\nGit diff:\n" + self._git_diff()).data
+        except ProviderError as error:
+            state.status = "BLOCKED"
+            state.run_history.append(f"Final QA unavailable: {error}")
+            return
+        status = reply.get("status")
+        findings = reply.get("findings", [])
+        if status == "PASS":
+            state.final_qa_status = "PASS"
+            state.final_qa_findings = []
+            state.status = "COMPLETE"
+            state.run_history.append("Final QA passed; project complete")
+            return
+        if status != "FAIL" or not isinstance(findings, list):
+            state.status = "BLOCKED"
+            state.run_history.append("Final QA returned an invalid verdict")
+            return
+        state.final_qa_status = "FAIL"
+        state.final_qa_findings = [str(finding) for finding in findings]
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            title = finding.get("title")
+            description = finding.get("description")
+            if isinstance(title, str) and isinstance(description, str):
+                state.tasks.append(Task.create(title, description))
+        if not any(task.status is TaskStatus.PENDING for task in state.tasks):
+            state.status = "BLOCKED"
+            state.run_history.append("Final QA failed without actionable findings")
+            return
+        state.run_history.append("Final QA failed; created corrective tasks")
 
     def pause(self) -> ProjectState:
         return self._set_control_status("PAUSED")

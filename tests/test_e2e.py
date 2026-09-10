@@ -51,6 +51,7 @@ def test_todo_spec_advances_multiple_autonomous_stages_and_persists_progress(tmp
                 AgentReply({"command": ["py", "-3", "app.py"]}),
             ],
             "REVIEWER": [AgentReply({"approved": True}), AgentReply({"approved": True})],
+            "FINAL_QA": [AgentReply({"status": "PASS", "findings": []})],
         }
     )
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
