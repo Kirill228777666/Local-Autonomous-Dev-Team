@@ -41,3 +41,14 @@ def test_load_config_reads_role_model_profile_with_generation_settings(tmp_path:
     assert config.model == "qwen3:14b"
     assert config.profiles["CODER"].model == "qwen2.5-coder:7b"
     assert config.profiles["CODER"].context_budget == 6000
+
+
+def test_cli_adds_requirement_as_a_durable_amendment(tmp_path: Path) -> None:
+    workspace = tmp_path / "app"
+    assert main(["init", str(workspace), "--spec", "Build notes"]) == 0
+
+    assert main(["requirement", "add", str(workspace), "Add JSON export"]) == 0
+
+    state = StateStore(workspace).load()
+    assert state.amendments == ["Add JSON export"]  # type: ignore[union-attr]
+    assert state.tasks[-1].title == "Implement amendment: Add JSON export"  # type: ignore[union-attr]

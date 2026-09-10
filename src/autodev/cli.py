@@ -148,6 +148,11 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("status", "pause", "stop"):
         control = commands.add_parser(name)
         control.add_argument("workspace", type=Path)
+    requirement = commands.add_parser("requirement", help="add a durable requirement amendment")
+    requirement_commands = requirement.add_subparsers(dest="requirement_command", required=True)
+    add_requirement = requirement_commands.add_parser("add")
+    add_requirement.add_argument("workspace", type=Path)
+    add_requirement.add_argument("text")
     return parser
 
 
@@ -162,6 +167,11 @@ def main(argv: list[str] | None = None) -> int:
             print(format_status(workspace))
             return 0
         if args.command == "status":
+            print(format_status(workspace))
+            return 0
+        if args.command == "requirement":
+            runner = make_runner(workspace, AppConfig(), scripted=True)
+            runner.add_requirement(args.text)
             print(format_status(workspace))
             return 0
         if args.command in {"pause", "stop"}:

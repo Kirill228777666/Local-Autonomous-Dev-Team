@@ -49,9 +49,10 @@ class StateStore:
 
     def _write_projections(self, state: ProjectState) -> None:
         (self.directory / "logs").mkdir(exist_ok=True)
-        (self.directory / "project_spec.md").write_text(
-            f"# Original project specification\n\n{state.original_spec}\n", encoding="utf-8"
-        )
+        specification = f"# Original project specification\n\n{state.original_spec}\n"
+        if state.amendments:
+            specification += "\n# Amendments\n\n" + "\n".join(f"- {amendment}" for amendment in state.amendments) + "\n"
+        (self.directory / "project_spec.md").write_text(specification, encoding="utf-8")
         task_lines = [f"- [{task.status}] {task.title}: {task.description}" for task in state.tasks]
         (self.directory / "progress.md").write_text(
             f"# Progress\n\nStatus: {state.status}\n\n" + "\n".join(task_lines) + "\n",

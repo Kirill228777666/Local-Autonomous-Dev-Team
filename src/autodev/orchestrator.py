@@ -149,6 +149,21 @@ class AutonomousRunner:
         self.store.save(state)
         return state
 
+    def add_requirement(self, requirement: str) -> ProjectState:
+        if not requirement.strip():
+            raise ValueError("requirement must not be blank")
+        state = self._required_state()
+        normalized = requirement.strip()
+        if normalized in state.amendments:
+            return state
+        state.amendments.append(normalized)
+        state.tasks.append(Task.create(f"Implement amendment: {normalized}", normalized))
+        state.final_qa_status = "NOT_RUN"
+        state.status = "READY"
+        state.run_history.append(f"Requirement amendment added: {normalized}")
+        self._mark(state, "MANAGER", "AMENDMENT", f"Requirement amendment added: {normalized}")
+        return state
+
     def _set_control_status(self, status: str) -> ProjectState:
         state = self._required_state()
         state.status = status

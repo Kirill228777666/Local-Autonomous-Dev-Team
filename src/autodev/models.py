@@ -129,6 +129,7 @@ class ProjectState:
     regression_history: list[str] = field(default_factory=list)
     heartbeat: Heartbeat = field(default_factory=Heartbeat)
     events: list[ActivityEvent] = field(default_factory=list)
+    amendments: list[str] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
     run_history: list[str] = field(default_factory=list)
 
@@ -158,6 +159,7 @@ class ProjectState:
             regression_history=[str(result) for result in value.get("regression_history", [])],  # type: ignore[arg-type]
             heartbeat=Heartbeat.from_dict(value.get("heartbeat", {})),  # type: ignore[arg-type]
             events=[ActivityEvent.from_dict(event) for event in value.get("events", [])],  # type: ignore[arg-type]
+            amendments=[str(amendment) for amendment in value.get("amendments", [])],  # type: ignore[arg-type]
             decisions=[str(decision) for decision in value.get("decisions", [])],  # type: ignore[arg-type]
             run_history=[str(entry) for entry in value.get("run_history", [])],  # type: ignore[arg-type]
         )
@@ -177,6 +179,7 @@ class ProjectState:
             "regression_history": self.regression_history,
             "heartbeat": self.heartbeat.to_dict(),
             "events": [event.to_dict() for event in self.events[-500:]],
+            "amendments": self.amendments,
             "decisions": self.decisions,
             "run_history": self.run_history,
         }
