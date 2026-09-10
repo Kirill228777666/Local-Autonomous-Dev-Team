@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import json
 
 import autodev.state_store as state_store_module
 from autodev.models import ProjectState, Task, TaskStatus
@@ -61,6 +62,21 @@ def test_state_store_retries_a_transient_windows_replace_lock(tmp_path: Path, mo
     store.save(ProjectState.create("Build a resilient run"))
 
     assert calls == 2
+
+
+def test_state_store_projects_summary_and_decisions_memory(tmp_path: Path) -> None:
+    state = ProjectState.create("Build a local notes application")
+    state.model = "qwen3:14b"
+    state.decisions.append("Use JSON persistence for MVP")
+    state.tasks.append(Task.create("Storage", "Persist notes"))
+
+    StateStore(tmp_path).save(state)
+
+    summary = (tmp_path / ".autodev" / "project_summary.md").read_text(encoding="utf-8")
+    decisions = (tmp_path / ".autodev" / "decisions.jsonl").read_text(encoding="utf-8").splitlines()
+    assert "Build a local notes application" in summary
+    assert "Use JSON persistence for MVP" in summary
+    assert json.loads(decisions[0])["decision"] == "Use JSON persistence for MVP"
 
 
 def test_state_store_rejects_workspace_outside_root(tmp_path: Path) -> None:

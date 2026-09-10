@@ -65,6 +65,28 @@ class StateStore:
             "# Decisions\n\n" + "\n".join(f"- {decision}" for decision in state.decisions) + "\n",
             encoding="utf-8",
         )
+        (self.directory / "decisions.jsonl").write_text(
+            "".join(
+                json.dumps(
+                    {"timestamp": state.updated_at, "decision": decision, "modules": []}, ensure_ascii=False
+                )
+                + "\n"
+                for decision in state.decisions[-200:]
+            ),
+            encoding="utf-8",
+        )
+        summary = (
+            "# Project Summary\n\n"
+            f"## Purpose\n{state.original_spec}\n\n"
+            f"## Model\n{state.model}\n\n"
+            "## Major Tasks\n"
+            + "\n".join(f"- [{task.status.value}] {task.title}" for task in state.tasks)
+            + "\n\n## Key Decisions\n"
+            + "\n".join(f"- {decision}" for decision in state.decisions[-20:])
+            + "\n\n## Known Limitations\n"
+            + ("- Blocked tasks exist.\n" if any(task.status.value == "BLOCKED" for task in state.tasks) else "- None recorded.\n")
+        )
+        (self.directory / "project_summary.md").write_text(summary, encoding="utf-8")
         (self.directory / "logs" / "events.log").write_text(
             "\n".join(state.run_history) + "\n", encoding="utf-8"
         )

@@ -17,6 +17,13 @@ py -3 -m autodev init C:\work\my-app --spec-file C:\work\my-spec.md
 py -3 -m autodev start C:\work\my-app --config .\example-config.toml
 ```
 
+Open the local dashboard in a second terminal:
+
+```powershell
+py -3 -m autodev dashboard C:\work\my-app --config .\example-config.toml
+# http://127.0.0.1:8765
+```
+
 The state is kept in the target workspace's `.autodev/` directory:
 
 - `state.json` — authoritative durable state;
@@ -30,9 +37,18 @@ py -3 -m autodev status C:\work\my-app
 py -3 -m autodev pause C:\work\my-app
 py -3 -m autodev resume C:\work\my-app --config .\example-config.toml
 py -3 -m autodev stop C:\work\my-app
+py -3 -m autodev requirement add C:\work\my-app "Add JSON export"
 ```
 
-`pause` preserves state for a later `resume`. `stop` deliberately ends the current run. The LLM has no shell access: all actions are validated and executed through the workspace-only tool layer.
+`pause` preserves state for a later `resume`. `stop` deliberately ends the current run. `requirement add` keeps an amendment separate from the original specification and returns it to the autonomous task queue. The LLM has no shell access: all actions are validated and executed through the workspace-only tool layer.
+
+## Reliability and inspection
+
+Before `COMPLETE`, AutoDev runs detected project-wide checks (Python tests and declared npm test/build/lint/typecheck scripts where present), then asks a separate Final QA role to compare the result with the original specification. A Final QA failure creates corrective tasks instead of silently completing.
+
+`.autodev/` also contains a heartbeat, human-readable `activity.log`, bounded event history, `project_summary.md`, `decisions.jsonl`, test/regression evidence, and atomic `state.json`. After an interruption, use `resume`; interrupted implementation/testing/review work is reconciled to a safe pending task.
+
+`[models]` and `[agents.<role>]` in the config can select a model and generation settings per role. Roles remain sequential, so the machine does not need multiple large models resident in VRAM.
 
 ## Development verification
 
