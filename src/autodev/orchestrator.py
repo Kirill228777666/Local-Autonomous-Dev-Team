@@ -185,7 +185,12 @@ class AutonomousRunner:
             self.store.save(state)
 
     def _select_next_task(self, state: ProjectState) -> Task | None:
-        pending = [task for task in state.tasks if task.status is TaskStatus.PENDING]
+        done_ids = {task.id for task in state.tasks if task.status is TaskStatus.DONE}
+        pending = [
+            task
+            for task in state.tasks
+            if task.status is TaskStatus.PENDING and all(dependency in done_ids for dependency in task.dependencies)
+        ]
         if not pending:
             return None
         try:

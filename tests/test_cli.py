@@ -26,3 +26,18 @@ def test_load_config_reads_ollama_model_and_timeout(tmp_path: Path) -> None:
     config = load_config(config_path)
 
     assert config == AppConfig(model="qwen3-coder", timeout=45, max_attempts=4)
+
+
+def test_load_config_reads_role_model_profile_with_generation_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "profiles.toml"
+    config_path.write_text(
+        "[models]\ndefault = 'qwen3:14b'\ncoder = 'qwen2.5-coder:7b'\n"
+        "[agents.coder]\ntemperature = 0.05\ntimeout = 60\nretries = 1\ncontext_budget = 6000\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.model == "qwen3:14b"
+    assert config.profiles["CODER"].model == "qwen2.5-coder:7b"
+    assert config.profiles["CODER"].context_budget == 6000

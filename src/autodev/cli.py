@@ -6,13 +6,22 @@ import argparse
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .orchestrator import AutonomousRunner
-from .providers import OllamaProvider, ScriptedProvider
+from .providers import OllamaProvider, RoleModelProvider, ScriptedProvider
 from .state_store import StateStore
 from .tools import WorkspaceTools
+
+
+@dataclass(frozen=True, slots=True)
+class AgentProfile:
+    model: str
+    temperature: float = 0.1
+    timeout: float = 120.0
+    retries: int = 2
+    context_budget: int = 12000
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +30,7 @@ class AppConfig:
     base_url: str = "http://localhost:11434"
     timeout: float = 120.0
     max_attempts: int = 3
+    profiles: dict[str, AgentProfile] = field(default_factory=dict)
 
 
 def load_config(path: Path | None) -> AppConfig:
@@ -30,14 +40,31 @@ def load_config(path: Path | None) -> AppConfig:
         config = tomllib.load(handle)
     ollama = config.get("ollama", {})
     runner = config.get("runner", {})
-    if not isinstance(ollama, dict) or not isinstance(runner, dict):
-        raise ValueError("[ollama] and [runner] must be TOML tables")
+    models = config.get("models", {})
+    agents = config.get("agents", {})
+    if not all(isinstance(value, dict) for value in (ollama, runner, models, agents)):
+        raise ValueError("[ollama], [runner], [models], and [agents] must be TOML tables")
     defaults = AppConfig()
+    default_model = str(models.get("default", ollama.get("model", defaults.model)))
+    profile_names = set(models).union(agents) - {"default"}
+    profiles: dict[str, AgentProfile] = {}
+    for name in profile_names:
+        settings = agents.get(name, {})
+        if not isinstance(settings, dict):
+            raise ValueError(f"[agents.{name}] must be a TOML table")
+        profiles[name.upper()] = AgentProfile(
+            model=str(models.get(name, default_model)),
+            temperature=float(settings.get("temperature", 0.1)),
+            timeout=float(settings.get("timeout", ollama.get("timeout", defaults.timeout))),
+            retries=int(settings.get("retries", 2)),
+            context_budget=int(settings.get("context_budget", 12000)),
+        )
     return AppConfig(
-        model=str(ollama.get("model", defaults.model)),
+        model=default_model,
         base_url=str(ollama.get("base_url", defaults.base_url)),
         timeout=float(ollama.get("timeout", defaults.timeout)),
         max_attempts=int(runner.get("max_attempts", defaults.max_attempts)),
+        profiles=profiles,
     )
 
 
@@ -64,9 +91,21 @@ def _git(workspace: Path, *args: str, check: bool = True) -> str:
 
 
 def make_runner(workspace: Path, config: AppConfig, scripted: bool = False) -> AutonomousRunner:
-    provider = ScriptedProvider({}) if scripted else OllamaProvider(
-        model=config.model, base_url=config.base_url, timeout=config.timeout
-    )
+    if scripted:
+        provider = ScriptedProvider({})
+    else:
+        default_provider = OllamaProvider(model=config.model, base_url=config.base_url, timeout=config.timeout)
+        profiles = {
+            role: OllamaProvider(
+                model=profile.model,
+                base_url=config.base_url,
+                temperature=profile.temperature,
+                timeout=profile.timeout,
+                retries=profile.retries,
+            )
+            for role, profile in config.profiles.items()
+        }
+        provider = RoleModelProvider(default_provider, profiles)
     return AutonomousRunner(
         workspace=workspace,
         store=StateStore(workspace),
@@ -132,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         config = load_config(args.config)
         if args.model:
-            config = AppConfig(args.model, config.base_url, config.timeout, config.max_attempts)
+            config = AppConfig(args.model, config.base_url, config.timeout, config.max_attempts, config.profiles)
         runner = make_runner(workspace, config)
         state = runner._required_state()
         state.model = config.model

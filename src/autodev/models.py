@@ -87,10 +87,11 @@ class Task:
     attempts: int = 0
     errors: list[str] = field(default_factory=list)
     action_fingerprints: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
 
     @classmethod
-    def create(cls, title: str, description: str) -> Task:
-        return cls(id=str(uuid4()), title=title, description=description)
+    def create(cls, title: str, description: str, dependencies: list[str] | None = None) -> Task:
+        return cls(id=str(uuid4()), title=title, description=description, dependencies=dependencies or [])
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> Task:
@@ -104,6 +105,7 @@ class Task:
             action_fingerprints=[
                 str(fingerprint) for fingerprint in value.get("action_fingerprints", [])  # type: ignore[arg-type]
             ],
+            dependencies=[str(dependency) for dependency in value.get("dependencies", [])],  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:

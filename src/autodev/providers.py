@@ -104,3 +104,14 @@ class ScriptedProvider:
         if not replies:
             raise ProviderError(f"no scripted reply for role {request.role}")
         return replies.popleft()
+
+
+class RoleModelProvider:
+    """Routes sequential role requests to profile-specific providers with a default fallback."""
+
+    def __init__(self, default: LLMProvider, profiles: dict[str, LLMProvider] | None = None) -> None:
+        self.default = default
+        self.profiles = profiles or {}
+
+    def complete(self, request: AgentRequest) -> AgentReply:
+        return self.profiles.get(request.role, self.default).complete(request)
