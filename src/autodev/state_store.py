@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 from .models import ProjectState, utc_now
@@ -36,4 +37,11 @@ class StateStore:
             json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        os.replace(temporary_path, self.path)
+        for attempt in range(3):
+            try:
+                os.replace(temporary_path, self.path)
+                return
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))

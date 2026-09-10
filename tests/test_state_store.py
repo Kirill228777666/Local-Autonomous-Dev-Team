@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+import autodev.state_store as state_store_module
 from autodev.models import ProjectState, Task, TaskStatus
 from autodev.state_store import StateStore
 
@@ -24,6 +25,36 @@ def test_state_store_round_trips_original_spec_and_running_task(tmp_path: Path) 
 
 def test_state_store_returns_none_before_project_is_initialized(tmp_path: Path) -> None:
     assert StateStore(tmp_path).load() is None
+
+
+def test_state_store_can_save_the_same_state_repeatedly(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    state = ProjectState.create("Build a durable run")
+
+    store.save(state)
+    state.status = "RUNNING"
+    store.save(state)
+
+    assert store.load().status == "RUNNING"  # type: ignore[union-attr]
+
+
+def test_state_store_retries_a_transient_windows_replace_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = StateStore(tmp_path)
+    original_replace = state_store_module.os.replace
+    calls = 0
+
+    def flaky_replace(source: str | Path, destination: str | Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError("temporarily locked")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(state_store_module.os, "replace", flaky_replace)
+
+    store.save(ProjectState.create("Build a resilient run"))
+
+    assert calls == 2
 
 
 def test_state_store_rejects_workspace_outside_root(tmp_path: Path) -> None:
