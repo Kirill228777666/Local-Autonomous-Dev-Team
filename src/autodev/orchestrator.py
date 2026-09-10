@@ -48,6 +48,8 @@ class AutonomousRunner:
         state.status = "RUNNING"
         if not state.tasks:
             self._plan(state)
+        if state.status == "BLOCKED":
+            return state
         for _ in range(max_cycles):
             if state.status in {"PAUSED", "STOPPED"}:
                 break
@@ -65,6 +67,15 @@ class AutonomousRunner:
 
     def stop(self) -> ProjectState:
         return self._set_control_status("STOPPED")
+
+    def resume(self) -> ProjectState:
+        state = self._required_state()
+        if state.status == "STOPPED":
+            raise ValueError("stopped projects cannot resume; start a new run explicitly")
+        state.status = "READY"
+        state.run_history.append("Run resumed")
+        self.store.save(state)
+        return state
 
     def _set_control_status(self, status: str) -> ProjectState:
         state = self._required_state()

@@ -32,6 +32,11 @@ class WorkspaceTools:
             "shutdown",
             "diskpart",
             "reg",
+            "cmd",
+            "powershell",
+            "pwsh",
+            "bash",
+            "sh",
         }
     )
 

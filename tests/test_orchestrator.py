@@ -108,3 +108,17 @@ def test_runner_blocks_repeated_identical_coder_actions(tmp_path: Path) -> None:
 
     assert state.tasks[0].status is TaskStatus.BLOCKED
     assert any("repeated" in error for error in state.tasks[0].errors)
+
+
+def test_runner_keeps_an_invalid_initial_plan_blocked(tmp_path: Path) -> None:
+    runner = AutonomousRunner(
+        tmp_path,
+        StateStore(tmp_path),
+        WorkspaceTools(tmp_path),
+        ScriptedProvider({"MANAGER": [AgentReply({"tasks": []})]}),
+    )
+    runner.initialize("Build a project")
+
+    state = runner.run()
+
+    assert state.status == "BLOCKED"

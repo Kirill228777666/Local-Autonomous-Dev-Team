@@ -13,6 +13,7 @@ def test_state_store_round_trips_original_spec_and_running_task(tmp_path: Path) 
     task = Task.create("Implement storage", "Persist TODO items in JSON")
     task.status = TaskStatus.RUNNING
     state.tasks.append(task)
+    state.model = "qwen3:14b"
 
     StateStore(workspace).save(state)
 
@@ -21,6 +22,11 @@ def test_state_store_round_trips_original_spec_and_running_task(tmp_path: Path) 
     assert restored.original_spec == "Build a persistent TODO application"
     assert restored.tasks[0].title == "Implement storage"
     assert restored.tasks[0].status is TaskStatus.RUNNING
+    assert restored.model == "qwen3:14b"
+    assert (workspace / ".autodev" / "project_spec.md").read_text(encoding="utf-8").endswith(
+        "Build a persistent TODO application\n"
+    )
+    assert "Implement storage" in (workspace / ".autodev" / "progress.md").read_text(encoding="utf-8")
 
 
 def test_state_store_returns_none_before_project_is_initialized(tmp_path: Path) -> None:

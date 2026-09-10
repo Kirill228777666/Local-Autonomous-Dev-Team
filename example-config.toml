@@ -1,0 +1,8 @@
+# Copy and adjust this file, then pass it to `autodev start --config`.
+[ollama]
+model = "qwen3:14b"
+base_url = "http://localhost:11434"
+timeout = 120
+
+[runner]
+max_attempts = 3

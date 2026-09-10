@@ -59,6 +59,7 @@ class Task:
 @dataclass(slots=True)
 class ProjectState:
     original_spec: str
+    model: str = "not selected"
     tasks: list[Task] = field(default_factory=list)
     status: str = "READY"
     created_at: str = field(default_factory=utc_now)
@@ -78,6 +79,7 @@ class ProjectState:
     def from_dict(cls, value: dict[str, object]) -> ProjectState:
         return cls(
             original_spec=str(value["original_spec"]),
+            model=str(value.get("model", "not selected")),
             tasks=[Task.from_dict(task) for task in value.get("tasks", [])],  # type: ignore[arg-type]
             status=str(value.get("status", "READY")),
             created_at=str(value.get("created_at", utc_now())),
@@ -95,6 +97,7 @@ class ProjectState:
     def to_dict(self) -> dict[str, object]:
         return {
             "original_spec": self.original_spec,
+            "model": self.model,
             "tasks": [task.to_dict() for task in self.tasks],
             "status": self.status,
             "created_at": self.created_at,

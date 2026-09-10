@@ -32,6 +32,7 @@ class StateStore:
     def save(self, state: ProjectState) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         state.updated_at = utc_now()
+        self._write_projections(state)
         temporary_path = self.path.with_suffix(".json.tmp")
         temporary_path.write_text(
             json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n",
@@ -45,3 +46,24 @@ class StateStore:
                 if attempt == 2:
                     raise
                 time.sleep(0.05 * (attempt + 1))
+
+    def _write_projections(self, state: ProjectState) -> None:
+        (self.directory / "logs").mkdir(exist_ok=True)
+        (self.directory / "project_spec.md").write_text(
+            f"# Original project specification\n\n{state.original_spec}\n", encoding="utf-8"
+        )
+        task_lines = [f"- [{task.status}] {task.title}: {task.description}" for task in state.tasks]
+        (self.directory / "progress.md").write_text(
+            f"# Progress\n\nStatus: {state.status}\n\n" + "\n".join(task_lines) + "\n",
+            encoding="utf-8",
+        )
+        current = next((task for task in state.tasks if task.id == state.current_task_id), None)
+        current_text = "No active task" if current is None else f"# {current.title}\n\n{current.description}\n"
+        (self.directory / "current_task.md").write_text(current_text, encoding="utf-8")
+        (self.directory / "decisions.md").write_text(
+            "# Decisions\n\n" + "\n".join(f"- {decision}" for decision in state.decisions) + "\n",
+            encoding="utf-8",
+        )
+        (self.directory / "logs" / "events.log").write_text(
+            "\n".join(state.run_history) + "\n", encoding="utf-8"
+        )

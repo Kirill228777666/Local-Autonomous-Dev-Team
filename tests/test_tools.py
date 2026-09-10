@@ -39,3 +39,8 @@ def test_workspace_tools_runs_non_shell_command_and_captures_output(tmp_path: Pa
 def test_workspace_tools_rejects_destructive_command(tmp_path: Path) -> None:
     with pytest.raises(ToolPolicyError, match="not permitted"):
         WorkspaceTools(tmp_path).run_command(["Remove-Item", "-Recurse", "src"])
+
+
+def test_workspace_tools_rejects_shell_wrappers_that_can_bypass_policy(tmp_path: Path) -> None:
+    with pytest.raises(ToolPolicyError, match="not permitted"):
+        WorkspaceTools(tmp_path).run_command(["cmd", "/c", "del important.txt"])

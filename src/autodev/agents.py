@@ -35,10 +35,22 @@ class RoleAgents:
         )
 
     def code(self, state: ProjectState, task: Task) -> AgentReply:
-        return self._ask("CODER", self.context.for_task(state, task, []))
+        schema = (
+            "Return {\"actions\":[...]}. Each action must be exactly one of: "
+            "{\"kind\":\"write_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
+            "{\"kind\":\"edit_file\",\"path\":\"relative/path\",\"old\":\"exact text\",\"new\":\"replacement\"}; "
+            "{\"kind\":\"delete_file\",\"path\":\"relative/path\"}; "
+            "{\"kind\":\"run_command\",\"command\":[\"program\",\"arg\"]}. "
+            "Paths must be relative to the workspace; do not use shell wrappers.\n\n"
+        )
+        return self._ask("CODER", schema + self.context.for_task(state, task, []))
 
     def test(self, state: ProjectState, task: Task) -> AgentReply:
-        return self._ask("TESTER", self.context.for_task(state, task, []))
+        instruction = (
+            "Return {\"command\":[\"program\",\"arg\"]} with one independent, non-shell verification command. "
+            "Do not merely report success.\n\n"
+        )
+        return self._ask("TESTER", instruction + self.context.for_task(state, task, []))
 
     def review(self, state: ProjectState, task: Task, evidence: str) -> AgentReply:
         return self._ask("REVIEWER", f"{self.context.for_task(state, task, [])}\n\nEvidence:\n{evidence}")
