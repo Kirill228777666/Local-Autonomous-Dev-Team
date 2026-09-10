@@ -19,6 +19,7 @@ class AgentRequest:
     role: str
     prompt: str
     system_prompt: str = "You are a careful local software-development agent. Reply with JSON only."
+    images: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +75,7 @@ class OllamaProvider:
                 "options": {"temperature": self.temperature},
                 "messages": [
                     {"role": "system", "content": request.system_prompt},
-                    {"role": "user", "content": request.prompt},
+                    {"role": "user", "content": request.prompt, **({"images": list(request.images)} if request.images else {})},
                 ],
             }
         ).encode("utf-8")
