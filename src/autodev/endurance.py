@@ -55,7 +55,7 @@ def controlled_crash(workspace: Path, config_path: Path | None, max_cycles: int,
     """Kill a separate live orchestrator only after it durably enters active work."""
     command = [sys.executable, "-m", "autodev", "start", str(workspace), "--max-cycles", str(max_cycles)]
     if config_path is not None:
-        command.extend(["--config", str(config_path)])
+        command.extend(["--config", str(config_path.resolve())])
     process = subprocess.Popen(command, cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.monotonic() + timeout
     reached_active_work = False
