@@ -276,3 +276,19 @@ def test_missing_tool_executable_is_retried_instead_of_crashing_orchestrator(tmp
     assert state.status == "RUNNING"
     assert state.tasks[0].status is TaskStatus.PENDING
     assert "Coder error" in state.tasks[0].errors[-1]
+
+
+def test_stale_edit_is_requeried_at_tool_level_without_consuming_task_attempt(tmp_path: Path) -> None:
+    repository(tmp_path)
+    (tmp_path / "app.txt").write_text("current", encoding="utf-8")
+    provider = ScriptedProvider({
+        "MANAGER": [AgentReply({"tasks": [{"title": "Edit", "description": "Edit file"}]}), AgentReply({})],
+        "CODER": [AgentReply({"actions": [{"kind": "edit_file", "path": "app.txt", "old": "stale", "new": "x"}]}), AgentReply({"actions": [{"kind": "write_file", "path": "app.txt", "content": "fixed"}]})],
+        "TESTER": [AgentReply({"command": ["py", "-3", "-c", "assert open('app.txt').read() == 'fixed'"]})],
+        "REVIEWER": [AgentReply({"approved": True})], "FINAL_QA": [AgentReply({"status": "PASS", "findings": []})],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    runner.initialize("Edit")
+    state = runner.run(max_cycles=2)
+    assert state.tasks[0].attempts == 1
+    assert any(event.phase == "TOOL_RECOVERY" for event in state.events)

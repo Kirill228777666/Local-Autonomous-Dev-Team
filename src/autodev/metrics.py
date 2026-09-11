@@ -44,6 +44,13 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "missing_executables": sum(event.agent == "ENVIRONMENT" and event.phase == "MISSING_EXECUTABLE" for event in events),
         "environment_repairs": sum(event.agent == "ENVIRONMENT" and event.phase == "REPAIRED" for event in events),
         "task_superseded_count": sum(task.status.value == "SUPERSEDED" for task in state.tasks),
+        "tool_recoveries": sum(event.phase == "TOOL_RECOVERY" for event in events),
+        "stale_edit_recoveries": sum(event.phase == "TOOL_RECOVERY" and "stale edit" in event.message.lower() for event in events),
+        "tool_recovery_failures": sum("Tool stale edit recovery" in entry and "Coder error" in entry for entry in history),
+        "environment_capability_cache_hits": sum("known unavailable" in entry.lower() for entry in history),
+        "task_decompositions": sum("decomposed" in entry.lower() for entry in history),
+        "screenshot_attempts": sum("Screenshot" in event.message for event in events),
+        "screenshot_successes": sum("screenshots captured" in event.message.lower() for event in events),
         "visual_status": state.visual_status,
     }
 

@@ -73,6 +73,17 @@ class WorkspaceTools:
             raise ValueError("edit target was not found")
         path.write_text(content.replace(old, new, 1), encoding="utf-8")
 
+    def append_file(self, relative_path: str, content: str) -> None:
+        path = self._path(relative_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+
+    def file_snapshot(self, relative_path: str) -> tuple[str, str]:
+        import hashlib
+        content = self.read_file(relative_path)
+        return hashlib.sha256(content.encode("utf-8")).hexdigest(), content
+
     def delete_file(self, relative_path: str) -> None:
         path = self._path(relative_path)
         if path.is_dir():

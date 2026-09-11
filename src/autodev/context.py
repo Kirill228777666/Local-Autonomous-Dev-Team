@@ -17,6 +17,7 @@ class ContextBuilder:
         files = "\n".join(f"- {path}" for path in relevant_files) or "- None selected"
         events = "\n".join(f"- {entry}" for entry in recent_log) or "- No prior events"
         sections = [
+            "Environment capabilities:\n" + (str(state.environment) if state.environment else "- Not discovered"),
             f"Current task ({task.id}): {task.title}\n{task.description}",
             f"Relevant files:\n{files}",
             "Recent errors:\n" + ("\n".join(f"- {error}" for error in task.errors[-4:]) or "- None"),

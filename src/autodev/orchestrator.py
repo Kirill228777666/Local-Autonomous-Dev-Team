@@ -311,7 +311,10 @@ class AutonomousRunner:
                 self._block(task, state, "repeated identical coder action without progress")
                 return
             task.action_fingerprints.append(fingerprint)
-            for action in actions:
+            tool_recoveries = 0
+            position = 0
+            while position < len(actions):
+                action = actions[position]
                 try:
                     self._execute_action(state, task, action)
                 except CommandExecutionError as error:
@@ -320,8 +323,26 @@ class AutonomousRunner:
                         self._pivot_to_static_frontend(state, task)
                         return
                     if self._repair_environment_failure(state, task, error.command, error.result):
+                        position += 1
                         continue
                     raise
+                except ValueError as error:
+                    if "edit target was not found" not in str(error) or tool_recoveries >= 2:
+                        raise
+                    path = action.get("path") if isinstance(action, dict) else None
+                    if not isinstance(path, str):
+                        raise
+                    _hash, current = self.tools.file_snapshot(path)
+                    task.errors.append(f"Tool stale edit recovery for {path}; current content: {current[-4000:]}")
+                    tool_recoveries += 1
+                    self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing stale edit context for {path}", task)
+                    refreshed = self.agents.code(state, task).data.get("actions")
+                    if not isinstance(refreshed, list):
+                        raise ProviderError("Coder tool recovery response needs actions")
+                    actions = refreshed
+                    position = 0
+                    continue
+                position += 1
             state.run_history.append(f"Coder completed attempt {task.attempts} for {task.title}")
         except (ProviderError, ToolPolicyError, ValueError, KeyError, TypeError) as error:
             self._retry_or_block(task, state, f"Coder error: {error}")
@@ -419,6 +440,8 @@ class AutonomousRunner:
             self.tools.write_file(self._string(action, "path"), self._string(action, "content"))
         elif kind == "edit_file":
             self.tools.edit_file(self._string(action, "path"), self._string(action, "old"), self._string(action, "new"))
+        elif kind == "append_file":
+            self.tools.append_file(self._string(action, "path"), self._string(action, "content"))
         elif kind == "delete_file":
             self.tools.delete_file(self._string(action, "path"))
         elif kind == "run_command":

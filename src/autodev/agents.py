@@ -44,6 +44,7 @@ class RoleAgents:
             "{\"kind\":\"write_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
             "{\"kind\":\"edit_file\",\"path\":\"relative/path\",\"old\":\"exact text\",\"new\":\"replacement\"}; "
             "{\"kind\":\"delete_file\",\"path\":\"relative/path\"}; "
+            "{\"kind\":\"append_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
             "{\"kind\":\"run_command\",\"command\":[\"program\",\"arg\"]}. "
             "Paths must be relative to the workspace; do not use shell wrappers.\n\n"
         )
@@ -110,7 +111,7 @@ class RoleAgents:
         actions = data.get("actions")
         if not isinstance(actions, list):
             raise ValueError("actions must be an array")
-        required = {"write_file": ("path", "content"), "edit_file": ("path", "old", "new"), "delete_file": ("path",), "run_command": ("command",)}
+        required = {"write_file": ("path", "content"), "append_file": ("path", "content"), "edit_file": ("path", "old", "new"), "delete_file": ("path",), "run_command": ("command",)}
         for action in actions:
             if not isinstance(action, dict) or action.get("kind") not in required:
                 raise ValueError("action kind is invalid")
