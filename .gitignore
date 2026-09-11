@@ -4,6 +4,7 @@ __pycache__/
 .pytest-tmp/
 .venv/
 .autodev/
+.e2e-runs/
 dist/
 build/
 *.egg-info/

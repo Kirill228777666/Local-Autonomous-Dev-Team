@@ -50,6 +50,33 @@ Before `COMPLETE`, AutoDev runs detected project-wide checks (Python tests and d
 
 `[models]` and `[agents.<role>]` in the config can select a model and generation settings per role. Roles remain sequential, so the machine does not need multiple large models resident in VRAM.
 
+## v0.3 recovery and visual QA
+
+Every tool action is persisted as `STARTED` before execution and as `SUCCEEDED` or `FAILED` afterwards. A forced process termination leaves a tool at `UNKNOWN`; `resume` validates the project specification, task graph, active-task invariant, Git repository and checkpoint before returning that task to safe pending work. `STOPPED` projects never resume, and a completed project remains completed.
+
+For UI projects, optionally configure one local application command. AutoDev chooses a free port, waits for HTTP readiness (or a health endpoint), captures desktop and narrow screenshots with Playwright, and terminates the complete application process tree after review. Playwright or a vision model being unavailable is recorded as a limitation; it never masquerades as a visual pass.
+
+```toml
+[visual]
+command = ["npm", "run", "dev", "--", "--port", "{port}"]
+url = "http://127.0.0.1:{port}"
+health_url = "http://127.0.0.1:{port}/health"
+ready_timeout = 45
+max_repairs = 2
+```
+
+The compact status and local dashboard expose task progress, heartbeat, repair/review counts, real LLM/tool calls, recovery state, visual findings, latest screenshots, and last checkpoint. Durable session evidence includes `.autodev/metrics.json`, `.autodev/run_report.md`, screenshots, and interrupted-tool records in `state.json`.
+
+## Notes endurance scenario
+
+This intentionally slow, opt-in scenario creates one Notes workspace from the single specification below, starts it through real local Ollama, forcibly kills the separate orchestrator only after durable active work is observed, resumes the same workspace, and writes its report/validation artifacts below `.e2e-runs/<run-id>/`:
+
+```powershell
+py -3 -m autodev e2e notes --live --config .\example-config.toml
+```
+
+It does not run as part of the normal test suite. The command never pre-seeds a Notes implementation or sends follow-up user instructions; all requirements are supplied once as the original project specification.
+
 ## Development verification
 
 ```powershell

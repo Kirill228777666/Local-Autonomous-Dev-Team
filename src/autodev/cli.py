@@ -195,13 +195,29 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--config", type=Path)
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8765)
+    e2e = commands.add_parser("e2e", help="run reproducible autonomous endurance scenarios")
+    e2e_commands = e2e.add_subparsers(dest="e2e_command", required=True)
+    notes = e2e_commands.add_parser("notes", help="run the live Ollama Notes endurance scenario")
+    notes.add_argument("--live", action="store_true", help="required acknowledgement that this invokes local Ollama")
+    notes.add_argument("--config", type=Path)
+    notes.add_argument("--artifacts", type=Path, default=Path(".e2e-runs"))
+    notes.add_argument("--max-cycles", type=int, default=100)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    workspace = args.workspace.resolve()
     try:
+        if args.command == "e2e":
+            if args.e2e_command != "notes" or not args.live:
+                raise ValueError("only `autodev e2e notes --live` is supported; --live is required")
+            from .endurance import run_notes_live
+
+            config = load_config(args.config)
+            workspace, summary = run_notes_live(config, args.config, args.artifacts, args.max_cycles)
+            print(f"Notes endurance workspace: {workspace}\nStatus: {summary['status']}")
+            return 0
+        workspace = args.workspace.resolve()
         if args.command == "init":
             ensure_workspace(workspace)
             spec = args.spec_file.read_text(encoding="utf-8") if args.spec_file else args.spec
