@@ -85,15 +85,22 @@ class WorkspaceTools:
         executable = Path(command[0]).name.lower()
         if executable in self._BLOCKED_COMMANDS:
             raise ToolPolicyError(f"command '{command[0]}' is not permitted")
-        completed = subprocess.run(
-            command,
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-            shell=False,
-            timeout=self.command_timeout,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                shell=False,
+                timeout=self.command_timeout,
+                check=False,
+            )
+        except FileNotFoundError as error:
+            return CommandResult(127, "", f"command not found: {command[0]} ({error})")
+        except subprocess.TimeoutExpired as error:
+            stdout = error.stdout if isinstance(error.stdout, str) else ""
+            stderr = error.stderr if isinstance(error.stderr, str) else ""
+            return CommandResult(124, stdout, f"command timed out after {self.command_timeout}s\n{stderr}")
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
     def run_tests(self, command: list[str]) -> CommandResult:

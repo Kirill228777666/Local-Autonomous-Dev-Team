@@ -258,3 +258,21 @@ def test_exhausted_task_creates_one_architect_guided_corrective_task(tmp_path: P
     assert corrective.repair_of == task.id
     assert corrective.status is TaskStatus.PENDING
     assert "stdlib SQLite" in corrective.description
+
+
+def test_missing_tool_executable_is_retried_instead_of_crashing_orchestrator(tmp_path: Path) -> None:
+    repository(tmp_path)
+    provider = ScriptedProvider(
+        {
+            "MANAGER": [AgentReply({"tasks": [{"title": "Tool", "description": "Run tool"}]}), AgentReply({})],
+            "CODER": [AgentReply({"actions": [{"kind": "run_command", "command": ["definitely-missing-tool"]}]})],
+        }
+    )
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    runner.initialize("Run tool")
+
+    state = runner.run(max_cycles=1)
+
+    assert state.status == "RUNNING"
+    assert state.tasks[0].status is TaskStatus.PENDING
+    assert "Coder error" in state.tasks[0].errors[-1]
