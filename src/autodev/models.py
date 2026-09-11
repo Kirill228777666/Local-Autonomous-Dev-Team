@@ -136,10 +136,11 @@ class Task:
     errors: list[str] = field(default_factory=list)
     action_fingerprints: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
+    repair_of: str | None = None
 
     @classmethod
-    def create(cls, title: str, description: str, dependencies: list[str] | None = None) -> Task:
-        return cls(id=str(uuid4()), title=title, description=description, dependencies=dependencies or [])
+    def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None) -> Task:
+        return cls(id=str(uuid4()), title=title, description=description, dependencies=dependencies or [], repair_of=repair_of)
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> Task:
@@ -154,6 +155,7 @@ class Task:
                 str(fingerprint) for fingerprint in value.get("action_fingerprints", [])  # type: ignore[arg-type]
             ],
             dependencies=[str(dependency) for dependency in value.get("dependencies", [])],  # type: ignore[arg-type]
+            repair_of=str(value["repair_of"]) if value.get("repair_of") else None,
         )
 
     def to_dict(self) -> dict[str, object]:

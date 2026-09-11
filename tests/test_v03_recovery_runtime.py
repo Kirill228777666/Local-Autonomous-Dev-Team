@@ -64,6 +64,23 @@ def test_resume_blocks_corrupt_dependency_graph_without_starting_work(tmp_path: 
     assert "dependency" in recovered.run_history[-1].lower()
 
 
+def test_resume_converts_legacy_blocked_task_into_one_bounded_corrective_task(tmp_path: Path) -> None:
+    repository(tmp_path)
+    task = Task.create("Backend", "Implement backend")
+    task.status = TaskStatus.BLOCKED
+    task.errors = ["dependency unavailable"]
+    state = ProjectState.create("Build Notes")
+    state.tasks = [task]
+    state.status = "RUNNING"
+    StateStore(tmp_path).save(state)
+
+    recovered = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({})).resume()
+
+    assert recovered.tasks[0].status is TaskStatus.FAILED
+    assert recovered.tasks[1].repair_of == task.id
+    assert recovered.tasks[1].status is TaskStatus.PENDING
+
+
 def test_new_process_recovers_state_written_before_controlled_crash(tmp_path: Path) -> None:
     repository(tmp_path)
     script = """
@@ -219,3 +236,25 @@ def test_role_agents_repair_malformed_structured_reply_before_returning_it() -> 
     reply = RoleAgents(provider, structured_retries=1).code(state, task)
 
     assert reply.data["actions"][0]["kind"] == "write_file"  # type: ignore[index]
+
+
+def test_exhausted_task_creates_one_architect_guided_corrective_task(tmp_path: Path) -> None:
+    repository(tmp_path)
+    task = Task.create("Backend", "Implement backend")
+    task.attempts = 3
+    state = ProjectState.create("Build Notes")
+    state.tasks = [task]
+    runner = AutonomousRunner(
+        tmp_path,
+        StateStore(tmp_path),
+        WorkspaceTools(tmp_path),
+        ScriptedProvider({"ARCHITECT": [AgentReply({"diagnosis": "Avoid unavailable dependencies and use stdlib SQLite."})]}),
+    )
+
+    runner._retry_or_block(task, state, "Coder error: unavailable dependency")
+
+    assert task.status is TaskStatus.FAILED
+    corrective = state.tasks[-1]
+    assert corrective.repair_of == task.id
+    assert corrective.status is TaskStatus.PENDING
+    assert "stdlib SQLite" in corrective.description

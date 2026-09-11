@@ -185,10 +185,30 @@ class AutonomousRunner:
             state.record_event("SYSTEM", "RECOVERY", f"Recovered interrupted task: {interrupted.title}", interrupted.id)
         if interrupted_tools:
             state.run_history.append(f"Crash recovery recorded {len(interrupted_tools)} interrupted tool execution(s)")
+        self._recover_blocked_tasks(state)
         state.status = "READY"
         state.run_history.append("Run resumed")
         self.store.save(state)
         return state
+
+    @staticmethod
+    def _recover_blocked_tasks(state: ProjectState) -> None:
+        """Migrate old terminal failures into one explicit, bounded corrective task."""
+        originals = {task.repair_of for task in state.tasks if task.repair_of}
+        for task in list(state.tasks):
+            if task.status is not TaskStatus.BLOCKED or task.id in originals:
+                continue
+            task.status = TaskStatus.FAILED
+            failure = task.errors[-1] if task.errors else "No persisted failure detail"
+            corrective = Task.create(
+                f"Repair: {task.title}",
+                f"Repair this previously blocked task without repeating the failed approach. Original task: {task.description}\nPersisted failure: {failure}",
+                dependencies=task.dependencies,
+                repair_of=task.id,
+            )
+            state.tasks.append(corrective)
+            state.run_history.append(f"Resume created bounded corrective task: {corrective.title}")
+            state.record_event("MANAGER", "CORRECTIVE", f"Resume created corrective task for {task.title}", corrective.id)
 
     def add_requirement(self, requirement: str) -> ProjectState:
         if not requirement.strip():
@@ -323,6 +343,11 @@ class AutonomousRunner:
             self._retry_or_block(task, state, f"Git checkpoint failed: {error}")
             return
         task.status = TaskStatus.DONE
+        if task.repair_of:
+            original = next((candidate for candidate in state.tasks if candidate.id == task.repair_of), None)
+            if original is not None:
+                original.status = TaskStatus.DONE
+                state.run_history.append(f"Corrective task resolved: {original.title}")
         state.current_task_id = None
         state.run_history.append(f"Task approved and checkpointed: {task.title}")
         self._mark(state, "GIT", "CHECKPOINT", f"Task approved and checkpointed: {task.title}", task)
@@ -381,6 +406,8 @@ class AutonomousRunner:
             missing = [dependency for dependency in task.dependencies if dependency not in by_id or dependency == task.id]
             if missing:
                 problems.append(f"task dependency is invalid for {task.title}")
+            if task.repair_of and task.repair_of not in by_id:
+                problems.append(f"corrective task has no original task: {task.title}")
         active = [task for task in state.tasks if task.status in {TaskStatus.RUNNING, TaskStatus.TESTING, TaskStatus.REVIEW}]
         if len(active) > 1:
             problems.append("sequential mode has more than one active task")
@@ -403,7 +430,25 @@ class AutonomousRunner:
     def _retry_or_block(self, task: Task, state: ProjectState, error: str) -> None:
         task.errors.append(error)
         if task.attempts >= self.max_attempts:
-            self._block(task, state, error)
+            if task.repair_of is not None:
+                self._block(task, state, error)
+                return
+            self._diagnose(state, task)
+            task.status = TaskStatus.FAILED
+            state.current_task_id = None
+            diagnosis = next(
+                (decision for decision in reversed(state.decisions) if f"Architect diagnosis for {task.title}:" in decision),
+                "No Architect diagnosis available",
+            )
+            corrective = Task.create(
+                f"Repair: {task.title}",
+                f"Repair the failed task without repeating its broken approach. Original task: {task.description}\nFailure: {error}\n{diagnosis}",
+                dependencies=task.dependencies,
+                repair_of=task.id,
+            )
+            state.tasks.append(corrective)
+            state.run_history.append(f"Created Architect-guided corrective task: {corrective.title}")
+            self._mark(state, "MANAGER", "CORRECTIVE", f"Created corrective task for failed work: {task.title}", corrective)
             return
         if len(task.errors) >= 2:
             self._diagnose(state, task)

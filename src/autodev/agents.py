@@ -10,7 +10,7 @@ from .providers import AgentReply, AgentRequest, LLMProvider, ProviderError
 ROLE_PROMPTS = {
     "MANAGER": "You are Manager. Keep scope faithful to the original specification. Reply in JSON only.",
     "ARCHITECT": "You are Architect. Recommend the smallest practical alternative after repeated failure. Reply in JSON only.",
-    "CODER": "You are Coder. Return only a JSON object with an actions array. Use only requested task scope.",
+    "CODER": "You are Coder. Return only a JSON object with an actions array. Use only requested task scope. Prefer available standard-library tools; never assume dependencies or executables exist. Do not start a persistent server as verification.",
     "TESTER": "You are Tester. Return only JSON with a command array that independently verifies the task.",
     "REVIEWER": "You are Reviewer. Return only JSON: approved boolean and optional reasons array. Do not add scope.",
     "FINAL_QA": "You are Final QA. Independently compare the completed product against the original specification. Return only JSON with status PASS or FAIL and a findings array. Do not add scope.",
