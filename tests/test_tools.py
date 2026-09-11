@@ -44,3 +44,16 @@ def test_workspace_tools_rejects_destructive_command(tmp_path: Path) -> None:
 def test_workspace_tools_rejects_shell_wrappers_that_can_bypass_policy(tmp_path: Path) -> None:
     with pytest.raises(ToolPolicyError, match="not permitted"):
         WorkspaceTools(tmp_path).run_command(["cmd", "/c", "del important.txt"])
+
+
+def test_workspace_tools_rejects_server_command_from_finite_tool_path(tmp_path: Path) -> None:
+    result = WorkspaceTools(tmp_path).run_command(["py", "-3", "-m", "http.server"])
+    assert result.exit_code == 125
+    assert "MANAGED_PROCESS" in result.stderr
+
+
+def test_workspace_tools_hard_timeout_returns_without_waiting_for_child(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path, command_timeout=0.2)
+    result = tools.run_command(["py", "-3", "-c", "import time; time.sleep(10)"])
+    assert result.exit_code == 124
+    assert "hard timed out" in result.stderr

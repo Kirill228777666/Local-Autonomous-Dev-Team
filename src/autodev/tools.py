@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,23 +98,53 @@ class WorkspaceTools:
         executable = Path(command[0]).name.lower()
         if executable in self._BLOCKED_COMMANDS:
             raise ToolPolicyError(f"command '{command[0]}' is not permitted")
+        app_server = any(
+            part.endswith("app.py") and (self.workspace / part).is_file()
+            and any(marker in (self.workspace / part).read_text(encoding="utf-8", errors="ignore") for marker in ("Flask(", "app.run(", "uvicorn.run("))
+            for part in command
+        )
+        if self.is_long_running(command) or app_server:
+            return CommandResult(125, "", "LONG_RUNNING_COMMAND_REQUIRES_MANAGED_PROCESS")
         try:
-            completed = subprocess.run(
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            process = subprocess.Popen(
                 command,
                 cwd=self.workspace,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 shell=False,
-                timeout=self.command_timeout,
-                check=False,
+                creationflags=flags,
             )
+            try:
+                stdout, stderr = process.communicate(timeout=self.command_timeout)
+            except subprocess.TimeoutExpired:
+                self._kill_tree(process.pid)
+                stdout, stderr = process.communicate(timeout=10)
+                return CommandResult(124, stdout or "", f"command hard timed out after {self.command_timeout}s\n{stderr or ''}")
         except FileNotFoundError as error:
             return CommandResult(127, "", f"command not found: {command[0]} ({error})")
-        except subprocess.TimeoutExpired as error:
-            stdout = error.stdout if isinstance(error.stdout, str) else ""
-            stderr = error.stderr if isinstance(error.stderr, str) else ""
-            return CommandResult(124, stdout, f"command timed out after {self.command_timeout}s\n{stderr}")
-        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+        return CommandResult(process.returncode, stdout, stderr)
+
+    @staticmethod
+    def is_long_running(command: list[str]) -> bool:
+        joined = " ".join(command).lower()
+        first = Path(command[0]).name.lower() if command else ""
+        return (
+            "flask run" in joined or "uvicorn" in joined or "hypercorn" in joined or "gunicorn" in joined
+            or "http.server" in joined or "npm run dev" in joined or "npm start" in joined
+            or first in {"vite", "next"}
+        )
+
+    @staticmethod
+    def _kill_tree(pid: int) -> None:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+        else:
+            try:
+                os.kill(pid, 15)
+            except ProcessLookupError:
+                pass
 
     def run_tests(self, command: list[str]) -> CommandResult:
         return self.run_command(command)
