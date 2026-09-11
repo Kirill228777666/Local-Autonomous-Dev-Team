@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import subprocess
-import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from .runtime import kill_process_tree
 
 
 class ToolPolicyError(PermissionError):
@@ -119,8 +120,14 @@ class WorkspaceTools:
             try:
                 stdout, stderr = process.communicate(timeout=self.command_timeout)
             except subprocess.TimeoutExpired:
-                self._kill_tree(process.pid)
-                stdout, stderr = process.communicate(timeout=10)
+                # Do not call subprocess.run here: on Windows its communicate() can
+                # still wait for a Flask watchdog child which inherited the pipe.
+                kill_process_tree(process.pid)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(2.0, max(0.5, self.command_timeout)))
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = "", "process tree did not exit after forced cleanup"
                 return CommandResult(124, stdout or "", f"command hard timed out after {self.command_timeout}s\n{stderr or ''}")
         except FileNotFoundError as error:
             return CommandResult(127, "", f"command not found: {command[0]} ({error})")
@@ -135,16 +142,6 @@ class WorkspaceTools:
             or "http.server" in joined or "npm run dev" in joined or "npm start" in joined
             or first in {"vite", "next"}
         )
-
-    @staticmethod
-    def _kill_tree(pid: int) -> None:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
-        else:
-            try:
-                os.kill(pid, 15)
-            except ProcessLookupError:
-                pass
 
     def run_tests(self, command: list[str]) -> CommandResult:
         return self.run_command(command)

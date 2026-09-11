@@ -51,6 +51,15 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "task_decompositions": sum("decomposed" in entry.lower() for entry in history),
         "screenshot_attempts": sum("Screenshot" in event.message for event in events),
         "screenshot_successes": sum("screenshots captured" in event.message.lower() for event in events),
+        "managed_process_starts": sum(event.agent == "RUNTIME" and event.phase == "PROCESS_START" for event in events),
+        "managed_process_stops": sum(event.agent == "RUNTIME" and event.phase == "PROCESS_STOP" for event in events),
+        "managed_process_failures": sum(event.agent == "RUNTIME" and event.phase == "READINESS_FAILED" for event in events),
+        "readiness_checks": sum(event.agent == "RUNTIME" and event.phase in {"READINESS", "READINESS_FAILED"} for event in events),
+        "readiness_failures": sum(event.agent == "RUNTIME" and event.phase == "READINESS_FAILED" for event in events),
+        "process_tree_kills": sum(event.agent == "RUNTIME" and event.phase == "PROCESS_STOP" for event in events),
+        "orphan_processes_cleaned": sum("Cleaned stale managed process" in entry for entry in history),
+        "long_running_commands_rerouted": sum("rerouted to managed process" in item.detail for item in state.tool_executions),
+        "run_command_hard_timeouts": sum("hard timed out" in item.detail for item in state.tool_executions),
         "visual_status": state.visual_status,
     }
 

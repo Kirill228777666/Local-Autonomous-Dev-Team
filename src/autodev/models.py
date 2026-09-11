@@ -188,6 +188,7 @@ class ProjectState:
     visual_issues: list[str] = field(default_factory=list)
     visual_repair_cycles: int = 0
     environment: dict[str, object] = field(default_factory=dict)
+    managed_processes: list[dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def create(cls, original_spec: str) -> ProjectState:
@@ -223,6 +224,7 @@ class ProjectState:
             visual_issues=[str(issue) for issue in value.get("visual_issues", [])],  # type: ignore[arg-type]
             visual_repair_cycles=int(value.get("visual_repair_cycles", 0)),
             environment=dict(value.get("environment", {})),  # type: ignore[arg-type]
+            managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -248,6 +250,7 @@ class ProjectState:
             "visual_issues": self.visual_issues[-50:],
             "visual_repair_cycles": self.visual_repair_cycles,
             "environment": self.environment,
+            "managed_processes": self.managed_processes[-100:],
         }
 
     def record_event(self, agent: str, phase: str, message: str, task_id: str | None = None) -> None:

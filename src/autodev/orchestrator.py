@@ -14,7 +14,7 @@ from .git import GitError, GitRepository
 from .models import Heartbeat, ProjectState, Task, TaskStatus, ToolExecution, ToolExecutionStatus
 from .providers import LLMProvider, ProviderError
 from .regression import RegressionRunner
-from .runtime import ScreenshotPipeline
+from .runtime import ManagedProcessManager, ScreenshotPipeline
 from .state_store import StateStore
 from .tools import CommandResult, ToolPolicyError, WorkspaceTools
 
@@ -52,6 +52,7 @@ class AutonomousRunner:
         self.max_visual_repairs = max_visual_repairs
         self.designer = DesignerAgent(provider, structured_retries=1)
         self.environment_manager = EnvironmentManager(workspace, tools, allow_project_dependency_install, allow_system_package_install)
+        self.process_manager = ManagedProcessManager(self.workspace)
 
     def initialize(self, original_spec: str) -> ProjectState:
         existing = self.store.load()
@@ -69,6 +70,7 @@ class AutonomousRunner:
         if state.status in {"PAUSED", "STOPPED", "COMPLETE"}:
             return state
         state.status = "RUNNING"
+        self._recover_managed_processes(state)
         if not state.environment:
             state.environment = self.environment_manager.discover()
             state.run_history.append("Environment capabilities discovered")
@@ -180,6 +182,7 @@ class AutonomousRunner:
             state.record_event("SYSTEM", "BLOCKED", message)
             self.store.save(state)
             return state
+        self._recover_managed_processes(state)
         interrupted_tools = [item for item in state.tool_executions if item.status is ToolExecutionStatus.STARTED]
         for execution in interrupted_tools:
             execution.finish(ToolExecutionStatus.UNKNOWN, "process ended before result was persisted")
@@ -242,6 +245,8 @@ class AutonomousRunner:
 
     def _set_control_status(self, status: str) -> ProjectState:
         state = self._required_state()
+        self.process_manager.stop_all()
+        state.managed_processes = self.process_manager.records()
         state.status = status
         state.run_history.append(f"Run {status.lower()} by user")
         self.store.save(state)
@@ -318,6 +323,12 @@ class AutonomousRunner:
                 try:
                     self._execute_action(state, task, action)
                 except CommandExecutionError as error:
+                    if error.result.exit_code == 125:
+                        self._reroute_server_command(state, task, error.command)
+                        # The execution was rejected only to move it to the managed path.
+                        state.tool_executions[-1].finish(ToolExecutionStatus.SUCCEEDED, "rerouted to managed process")
+                        position += 1
+                        continue
                     failure = classify_failure(error.result, error.command)
                     if failure.kind is FailureKind.MISSING_EXECUTABLE and error.command[0].lower() in {"npm", "node"}:
                         self._pivot_to_static_frontend(state, task)
@@ -411,6 +422,48 @@ class AutonomousRunner:
         state.current_task_id = None
         state.run_history.append(f"Task approved and checkpointed: {task.title}")
         self._mark(state, "GIT", "CHECKPOINT", f"Task approved and checkpointed: {task.title}", task)
+        self._stop_task_processes(state, task)
+
+    def _reroute_server_command(self, state: ProjectState, task: Task, command: list[str]) -> None:
+        port = self._server_port(command)
+        record = self.process_manager.start(command, purpose=f"task:{task.id}", expected_port=port, env={"PORT": str(port)})
+        state.managed_processes = self.process_manager.records()
+        self._mark(state, "RUNTIME", "PROCESS_START", f"Managed process started: {record.pid}", task)
+        if not self.process_manager.wait_ready(record.id, "127.0.0.1", port, timeout=15):
+            logs = self.process_manager.logs(record.id)
+            self.process_manager.stop(record.id)
+            state.managed_processes = self.process_manager.records()
+            self._mark(state, "RUNTIME", "READINESS_FAILED", f"Managed process readiness failed: {logs[-500:]}", task)
+            raise ValueError("managed application failed readiness")
+        state.managed_processes = self.process_manager.records()
+        self._mark(state, "RUNTIME", "READINESS", f"Managed process ready on port {port}", task)
+
+    def _stop_task_processes(self, state: ProjectState, task: Task) -> None:
+        for record in self.process_manager.records():
+            if record.get("purpose") == f"task:{task.id}" and record.get("status") != "STOPPED":
+                self.process_manager.stop(str(record["id"]))
+                self._mark(state, "RUNTIME", "PROCESS_STOP", f"Managed process stopped: {record.get('pid')}", task)
+        state.managed_processes = self.process_manager.records()
+
+    def _recover_managed_processes(self, state: ProjectState) -> None:
+        active = [record for record in state.managed_processes if record.get("status") in {"STARTED", "READY"}]
+        if not active:
+            return
+        for message in self.process_manager.recover(active):
+            state.run_history.append(message)
+            self._mark(state, "RUNTIME", "PROCESS_RECOVERY", message)
+        for record in state.managed_processes:
+            if record.get("status") in {"STARTED", "READY"}:
+                record["status"] = "RECOVERED" if record.get("ownership_token") else "UNVERIFIED"
+
+    def _server_port(self, command: list[str]) -> int:
+        for index, item in enumerate(command[:-1]):
+            if item in {"--port", "-p"}:
+                try:
+                    return int(command[index + 1])
+                except ValueError:
+                    break
+        return 5000
 
     def _execute_action(self, state: ProjectState, task: Task, action: object) -> None:
         if not isinstance(action, dict):
@@ -490,6 +543,7 @@ class AutonomousRunner:
         return value
 
     def _retry_or_block(self, task: Task, state: ProjectState, error: str) -> None:
+        self._stop_task_processes(state, task)
         task.errors.append(error)
         if task.attempts >= self.max_attempts:
             if task.repair_of is not None:
