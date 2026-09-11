@@ -12,6 +12,7 @@ from pathlib import Path
 from .orchestrator import AutonomousRunner
 from .dashboard import DashboardController, serve_dashboard
 from .providers import OllamaProvider, RoleModelProvider, ScriptedProvider
+from .runtime import ApplicationScreenshotPipeline
 from .state_store import StateStore
 from .tools import WorkspaceTools
 
@@ -26,12 +27,22 @@ class AgentProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class VisualConfig:
+    command: tuple[str, ...] = ()
+    url: str = ""
+    health_url: str = ""
+    ready_timeout: float = 30.0
+    max_repairs: int = 2
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     model: str = "qwen3:14b"
     base_url: str = "http://localhost:11434"
     timeout: float = 120.0
     max_attempts: int = 3
     profiles: dict[str, AgentProfile] = field(default_factory=dict)
+    visual: VisualConfig = field(default_factory=VisualConfig)
 
 
 def load_config(path: Path | None) -> AppConfig:
@@ -43,8 +54,9 @@ def load_config(path: Path | None) -> AppConfig:
     runner = config.get("runner", {})
     models = config.get("models", {})
     agents = config.get("agents", {})
-    if not all(isinstance(value, dict) for value in (ollama, runner, models, agents)):
-        raise ValueError("[ollama], [runner], [models], and [agents] must be TOML tables")
+    visual = config.get("visual", {})
+    if not all(isinstance(value, dict) for value in (ollama, runner, models, agents, visual)):
+        raise ValueError("[ollama], [runner], [models], [agents], and [visual] must be TOML tables")
     defaults = AppConfig()
     default_model = str(models.get("default", ollama.get("model", defaults.model)))
     profile_names = set(models).union(agents) - {"default"}
@@ -60,12 +72,23 @@ def load_config(path: Path | None) -> AppConfig:
             retries=int(settings.get("retries", 2)),
             context_budget=int(settings.get("context_budget", 12000)),
         )
+    command = visual.get("command", [])
+    if not isinstance(command, list) or not all(isinstance(part, str) and part for part in command):
+        raise ValueError("[visual].command must be a string array")
+    visual_config = VisualConfig(
+        command=tuple(command),
+        url=str(visual.get("url", "")),
+        health_url=str(visual.get("health_url", "")),
+        ready_timeout=float(visual.get("ready_timeout", 30.0)),
+        max_repairs=int(visual.get("max_repairs", 2)),
+    )
     return AppConfig(
         model=default_model,
         base_url=str(ollama.get("base_url", defaults.base_url)),
         timeout=float(ollama.get("timeout", defaults.timeout)),
         max_attempts=int(runner.get("max_attempts", defaults.max_attempts)),
         profiles=profiles,
+        visual=visual_config,
     )
 
 
@@ -107,12 +130,20 @@ def make_runner(workspace: Path, config: AppConfig, scripted: bool = False) -> A
             for role, profile in config.profiles.items()
         }
         provider = RoleModelProvider(default_provider, profiles)
+    pipeline = None
+    if config.visual.command and config.visual.url:
+        pipeline = ApplicationScreenshotPipeline(
+            workspace, config.visual.command, config.visual.health_url, config.visual.ready_timeout
+        )
     return AutonomousRunner(
         workspace=workspace,
         store=StateStore(workspace),
         tools=WorkspaceTools(workspace),
         provider=provider,
         max_attempts=config.max_attempts,
+        visual_pipeline=pipeline,
+        visual_url=config.visual.url or None,
+        max_visual_repairs=config.visual.max_repairs,
     )
 
 
@@ -122,13 +153,18 @@ def format_status(workspace: Path) -> str:
         raise ValueError("project is not initialized")
     done = len([task for task in state.tasks if task.status.value == "DONE"])
     current = next((task.title for task in state.tasks if task.id == state.current_task_id), "None")
-    last_action = state.run_history[-1] if state.run_history else "None"
-    last_test = next((entry for entry in reversed(state.run_history) if entry.startswith("Tester")), "None")
+    from .metrics import metrics
+
+    data = metrics(state)
+    seconds = int(data["run_duration_seconds"])
+    elapsed = f"{seconds // 3600:02}:{(seconds % 3600) // 60:02}:{seconds % 60:02}"
+    heartbeat = "healthy" if state.heartbeat.agent != "IDLE" else "idle"
     return (
-        f"PROJECT\n{workspace.name}\n\nSTATUS\n{state.status}\n\nMODEL\n{state.model}\n\n"
-        f"CURRENT AGENT\n{'CODER' if state.current_task_id else 'MANAGER'}\n\nCURRENT TASK\n{current}\n\n"
-        f"PROGRESS\n{done} / {len(state.tasks)} major tasks\n\nLAST ACTION\n{last_action}\n\n"
-        f"LAST TEST RESULT\n{last_test}\n"
+        f"Project: {workspace.name}\nStatus: {state.status}\n"
+        f"Agent: {state.heartbeat.agent}\nTask: {current}\nTasks: {done}/{len(state.tasks)} complete\n"
+        f"Repairs: {data['repairs']}\nReviewer rejects: {data['reviewer_rejects']}\n"
+        f"Designer: {state.visual_status}\nLLM calls: {data['total_llm_calls']}\nRun time: {elapsed}\n"
+        f"Heartbeat: {heartbeat}\nLast checkpoint: {state.last_checkpoint or 'None'}\n"
     )
 
 
@@ -192,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         config = load_config(args.config)
         if args.model:
-            config = AppConfig(args.model, config.base_url, config.timeout, config.max_attempts, config.profiles)
+            config = AppConfig(args.model, config.base_url, config.timeout, config.max_attempts, config.profiles, config.visual)
         runner = make_runner(workspace, config)
         state = runner._required_state()
         state.model = config.model

@@ -24,12 +24,25 @@ def detect_ui_project(workspace: Path) -> bool:
     return any((workspace / name).exists() for name in ("package.json", "index.html", "templates"))
 
 class DesignerAgent:
-    def __init__(self, provider: LLMProvider) -> None: self.provider = provider
+    def __init__(self, provider: LLMProvider, structured_retries: int = 0) -> None:
+        self.provider = provider
+        self.structured_retries = structured_retries
+
     def review(self, screenshot: Path, requirements: str, state: ProjectState, task: Task, viewport: dict[str, object]) -> VisualReview:
         if not screenshot.is_file(): raise ValueError("screenshot does not exist")
         encoded = base64.b64encode(screenshot.read_bytes()).decode("ascii")
         prompt = f"Review only objective UI defects. Requirements: {requirements}. Task: {task.title}. Viewport: {viewport}. Return a JSON object with verdict PASS or FAIL and issues array."
-        data = self.provider.complete(AgentRequest(role="DESIGNER", prompt=prompt, system_prompt="You are Designer. Report objective UI defects only. JSON only.", images=(encoded,))).data
+        error = ""
+        for _ in range(self.structured_retries + 1):
+            data = self.provider.complete(AgentRequest(role="DESIGNER", prompt=prompt if not error else prompt + f" Previous output was invalid: {error}. JSON only.", system_prompt="You are Designer. Report objective UI defects only. JSON only.", images=(encoded,))).data
+            try:
+                return self._parse(data)
+            except ValueError as exc:
+                error = str(exc)
+        raise ValueError(f"invalid visual verdict after retries: {error}")
+
+    @staticmethod
+    def _parse(data: dict[str, object]) -> VisualReview:
         verdict, issues = data.get("verdict"), data.get("issues")
         if verdict not in {"PASS", "FAIL"} or not isinstance(issues, list): raise ValueError("invalid visual verdict")
         parsed = []

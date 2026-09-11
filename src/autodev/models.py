@@ -78,6 +78,54 @@ class TaskStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class ToolExecutionStatus(StrEnum):
+    """Durable lifecycle of one tool call made for a task."""
+
+    STARTED = "STARTED"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(slots=True)
+class ToolExecution:
+    id: str
+    task_id: str
+    kind: str
+    payload: list[str] | str
+    status: ToolExecutionStatus = ToolExecutionStatus.STARTED
+    started_at: str = field(default_factory=utc_now)
+    finished_at: str | None = None
+    detail: str = ""
+
+    @classmethod
+    def create(cls, task_id: str, kind: str, payload: list[str] | str) -> ToolExecution:
+        return cls(id=str(uuid4()), task_id=task_id, kind=kind, payload=payload)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> ToolExecution:
+        payload = value.get("payload", "")
+        if not isinstance(payload, (str, list)) or (isinstance(payload, list) and not all(isinstance(item, str) for item in payload)):
+            raise ValueError("tool execution payload must be text or a string array")
+        return cls(
+            id=str(value["id"]), task_id=str(value["task_id"]), kind=str(value["kind"]), payload=payload,
+            status=ToolExecutionStatus(str(value.get("status", ToolExecutionStatus.STARTED))),
+            started_at=str(value.get("started_at", utc_now())),
+            finished_at=str(value["finished_at"]) if value.get("finished_at") else None,
+            detail=str(value.get("detail", "")),
+        )
+
+    def finish(self, status: ToolExecutionStatus, detail: str = "") -> None:
+        self.status = status
+        self.finished_at = utc_now()
+        self.detail = detail
+
+    def to_dict(self) -> dict[str, object]:
+        value = asdict(self)
+        value["status"] = self.status.value
+        return value
+
+
 @dataclass(slots=True)
 class Task:
     id: str
@@ -132,6 +180,10 @@ class ProjectState:
     amendments: list[str] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
     run_history: list[str] = field(default_factory=list)
+    tool_executions: list[ToolExecution] = field(default_factory=list)
+    visual_status: str = "NOT_RUN"
+    visual_issues: list[str] = field(default_factory=list)
+    visual_repair_cycles: int = 0
 
     @classmethod
     def create(cls, original_spec: str) -> ProjectState:
@@ -162,6 +214,10 @@ class ProjectState:
             amendments=[str(amendment) for amendment in value.get("amendments", [])],  # type: ignore[arg-type]
             decisions=[str(decision) for decision in value.get("decisions", [])],  # type: ignore[arg-type]
             run_history=[str(entry) for entry in value.get("run_history", [])],  # type: ignore[arg-type]
+            tool_executions=[ToolExecution.from_dict(item) for item in value.get("tool_executions", [])],  # type: ignore[arg-type]
+            visual_status=str(value.get("visual_status", "NOT_RUN")),
+            visual_issues=[str(issue) for issue in value.get("visual_issues", [])],  # type: ignore[arg-type]
+            visual_repair_cycles=int(value.get("visual_repair_cycles", 0)),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -182,6 +238,10 @@ class ProjectState:
             "amendments": self.amendments,
             "decisions": self.decisions,
             "run_history": self.run_history,
+            "tool_executions": [execution.to_dict() for execution in self.tool_executions[-200:]],
+            "visual_status": self.visual_status,
+            "visual_issues": self.visual_issues[-50:],
+            "visual_repair_cycles": self.visual_repair_cycles,
         }
 
     def record_event(self, agent: str, phase: str, message: str, task_id: str | None = None) -> None:

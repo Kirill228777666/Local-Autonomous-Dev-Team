@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Callable
 
 from .agents import RoleAgents
+from .designer import DesignerAgent, detect_ui_project
 from .git import GitError, GitRepository
-from .models import Heartbeat, ProjectState, Task, TaskStatus
+from .models import Heartbeat, ProjectState, Task, TaskStatus, ToolExecution, ToolExecutionStatus
 from .providers import LLMProvider, ProviderError
 from .regression import RegressionRunner
+from .runtime import ScreenshotPipeline
 from .state_store import StateStore
 from .tools import CommandResult, ToolPolicyError, WorkspaceTools
 
@@ -25,6 +27,9 @@ class AutonomousRunner:
         provider: LLMProvider,
         max_attempts: int = 3,
         regression_runner: RegressionRunner | None = None,
+        visual_pipeline: ScreenshotPipeline | None = None,
+        visual_url: str | None = None,
+        max_visual_repairs: int = 2,
     ) -> None:
         self.workspace = workspace.resolve()
         self.store = store
@@ -32,6 +37,10 @@ class AutonomousRunner:
         self.agents = RoleAgents(provider)
         self.max_attempts = max_attempts
         self.regression_runner = regression_runner or RegressionRunner(self.workspace, tools)
+        self.visual_pipeline = visual_pipeline
+        self.visual_url = visual_url
+        self.max_visual_repairs = max_visual_repairs
+        self.designer = DesignerAgent(provider, structured_retries=1)
 
     def initialize(self, original_spec: str) -> ProjectState:
         existing = self.store.load()
@@ -75,6 +84,18 @@ class AutonomousRunner:
             state.run_history.append("Completion blocked by unresolved tasks: " + ", ".join(task.title for task in blocked))
             self._mark(state, "SYSTEM", "BLOCKED", "Completion blocked by unresolved tasks")
             return
+        if detect_ui_project(self.workspace) and self.visual_pipeline is not None and self.visual_url:
+            final_visual = Task.create("Final visual QA", "Verify desktop and narrow UI before completion")
+            if not self._visual_review(state, final_visual):
+                if final_visual.status is TaskStatus.BLOCKED:
+                    state.status = "BLOCKED"
+                    state.run_history.append("Final visual QA blocked completion")
+                    return
+                description = final_visual.errors[-1] if final_visual.errors else "Resolve objective visual QA findings"
+                state.tasks.append(Task.create("Resolve final visual QA findings", description))
+                state.run_history.append("Final visual QA failed; created corrective task")
+                self._mark(state, "MANAGER", "CORRECTIVE", "Final visual QA created corrective task")
+                return
         self._mark(state, "FINAL_QA", "REGRESSION", "Running full regression")
         regression = self.regression_runner.run()
         state.regression_history.append(regression.summary)
@@ -86,6 +107,7 @@ class AutonomousRunner:
             self._mark(state, "MANAGER", "CORRECTIVE", "Regression failed; corrective task created")
             return
         try:
+            self._mark(state, "FINAL_QA", "LLM_CALL", "Final QA request", None)
             self._mark(state, "FINAL_QA", "REVIEW", "Final QA evaluating completed project")
             reply = self.agents.final_qa(state, regression.summary + "\nGit diff:\n" + self._git_diff()).data
         except ProviderError as error:
@@ -131,6 +153,23 @@ class AutonomousRunner:
         state = self._required_state()
         if state.status == "STOPPED":
             raise ValueError("stopped projects cannot resume; start a new run explicitly")
+        if state.status == "COMPLETE":
+            state.run_history.append("Resume ignored: project is already COMPLETE")
+            self.store.save(state)
+            return state
+        problems = self._resume_invariants(state)
+        if problems:
+            state.status = "BLOCKED"
+            message = "Resume invariant violation: " + "; ".join(problems)
+            state.run_history.append(message)
+            state.record_event("SYSTEM", "BLOCKED", message)
+            self.store.save(state)
+            return state
+        interrupted_tools = [item for item in state.tool_executions if item.status is ToolExecutionStatus.STARTED]
+        for execution in interrupted_tools:
+            execution.finish(ToolExecutionStatus.UNKNOWN, "process ended before result was persisted")
+            state.run_history.append(f"Interrupted tool marked UNKNOWN: {execution.kind} for task {execution.task_id}")
+            state.record_event("SYSTEM", "RECOVERY", f"Interrupted tool marked UNKNOWN: {execution.kind}", execution.task_id)
         interrupted = next(
             (
                 task
@@ -144,6 +183,8 @@ class AutonomousRunner:
             state.current_task_id = None
             state.run_history.append(f"Recovered interrupted task: {interrupted.title}")
             state.record_event("SYSTEM", "RECOVERY", f"Recovered interrupted task: {interrupted.title}", interrupted.id)
+        if interrupted_tools:
+            state.run_history.append(f"Crash recovery recorded {len(interrupted_tools)} interrupted tool execution(s)")
         state.status = "READY"
         state.run_history.append("Run resumed")
         self.store.save(state)
@@ -179,6 +220,7 @@ class AutonomousRunner:
 
     def _plan(self, state: ProjectState) -> None:
         try:
+            self._mark(state, "MANAGER", "LLM_CALL", "Manager planning request")
             reply = self.agents.plan(state).data
             raw_tasks = reply.get("tasks")
             if not isinstance(raw_tasks, list) or not raw_tasks:
@@ -209,6 +251,7 @@ class AutonomousRunner:
         if not pending:
             return None
         try:
+            self._mark(state, "MANAGER", "LLM_CALL", "Manager task-selection request")
             requested_id = self.agents.select(state).data.get("next_task_id")
             if isinstance(requested_id, str):
                 selected = next((task for task in pending if task.id == requested_id), None)
@@ -224,6 +267,7 @@ class AutonomousRunner:
         task.attempts += 1
         self._mark(state, "CODER", "IMPLEMENTING", f"Coder started attempt {task.attempts}: {task.title}", task)
         try:
+            self._mark(state, "CODER", "LLM_CALL", "Coder implementation request", task)
             actions = self.agents.code(state, task).data.get("actions")
             if not isinstance(actions, list):
                 raise ProviderError("Coder response needs an actions array")
@@ -233,7 +277,7 @@ class AutonomousRunner:
                 return
             task.action_fingerprints.append(fingerprint)
             for action in actions:
-                self._execute_action(action)
+                self._execute_action(state, task, action)
             state.run_history.append(f"Coder completed attempt {task.attempts} for {task.title}")
         except (ProviderError, ToolPolicyError, ValueError, KeyError, TypeError) as error:
             self._retry_or_block(task, state, f"Coder error: {error}")
@@ -242,6 +286,7 @@ class AutonomousRunner:
         task.status = TaskStatus.TESTING
         try:
             self._mark(state, "TESTER", "TESTING", f"Tester verifying: {task.title}", task)
+            self._mark(state, "TESTER", "LLM_CALL", "Tester verification request", task)
             reply = self.agents.test(state, task).data
             command = reply.get("command")
             if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
@@ -255,9 +300,13 @@ class AutonomousRunner:
             self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}")
             return
 
+        if not self._visual_review(state, task):
+            return
+
         task.status = TaskStatus.REVIEW
         try:
             self._mark(state, "REVIEWER", "REVIEW", f"Reviewer evaluating: {task.title}", task)
+            self._mark(state, "REVIEWER", "LLM_CALL", "Reviewer decision request", task)
             evidence = self._result_log(task, result) + "\nGit diff:\n" + self._git_diff()
             review = self.agents.review(state, task, evidence).data
             if review.get("approved") is not True:
@@ -278,9 +327,29 @@ class AutonomousRunner:
         state.run_history.append(f"Task approved and checkpointed: {task.title}")
         self._mark(state, "GIT", "CHECKPOINT", f"Task approved and checkpointed: {task.title}", task)
 
-    def _execute_action(self, action: object) -> None:
+    def _execute_action(self, state: ProjectState, task: Task, action: object) -> None:
         if not isinstance(action, dict):
             raise ValueError("Coder action must be an object")
+        kind = action.get("kind")
+        payload: list[str] | str
+        if kind == "run_command":
+            command = action.get("command")
+            payload = command if isinstance(command, list) else "invalid command"
+        else:
+            payload = self._string(action, "path")
+        execution = ToolExecution.create(task.id, str(kind), payload)
+        state.tool_executions.append(execution)
+        self._mark(state, "CODER", "TOOL_STARTED", f"Started tool: {kind}", task)
+        try:
+            self._execute_action_once(action)
+        except Exception as error:
+            execution.finish(ToolExecutionStatus.FAILED, str(error))
+            self._mark(state, "CODER", "TOOL_FAILED", f"Tool failed: {kind}: {error}", task)
+            raise
+        execution.finish(ToolExecutionStatus.SUCCEEDED)
+        self._mark(state, "CODER", "TOOL_SUCCEEDED", f"Completed tool: {kind}", task)
+
+    def _execute_action_once(self, action: dict[str, object]) -> None:
         kind = action.get("kind")
         if kind == "write_file":
             self.tools.write_file(self._string(action, "path"), self._string(action, "content"))
@@ -297,6 +366,32 @@ class AutonomousRunner:
                 raise ValueError(f"command failed: {result.stderr or result.stdout}")
         else:
             raise ValueError(f"unsupported action kind: {kind}")
+
+    def _resume_invariants(self, state: ProjectState) -> list[str]:
+        problems: list[str] = []
+        if not state.original_spec.strip():
+            problems.append("project specification is missing")
+        task_ids = [task.id for task in state.tasks]
+        if len(task_ids) != len(set(task_ids)):
+            problems.append("task identifiers are not unique")
+        by_id = {task.id: task for task in state.tasks}
+        if state.current_task_id and state.current_task_id not in by_id:
+            problems.append("current task does not exist")
+        for task in state.tasks:
+            missing = [dependency for dependency in task.dependencies if dependency not in by_id or dependency == task.id]
+            if missing:
+                problems.append(f"task dependency is invalid for {task.title}")
+        active = [task for task in state.tasks if task.status in {TaskStatus.RUNNING, TaskStatus.TESTING, TaskStatus.REVIEW}]
+        if len(active) > 1:
+            problems.append("sequential mode has more than one active task")
+        try:
+            repository = GitRepository(self.workspace)
+            repository._run("rev-parse", "--is-inside-work-tree")
+            if state.last_checkpoint:
+                repository._run("cat-file", "-e", f"{state.last_checkpoint}^{{commit}}")
+        except GitError as error:
+            problems.append(f"Git checkpoint/repository is unavailable: {error}")
+        return problems
 
     @staticmethod
     def _string(action: dict[str, object], key: str) -> str:
@@ -315,8 +410,57 @@ class AutonomousRunner:
         task.status = TaskStatus.PENDING
         state.run_history.append(f"Returning task to Coder: {task.title}; {error}")
 
+    def _visual_review(self, state: ProjectState, task: Task) -> bool:
+        """Run objective visual QA only when a configured UI pipeline is available."""
+        if not detect_ui_project(self.workspace):
+            return True
+        if self.visual_pipeline is None or not self.visual_url:
+            state.visual_status = "SKIPPED"
+            limitation = "Visual QA skipped: no application screenshot pipeline is configured"
+            if limitation not in state.run_history:
+                state.run_history.append(limitation)
+                state.record_event("DESIGNER", "LIMITATION", limitation, task.id)
+            return True
+        screenshots = self.visual_pipeline.capture(self.visual_url)
+        if not screenshots:
+            state.visual_status = "UNAVAILABLE"
+            state.run_history.append(self.visual_pipeline.last_diagnostic or "Visual QA screenshot acquisition failed")
+            state.record_event("DESIGNER", "UNAVAILABLE", self.visual_pipeline.last_diagnostic, task.id)
+            return True
+        issues: list[str] = []
+        for screenshot, viewport in zip(screenshots, ({"width": 1440, "height": 1000}, {"width": 390, "height": 844}), strict=True):
+            try:
+                self._mark(state, "DESIGNER", "LLM_CALL", f"Designer reviewing {screenshot.name}", task)
+                review = self.designer.review(screenshot, state.original_spec, state, task, viewport)
+            except (ProviderError, ValueError) as error:
+                state.visual_status = "UNAVAILABLE"
+                state.run_history.append(f"Visual QA unavailable: {error}")
+                state.record_event("DESIGNER", "UNAVAILABLE", f"Visual QA unavailable: {error}", task.id)
+                return True
+            issues.extend(f"{item.severity}:{item.category}: {item.description}" for item in review.issues)
+        state.visual_issues = issues
+        serious = [issue for issue in issues if issue.startswith("high:") or issue.startswith("critical:")]
+        if not serious:
+            state.visual_status = "PASS"
+            state.run_history.append("Designer visual QA passed")
+            self._mark(state, "DESIGNER", "PASS", "Designer visual QA passed", task)
+            return True
+        state.visual_status = "FAIL"
+        state.visual_repair_cycles += 1
+        error = "Visual QA failed: " + " | ".join(serious)
+        if state.visual_repair_cycles > self.max_visual_repairs:
+            self._block(task, state, f"Visual repair limit reached: {error}")
+        else:
+            task.errors.append(error)
+            task.status = TaskStatus.PENDING
+            state.current_task_id = None
+            state.run_history.append(f"Returning task to Coder for visual repair: {task.title}; {error}")
+            self._mark(state, "MANAGER", "VISUAL_REPAIR", "Created bounded visual repair for objective issues", task)
+        return False
+
     def _diagnose(self, state: ProjectState, task: Task) -> None:
         try:
+            self._mark(state, "ARCHITECT", "LLM_CALL", "Architect diagnosis request", task)
             diagnosis = self.agents.diagnose(state, task).data
             state.decisions.append(f"Architect diagnosis for {task.title}: {diagnosis}")
         except ProviderError as error:

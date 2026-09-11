@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from autodev.cli import AppConfig, load_config, main
+from autodev.cli import AppConfig, VisualConfig, format_status, load_config, main
 from autodev.state_store import StateStore
 
 
@@ -9,7 +9,7 @@ def test_cli_initializes_workspace_and_exposes_status_controls(tmp_path: Path, c
 
     assert main(["init", str(workspace), "--spec", "Build a local TODO application"]) == 0
     assert main(["status", str(workspace)]) == 0
-    assert "STATUS\nREADY" in capsys.readouterr().out  # type: ignore[attr-defined]
+    assert "Status: READY" in capsys.readouterr().out  # type: ignore[attr-defined]
     assert main(["pause", str(workspace)]) == 0
     assert StateStore(workspace).load().status == "PAUSED"  # type: ignore[union-attr]
     assert main(["stop", str(workspace)]) == 0
@@ -52,3 +52,29 @@ def test_cli_adds_requirement_as_a_durable_amendment(tmp_path: Path) -> None:
     state = StateStore(workspace).load()
     assert state.amendments == ["Add JSON export"]  # type: ignore[union-attr]
     assert state.tasks[-1].title == "Implement amendment: Add JSON export"  # type: ignore[union-attr]
+
+
+def test_config_and_compact_status_expose_visual_runtime_and_recovery_data(tmp_path: Path) -> None:
+    config_path = tmp_path / "visual.toml"
+    config_path.write_text(
+        "[visual]\ncommand = ['py', '-3', '-m', 'http.server', '{port}']\nurl = 'http://127.0.0.1:{port}'\nhealth_url = 'http://127.0.0.1:{port}'\nready_timeout = 11\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert config.visual == VisualConfig(
+        command=("py", "-3", "-m", "http.server", "{port}"),
+        url="http://127.0.0.1:{port}",
+        health_url="http://127.0.0.1:{port}",
+        ready_timeout=11,
+    )
+
+    workspace = tmp_path / "notes"
+    assert main(["init", str(workspace), "--spec", "Build Notes"]) == 0
+    state = StateStore(workspace).load()
+    state.run_history.append("Run resumed")  # type: ignore[union-attr]
+    state.visual_status = "PASS"  # type: ignore[union-attr]
+    StateStore(workspace).save(state)  # type: ignore[arg-type]
+    status = format_status(workspace)
+    assert "Project: notes" in status
+    assert "Designer: PASS" in status
+    assert "Run time:" in status

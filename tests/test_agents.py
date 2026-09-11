@@ -9,6 +9,8 @@ class RecordingProvider:
 
     def complete(self, request: AgentRequest) -> AgentReply:
         self.requests.append(request)
+        if request.role == "TESTER":
+            return AgentReply({"command": ["py", "-3", "-c", "print('verified')"]})
         return AgentReply({"actions": []})
 
 
