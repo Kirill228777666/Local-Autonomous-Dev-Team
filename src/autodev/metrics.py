@@ -38,6 +38,12 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "crash_events": sum("Crash recovery" in entry for entry in history),
         "resume_events": sum(entry == "Run resumed" for entry in history),
         "watchdog_events": sum(event.agent == "WATCHDOG" for event in events),
+        "environment_checks": sum(event.agent == "ENVIRONMENT" and event.phase == "CHECK" for event in events),
+        "dependency_installs": sum(event.agent == "ENVIRONMENT" and event.phase == "REPAIRED" for event in events),
+        "dependency_install_failures": sum("Environment limitation:" in entry and "install" in entry.lower() for entry in history),
+        "missing_executables": sum(event.agent == "ENVIRONMENT" and event.phase == "MISSING_EXECUTABLE" for event in events),
+        "environment_repairs": sum(event.agent == "ENVIRONMENT" and event.phase == "REPAIRED" for event in events),
+        "task_superseded_count": sum(task.status.value == "SUPERSEDED" for task in state.tasks),
         "visual_status": state.visual_status,
     }
 

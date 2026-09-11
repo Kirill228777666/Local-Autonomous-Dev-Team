@@ -76,6 +76,7 @@ class TaskStatus(StrEnum):
     DONE = "DONE"
     BLOCKED = "BLOCKED"
     FAILED = "FAILED"
+    SUPERSEDED = "SUPERSEDED"
 
 
 class ToolExecutionStatus(StrEnum):
@@ -186,6 +187,7 @@ class ProjectState:
     visual_status: str = "NOT_RUN"
     visual_issues: list[str] = field(default_factory=list)
     visual_repair_cycles: int = 0
+    environment: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def create(cls, original_spec: str) -> ProjectState:
@@ -220,6 +222,7 @@ class ProjectState:
             visual_status=str(value.get("visual_status", "NOT_RUN")),
             visual_issues=[str(issue) for issue in value.get("visual_issues", [])],  # type: ignore[arg-type]
             visual_repair_cycles=int(value.get("visual_repair_cycles", 0)),
+            environment=dict(value.get("environment", {})),  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -244,6 +247,7 @@ class ProjectState:
             "visual_status": self.visual_status,
             "visual_issues": self.visual_issues[-50:],
             "visual_repair_cycles": self.visual_repair_cycles,
+            "environment": self.environment,
         }
 
     def record_event(self, agent: str, phase: str, message: str, task_id: str | None = None) -> None:

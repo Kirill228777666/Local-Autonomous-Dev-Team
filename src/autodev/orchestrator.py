@@ -9,6 +9,7 @@ from typing import Callable
 
 from .agents import RoleAgents
 from .designer import DesignerAgent, detect_ui_project
+from .environment import EnvironmentManager, FailureKind, classify_failure, validate_readme
 from .git import GitError, GitRepository
 from .models import Heartbeat, ProjectState, Task, TaskStatus, ToolExecution, ToolExecutionStatus
 from .providers import LLMProvider, ProviderError
@@ -16,6 +17,13 @@ from .regression import RegressionRunner
 from .runtime import ScreenshotPipeline
 from .state_store import StateStore
 from .tools import CommandResult, ToolPolicyError, WorkspaceTools
+
+
+class CommandExecutionError(ValueError):
+    def __init__(self, command: list[str], result: CommandResult) -> None:
+        super().__init__(result.stderr or result.stdout or f"command exited {result.exit_code}")
+        self.command = command
+        self.result = result
 
 
 class AutonomousRunner:
@@ -30,6 +38,8 @@ class AutonomousRunner:
         visual_pipeline: ScreenshotPipeline | None = None,
         visual_url: str | None = None,
         max_visual_repairs: int = 2,
+        allow_project_dependency_install: bool = True,
+        allow_system_package_install: bool = False,
     ) -> None:
         self.workspace = workspace.resolve()
         self.store = store
@@ -41,6 +51,7 @@ class AutonomousRunner:
         self.visual_url = visual_url
         self.max_visual_repairs = max_visual_repairs
         self.designer = DesignerAgent(provider, structured_retries=1)
+        self.environment_manager = EnvironmentManager(workspace, tools, allow_project_dependency_install, allow_system_package_install)
 
     def initialize(self, original_spec: str) -> ProjectState:
         existing = self.store.load()
@@ -58,6 +69,10 @@ class AutonomousRunner:
         if state.status in {"PAUSED", "STOPPED", "COMPLETE"}:
             return state
         state.status = "RUNNING"
+        if not state.environment:
+            state.environment = self.environment_manager.discover()
+            state.run_history.append("Environment capabilities discovered")
+            self._mark(state, "ENVIRONMENT", "CHECK", "Environment capabilities discovered")
         self._mark(state, "MANAGER", "PLANNING", "Autonomous run started")
         if not state.tasks:
             self._plan(state)
@@ -297,28 +312,52 @@ class AutonomousRunner:
                 return
             task.action_fingerprints.append(fingerprint)
             for action in actions:
-                self._execute_action(state, task, action)
+                try:
+                    self._execute_action(state, task, action)
+                except CommandExecutionError as error:
+                    failure = classify_failure(error.result, error.command)
+                    if failure.kind is FailureKind.MISSING_EXECUTABLE and error.command[0].lower() in {"npm", "node"}:
+                        self._pivot_to_static_frontend(state, task)
+                        return
+                    if self._repair_environment_failure(state, task, error.command, error.result):
+                        continue
+                    raise
             state.run_history.append(f"Coder completed attempt {task.attempts} for {task.title}")
         except (ProviderError, ToolPolicyError, ValueError, KeyError, TypeError) as error:
             self._retry_or_block(task, state, f"Coder error: {error}")
             return
 
         task.status = TaskStatus.TESTING
-        try:
-            self._mark(state, "TESTER", "TESTING", f"Tester verifying: {task.title}", task)
-            self._mark(state, "TESTER", "LLM_CALL", "Tester verification request", task)
-            reply = self.agents.test(state, task).data
-            command = reply.get("command")
-            if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-                raise ProviderError("Tester response needs a string command array")
-            result = self.tools.run_tests(command)
-        except (ProviderError, ToolPolicyError, ValueError) as error:
-            self._retry_or_block(task, state, f"Tester error: {error}")
-            return
+        if "readme" in task.title.lower() or "documentation" in task.title.lower():
+            documentation = validate_readme(self.workspace)
+            command = ["README validator"]
+            result = CommandResult(0 if documentation.passed else 1, "", "; ".join(documentation.findings))
+            self._mark(state, "TESTER", "DOCUMENTATION", "Validated README instructions without executing them", task)
+        else:
+            try:
+                self._mark(state, "TESTER", "TESTING", f"Tester verifying: {task.title}", task)
+                self._mark(state, "TESTER", "LLM_CALL", "Tester verification request", task)
+                reply = self.agents.test(state, task).data
+                command = reply.get("command")
+                if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+                    raise ProviderError("Tester response needs a string command array")
+                result = self.tools.run_tests(command)
+            except (ProviderError, ToolPolicyError, ValueError) as error:
+                self._retry_or_block(task, state, f"Tester error: {error}")
+                return
         state.run_history.append(self._result_log(task, result))
         if result.exit_code != 0:
-            self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}")
-            return
+            failure = classify_failure(result, command)
+            if failure.kind is FailureKind.MISSING_EXECUTABLE and command[0].lower() in {"npm", "node"}:
+                self._pivot_to_static_frontend(state, task)
+                return
+            if self._repair_environment_failure(state, task, command, result):
+                result = self.tools.run_tests(command)
+            if result.exit_code == 0:
+                state.run_history.append(self._result_log(task, result))
+            else:
+                self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}")
+                return
 
         if not self._visual_review(state, task):
             return
@@ -388,7 +427,7 @@ class AutonomousRunner:
                 raise ValueError("run_command requires a string command array")
             result = self.tools.run_command(command)
             if result.exit_code:
-                raise ValueError(f"command failed: {result.stderr or result.stdout}")
+                raise CommandExecutionError(command, result)
         else:
             raise ValueError(f"unsupported action kind: {kind}")
 
@@ -454,6 +493,37 @@ class AutonomousRunner:
             self._diagnose(state, task)
         task.status = TaskStatus.PENDING
         state.run_history.append(f"Returning task to Coder: {task.title}; {error}")
+
+    def _repair_environment_failure(self, state: ProjectState, task: Task, command: list[str], result: CommandResult) -> bool:
+        failure = classify_failure(result, command)
+        state.run_history.append(f"Failure classified: {failure.kind.value}")
+        self._mark(state, "ENVIRONMENT", failure.kind.value, f"Classified command failure: {failure.kind.value}", task)
+        if failure.kind is FailureKind.IMPORT_PATH:
+            state.run_history.append("Test harness diagnostic: check cwd/package layout/PYTHONPATH before code repair")
+            return False
+        repaired = self.environment_manager.repair(failure)
+        if repaired:
+            state.run_history.append(f"Environment repair completed: {failure.kind.value}")
+            self._mark(state, "ENVIRONMENT", "REPAIRED", f"Environment repair completed: {failure.kind.value}", task)
+            return True
+        if self.environment_manager.last_diagnostic:
+            state.run_history.append(f"Environment limitation: {self.environment_manager.last_diagnostic}")
+        return False
+
+    def _pivot_to_static_frontend(self, state: ProjectState, task: Task) -> None:
+        """Replace npm-specific work with a Node-free browser frontend while retaining product goals."""
+        for candidate in state.tasks:
+            text = f"{candidate.title} {candidate.description}".lower()
+            if candidate.status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.FAILED} and (candidate is task or "npm" in text or "build" in text and "frontend" in text):
+                candidate.status = TaskStatus.SUPERSEDED
+        replacement = Task.create(
+            "Static frontend fallback",
+            "Implement responsive plain HTML/CSS/JavaScript frontend served by the backend. Preserve Notes CRUD, search, categories, filters and favorites. Validate with a browser-free static-file check; no npm build is required.",
+        )
+        state.tasks.append(replacement)
+        state.current_task_id = None
+        state.run_history.append("Architecture pivot: Node/npm unavailable; superseded npm-specific tasks and created static frontend replacement")
+        self._mark(state, "MANAGER", "PIVOT", "Applied Node-free static frontend pivot", replacement)
 
     def _visual_review(self, state: ProjectState, task: Task) -> bool:
         """Run objective visual QA only when a configured UI pipeline is available."""

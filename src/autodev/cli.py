@@ -36,6 +36,12 @@ class VisualConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PermissionConfig:
+    allow_project_dependency_install: bool = True
+    allow_system_package_install: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     model: str = "qwen3:14b"
     base_url: str = "http://localhost:11434"
@@ -43,6 +49,7 @@ class AppConfig:
     max_attempts: int = 3
     profiles: dict[str, AgentProfile] = field(default_factory=dict)
     visual: VisualConfig = field(default_factory=VisualConfig)
+    permissions: PermissionConfig = field(default_factory=PermissionConfig)
 
 
 def load_config(path: Path | None) -> AppConfig:
@@ -55,7 +62,8 @@ def load_config(path: Path | None) -> AppConfig:
     models = config.get("models", {})
     agents = config.get("agents", {})
     visual = config.get("visual", {})
-    if not all(isinstance(value, dict) for value in (ollama, runner, models, agents, visual)):
+    permissions = config.get("permissions", {})
+    if not all(isinstance(value, dict) for value in (ollama, runner, models, agents, visual, permissions)):
         raise ValueError("[ollama], [runner], [models], [agents], and [visual] must be TOML tables")
     defaults = AppConfig()
     default_model = str(models.get("default", ollama.get("model", defaults.model)))
@@ -82,6 +90,7 @@ def load_config(path: Path | None) -> AppConfig:
         ready_timeout=float(visual.get("ready_timeout", 30.0)),
         max_repairs=int(visual.get("max_repairs", 2)),
     )
+    permission_config = PermissionConfig(bool(permissions.get("allow_project_dependency_install", True)), bool(permissions.get("allow_system_package_install", False)))
     return AppConfig(
         model=default_model,
         base_url=str(ollama.get("base_url", defaults.base_url)),
@@ -89,6 +98,7 @@ def load_config(path: Path | None) -> AppConfig:
         max_attempts=int(runner.get("max_attempts", defaults.max_attempts)),
         profiles=profiles,
         visual=visual_config,
+        permissions=permission_config,
     )
 
 
@@ -144,6 +154,8 @@ def make_runner(workspace: Path, config: AppConfig, scripted: bool = False) -> A
         visual_pipeline=pipeline,
         visual_url=config.visual.url or None,
         max_visual_repairs=config.visual.max_repairs,
+        allow_project_dependency_install=config.permissions.allow_project_dependency_install,
+        allow_system_package_install=config.permissions.allow_system_package_install,
     )
 
 
@@ -244,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         config = load_config(args.config)
         if args.model:
-            config = AppConfig(args.model, config.base_url, config.timeout, config.max_attempts, config.profiles, config.visual)
+            config = AppConfig(args.model, config.base_url, config.timeout, config.max_attempts, config.profiles, config.visual, config.permissions)
         runner = make_runner(workspace, config)
         state = runner._required_state()
         state.model = config.model
