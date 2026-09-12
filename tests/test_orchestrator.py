@@ -1,7 +1,8 @@
 import subprocess
 from pathlib import Path
 
-from autodev.models import Task, TaskStatus
+from autodev.models import ProjectState, Task, TaskStatus
+from autodev.metrics import metrics
 from autodev.orchestrator import AutonomousRunner
 from autodev.providers import AgentReply, ScriptedProvider
 from autodev.state_store import StateStore
@@ -43,6 +44,67 @@ def test_python_notes_run_materializes_and_persists_project_interpreter_before_p
 
     assert Path(context["python_interpreter"]).is_file()
     assert Path(context["python_interpreter"]).is_absolute()
+
+
+def test_destructive_write_is_recovered_inside_same_coder_attempt(tmp_path: Path) -> None:
+    setup_repository(tmp_path)
+    old = "# preserved capability\n" * 80
+    (tmp_path / "app.py").write_text(old, encoding="utf-8")
+    provider = ScriptedProvider({
+        "CODER": [
+            AgentReply({"actions": [
+                {"kind": "write_file", "path": "created.txt", "content": "kept"},
+                {"kind": "write_file", "path": "app.py", "content": "too short\n"},
+            ]}),
+            AgentReply({"actions": [{"kind": "edit_file", "path": "app.py", "old": "# preserved capability\n", "new": "# updated capability\n"}]}),
+        ],
+        "TESTER": [AgentReply({"command": ["py", "-3", "-c", "print('ok')"]})],
+        "REVIEWER": [AgentReply({"approved": True, "reasons": []})],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = runner.initialize("Build Notes")
+    task = Task.create("Update capability", "Make one safe update")
+    state.tasks.append(task)
+
+    runner._run_task(state, task)
+
+    assert task.attempts == 1
+    assert task.status is TaskStatus.DONE
+    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "kept"
+    assert "# updated capability" in (tmp_path / "app.py").read_text(encoding="utf-8")
+    assert any(event.phase == "DESTRUCTIVE_WRITE_REJECTED" for event in state.events)
+    assert not any(event.agent == "ARCHITECT" for event in state.events)
+
+
+def test_tester_executes_regenerated_harness_without_new_coder_attempt(tmp_path: Path) -> None:
+    setup_repository(tmp_path)
+    provider = ScriptedProvider({
+        "CODER": [AgentReply({"actions": []})],
+        "TESTER": [
+            AgentReply({"command": ["py", "-3", "-c", "if True print('x')"]}),
+            AgentReply({"command": ["py", "-3", "-c", "print('ok')"]}),
+        ],
+        "REVIEWER": [AgentReply({"approved": True, "reasons": []})],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = runner.initialize("Build Notes")
+    task = Task.create("Validate backend", "Run a deterministic check")
+    state.tasks.append(task)
+
+    runner._run_task(state, task)
+
+    assert task.attempts == 1
+    assert task.status is TaskStatus.DONE
+    assert any(event.phase == "HARNESS_EXECUTE" for event in state.events)
+    assert any(event.phase == "HARNESS_RECOVERED" for event in state.events)
+
+
+def test_llm_completed_metric_never_exceeds_dispatched_requests() -> None:
+    state = ProjectState.create("Build Notes")
+    state.event_counters["LLM:REQUEST"] = 1
+    state.event_counters["LLM:RESPONSE"] = 2
+
+    assert metrics(state)["llm_responses_completed"] <= metrics(state)["llm_requests_attempted"]
 
 
 def test_runner_completes_multiple_tasks_and_repairs_a_failed_test(tmp_path: Path) -> None:

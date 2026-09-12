@@ -410,10 +410,32 @@ class AutonomousRunner:
                     task.errors.append(f"Tool stale edit recovery for {path}; current content: {current[-4000:]}")
                     tool_recoveries += 1
                     self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing stale edit context for {path}", task)
+                    self._mark(state, "CODER", "LLM_CALL", "Coder stale-edit recovery request", task)
                     refreshed = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
                     self._mark(state, "CODER", "LLM_RESPONSE", "Coder stale-edit recovery response received", task)
                     if not isinstance(refreshed, list):
                         raise ProviderError("Coder tool recovery response needs actions")
+                    actions = refreshed
+                    position = 0
+                    continue
+                except ToolPolicyError as error:
+                    if "DESTRUCTIVE_WRITE_REQUIRES_TARGETED_EDIT_OR_CURRENT_FULL_FILE" not in str(error) or tool_recoveries >= 2:
+                        raise
+                    path = action.get("path") if isinstance(action, dict) else None
+                    if not isinstance(path, str):
+                        raise
+                    _hash, current = self.tools.file_snapshot(path)
+                    task.errors.append(
+                        f"Whole-file replacement rejected for {path}. Use edit_file against current content; preserve unrelated functionality:\n{current[-4000:]}"
+                    )
+                    tool_recoveries += 1
+                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_REJECTED", f"Whole-file write rejected for {path}", task)
+                    self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing current file for targeted edit: {path}", task)
+                    self._mark(state, "CODER", "LLM_CALL", "Coder targeted-edit recovery request", task)
+                    refreshed = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
+                    self._mark(state, "CODER", "LLM_RESPONSE", "Coder targeted-edit recovery response received", task)
+                    if not isinstance(refreshed, list):
+                        raise ProviderError("Coder policy recovery response needs actions")
                     actions = refreshed
                     position = 0
                     continue
@@ -466,10 +488,11 @@ class AutonomousRunner:
         state.run_history.append(self._result_log(task, result))
         if result.exit_code != 0:
             failure = classify_failure(result, command, self.workspace)
-            if failure.kind in {FailureKind.TEST_HARNESS_FAILURE, FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
+            harness_attempts = 0
+            while result.exit_code != 0 and failure.kind in {FailureKind.TEST_HARNESS_FAILURE, FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
                 self._mark(state, "TESTER", "HARNESS_FAILURE", "Generated validation command is invalid; regenerate validation without changing application code", task)
-                if any(error.startswith("Tester harness failure:") for error in task.errors):
-                    self._block(task, state, "Tester generated two invalid validation commands; application code was not changed")
+                if harness_attempts >= 2:
+                    self._block(task, state, "TEST_HARNESS_BLOCKED: Tester generated three invalid validation commands; application code was not changed")
                     return
                 task.errors.append(f"Tester harness failure: {result.stderr or result.stdout}")
                 try:
@@ -479,6 +502,7 @@ class AutonomousRunner:
                     command = retry.get("command")
                     if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
                         raise ProviderError("Tester response needs a string command array")
+                    self._mark(state, "TESTER", "HARNESS_EXECUTE", "Executing regenerated validation command", task)
                     result = self.tools.run_tests(command)
                     state.run_history.append(self._result_log(task, result))
                 except ProviderUnavailableError as error:
@@ -488,10 +512,13 @@ class AutonomousRunner:
                 except (ProviderError, ToolPolicyError, ValueError) as error:
                     self._block(task, state, f"Tester harness regeneration failed: {error}")
                     return
-                if result.exit_code != 0 and classify_failure(result, command, self.workspace).kind in {FailureKind.TEST_HARNESS_FAILURE, FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
-                    self._block(task, state, "Tester generated two invalid validation commands; application code was not changed")
-                    return
+                harness_attempts += 1
+                failure = classify_failure(result, command, self.workspace)
+            if harness_attempts and result.exit_code == 0:
+                self._mark(state, "TESTER", "HARNESS_RECOVERED", "Regenerated validation command passed", task)
             if result.exit_code != 0:
+                if not actions:
+                    self._mark(state, "CODER", "NOOP_FAILED_ACCEPTANCE", "No-op Coder response did not satisfy acceptance", task)
                 failure = classify_failure(result, command, self.workspace)
                 if failure.kind is FailureKind.MISSING_EXECUTABLE and command[0].lower() in {"npm", "node"}:
                     self._pivot_to_static_frontend(state, task)
@@ -503,6 +530,8 @@ class AutonomousRunner:
                 else:
                     self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}")
                     return
+        elif not actions:
+            self._mark(state, "CODER", "NOOP_ALREADY_SATISFIED", "No-op Coder response passed acceptance", task)
 
         if not self._run_accepted_regressions(state, task, command):
             return
@@ -807,6 +836,15 @@ class AutonomousRunner:
         self._mark(state, "ENVIRONMENT", failure.kind.value, f"Classified command failure: {failure.kind.value}", task)
         if failure.kind in {FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
             state.run_history.append("Test harness diagnostic: check cwd/package layout/PYTHONPATH before code repair")
+            return False
+        repairable = {
+            FailureKind.MISSING_PYTHON_DEPENDENCY,
+            FailureKind.MISSING_EXECUTABLE,
+            FailureKind.GLOBAL_ENVIRONMENT_LEAK,
+            FailureKind.PROJECT_DEPENDENCY_INCOMPATIBLE,
+        }
+        if failure.kind not in repairable:
+            self._mark(state, "ENVIRONMENT", "REPAIR_SKIPPED", f"No deterministic environment repair for: {failure.kind.value}", task)
             return False
         self._mark(state, "ENVIRONMENT", "REPAIR_ATTEMPT", f"Environment repair attempt: {failure.kind.value}", task)
         repaired = self.environment_manager.repair(failure, state.environment)
