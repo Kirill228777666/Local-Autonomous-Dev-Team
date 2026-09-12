@@ -12,12 +12,17 @@ from autodev.tools import WorkspaceTools
 
 
 class RecordingTools:
-    def __init__(self, replies: list[CommandResult] | None = None) -> None:
+    def __init__(self, replies: list[CommandResult] | None = None, workspace: Path | None = None) -> None:
         self.commands: list[list[str]] = []
         self.replies = replies or []
+        self.workspace = workspace
 
     def run_command(self, command: list[str]) -> CommandResult:
         self.commands.append(command)
+        if self.workspace is not None and "venv" in command and "-m" in command:
+            executable = self.workspace / ".venv" / "Scripts" / "python.exe"
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_text("", encoding="utf-8")
         return self.replies.pop(0) if self.replies else CommandResult(0, "ok", "")
 
 
@@ -29,8 +34,37 @@ def test_classifier_identifies_environment_failures_before_llm_repair() -> None:
     assert classify_failure(CommandResult(7, "", "curl: (7) Failed to connect to localhost:5000"), ["curl", "http://localhost:5000"]).kind is FailureKind.SERVICE_NOT_RUNNING
 
 
+def test_classifier_keeps_local_package_import_failure_out_of_pip(tmp_path: Path) -> None:
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "__init__.py").write_text("", encoding="utf-8")
+
+    failure = classify_failure(
+        CommandResult(1, "", "ModuleNotFoundError: No module named 'backend'"),
+        ["python", "backend/tests.py"],
+        tmp_path,
+    )
+
+    assert failure.kind is FailureKind.LOCAL_IMPORT_PATH_ERROR
+
+
+def test_python_project_environment_is_materialized_even_when_global_packages_exist(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path)
+    manager = EnvironmentManager(tmp_path, tools)
+
+    assert manager.ensure_python_environment() is True
+    context = manager.execution_context()
+    interpreter = Path(context["python_interpreter"])
+
+    assert interpreter.is_file()
+    assert interpreter.is_absolute()
+    result = tools.run_command(["python", "-c", "import sys, site; print(sys.executable); print(site.ENABLE_USER_SITE)"])
+    assert result.exit_code == 0
+    assert str(interpreter) in result.stdout
+    assert result.stdout.rstrip().endswith("False")
+
+
 def test_missing_flask_is_persisted_installed_in_project_venv_and_retried(tmp_path: Path) -> None:
-    tools = RecordingTools()
+    tools = RecordingTools(workspace=tmp_path)
     manager = EnvironmentManager(tmp_path, tools, allow_project_dependency_install=True)
     failure = classify_failure(CommandResult(1, "", "ModuleNotFoundError: No module named 'flask'"), ["py", "-3", "app.py"])
 

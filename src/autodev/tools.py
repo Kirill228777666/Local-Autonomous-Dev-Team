@@ -46,6 +46,7 @@ class WorkspaceTools:
     def __init__(self, workspace: Path, command_timeout: float = 120.0) -> None:
         self.workspace = workspace.resolve()
         self.command_timeout = command_timeout
+        self.require_project_python = False
 
     def _path(self, relative_path: str) -> Path:
         path = (self.workspace / relative_path).resolve()
@@ -66,6 +67,13 @@ class WorkspaceTools:
 
     def write_file(self, relative_path: str, content: str) -> None:
         path = self._path(relative_path)
+        if path.is_file():
+            previous = path.read_text(encoding="utf-8")
+            # A short overwrite of a substantial source file is almost always a
+            # stale-model rewrite.  Targeted edits or a full current-file rewrite
+            # remain available, but silently dropping accepted routes is not.
+            if len(previous) >= 500 and len(content) < len(previous) * 0.5:
+                raise ToolPolicyError("DESTRUCTIVE_WRITE_REQUIRES_TARGETED_EDIT_OR_CURRENT_FULL_FILE")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
@@ -98,6 +106,8 @@ class WorkspaceTools:
             raise ToolPolicyError("command must not be empty")
         if self._is_activation_command(command):
             return CommandResult(126, "", "PROJECT_ENVIRONMENT_IS_ALREADY_MANAGED; use the project interpreter explicitly")
+        if self.require_project_python and self._is_project_python_command(command) and self.project_python is None:
+            return CommandResult(126, "", "ENVIRONMENT_NOT_INITIALIZED: project Python interpreter is missing")
         command = self.normalize_command(command)
         executable = Path(command[0]).name.lower()
         if executable in self._BLOCKED_COMMANDS:
@@ -157,7 +167,16 @@ class WorkspaceTools:
             return [str(interpreter), *remainder]
         if first in {"pip", "pip.exe"}:
             return [str(interpreter), "-m", "pip", *command[1:]]
+        if first in {"pytest", "pytest.exe", "unittest"}:
+            return [str(interpreter), "-m", first.removesuffix(".exe"), *command[1:]]
         return list(command)
+
+    @staticmethod
+    def _is_project_python_command(command: list[str]) -> bool:
+        if not command:
+            return False
+        first = Path(command[0]).name.lower()
+        return first in {"python", "python.exe", "py", "py.exe", "pip", "pip.exe", "pytest", "pytest.exe", "unittest"}
 
     @staticmethod
     def _is_activation_command(command: list[str]) -> bool:

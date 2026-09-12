@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from autodev.models import TaskStatus
+from autodev.models import Task, TaskStatus
 from autodev.orchestrator import AutonomousRunner
 from autodev.providers import AgentReply, ScriptedProvider
 from autodev.state_store import StateStore
@@ -19,6 +19,30 @@ def setup_repository(path: Path) -> None:
     (path / ".gitignore").write_text(".autodev/\n", encoding="utf-8")
     git(path, "add", ".gitignore")
     git(path, "commit", "-m", "initial")
+
+
+def test_regression_guard_rejects_later_change_when_accepted_capability_fails(tmp_path: Path) -> None:
+    setup_repository(tmp_path)
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))
+    state = runner.initialize("Build Notes")
+    task = Task.create("Later capability", "Change a later endpoint")
+    state.tasks.append(task)
+    state.accepted_regressions.append({"key": "accepted", "task": "Create notes", "command": ["py", "-3", "-c", "raise SystemExit(1)"]})
+
+    assert runner._run_accepted_regressions(state, task, ["py", "-3", "-c", "print('current')"]) is False
+    assert any(event.agent == "REGRESSION" and event.phase == "FAIL" for event in state.events)
+
+
+def test_python_notes_run_materializes_and_persists_project_interpreter_before_planning(tmp_path: Path) -> None:
+    setup_repository(tmp_path)
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))
+    runner.initialize("Create a local Notes backend with SQLite persistence")
+
+    state = runner.run(max_cycles=0)
+    context = state.environment["execution_context"]
+
+    assert Path(context["python_interpreter"]).is_file()
+    assert Path(context["python_interpreter"]).is_absolute()
 
 
 def test_runner_completes_multiple_tasks_and_repairs_a_failed_test(tmp_path: Path) -> None:

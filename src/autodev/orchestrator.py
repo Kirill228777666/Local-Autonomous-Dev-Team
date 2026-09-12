@@ -93,6 +93,13 @@ class AutonomousRunner:
             state.environment = self.environment_manager.discover()
             state.run_history.append("Environment capabilities discovered")
             self._mark(state, "ENVIRONMENT", "CHECK", "Environment capabilities discovered")
+        if not state.architecture:
+            state.architecture = default_contract(state.original_spec, state.environment)
+        if self._is_python_project(state) and not self._ensure_project_python(state):
+            state.status = "BLOCKED"
+            self._mark(state, "ENVIRONMENT", "NOT_INITIALIZED", self.environment_manager.last_diagnostic, None)
+            self.store.save(state)
+            return state
         self._mark(state, "MANAGER", "PLANNING", "Autonomous run started")
         if not state.tasks:
             self._plan(state)
@@ -355,12 +362,15 @@ class AutonomousRunner:
         state.current_task_id = task.id
         task.attempts += 1
         self._mark(state, "CODER", "IMPLEMENTING", f"Coder started attempt {task.attempts}: {task.title}", task)
+        before_files = self._source_fingerprints()
         try:
             self._mark(state, "CODER", "LLM_CALL", "Coder implementation request", task)
-            actions = self.agents.code(state, task).data.get("actions")
+            actions = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
             self._mark(state, "CODER", "LLM_RESPONSE", "Coder implementation response received", task)
             if not isinstance(actions, list):
                 raise ProviderError("Coder response needs an actions array")
+            if not actions:
+                self._mark(state, "CODER", "NOOP", "Coder returned no tool actions", task)
             fingerprint = hashlib.sha256(json.dumps(actions, sort_keys=True).encode()).hexdigest()
             if fingerprint in task.action_fingerprints:
                 self._block(task, state, "repeated identical coder action without progress")
@@ -382,7 +392,7 @@ class AutonomousRunner:
                         state.tool_executions[-1].finish(ToolExecutionStatus.SUCCEEDED, "rerouted to managed process")
                         position += 1
                         continue
-                    failure = classify_failure(error.result, error.command)
+                    failure = classify_failure(error.result, error.command, self.workspace)
                     if failure.kind is FailureKind.MISSING_EXECUTABLE and error.command[0].lower() in {"npm", "node"}:
                         self._pivot_to_static_frontend(state, task)
                         return
@@ -400,7 +410,7 @@ class AutonomousRunner:
                     task.errors.append(f"Tool stale edit recovery for {path}; current content: {current[-4000:]}")
                     tool_recoveries += 1
                     self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing stale edit context for {path}", task)
-                    refreshed = self.agents.code(state, task).data.get("actions")
+                    refreshed = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
                     self._mark(state, "CODER", "LLM_RESPONSE", "Coder stale-edit recovery response received", task)
                     if not isinstance(refreshed, list):
                         raise ProviderError("Coder tool recovery response needs actions")
@@ -408,6 +418,8 @@ class AutonomousRunner:
                     position = 0
                     continue
                 position += 1
+            if before_files == self._source_fingerprints() and any(isinstance(action, dict) and action.get("kind") in {"write_file", "edit_file", "append_file", "delete_file"} for action in actions):
+                self._mark(state, "CODER", "ZERO_DIFF", "Coder file actions produced no semantic file change", task)
             state.run_history.append(f"Coder completed attempt {task.attempts} for {task.title}")
         except ProviderUnavailableError as error:
             self._preserve_task_for_provider_wait(task, state)
@@ -453,8 +465,8 @@ class AutonomousRunner:
                 return
         state.run_history.append(self._result_log(task, result))
         if result.exit_code != 0:
-            failure = classify_failure(result, command)
-            if failure.kind is FailureKind.TEST_HARNESS_FAILURE:
+            failure = classify_failure(result, command, self.workspace)
+            if failure.kind in {FailureKind.TEST_HARNESS_FAILURE, FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
                 self._mark(state, "TESTER", "HARNESS_FAILURE", "Generated validation command is invalid; regenerate validation without changing application code", task)
                 if any(error.startswith("Tester harness failure:") for error in task.errors):
                     self._block(task, state, "Tester generated two invalid validation commands; application code was not changed")
@@ -476,11 +488,11 @@ class AutonomousRunner:
                 except (ProviderError, ToolPolicyError, ValueError) as error:
                     self._block(task, state, f"Tester harness regeneration failed: {error}")
                     return
-                if result.exit_code != 0 and classify_failure(result, command).kind is FailureKind.TEST_HARNESS_FAILURE:
+                if result.exit_code != 0 and classify_failure(result, command, self.workspace).kind in {FailureKind.TEST_HARNESS_FAILURE, FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
                     self._block(task, state, "Tester generated two invalid validation commands; application code was not changed")
                     return
             if result.exit_code != 0:
-                failure = classify_failure(result, command)
+                failure = classify_failure(result, command, self.workspace)
                 if failure.kind is FailureKind.MISSING_EXECUTABLE and command[0].lower() in {"npm", "node"}:
                     self._pivot_to_static_frontend(state, task)
                     return
@@ -492,6 +504,8 @@ class AutonomousRunner:
                     self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}")
                     return
 
+        if not self._run_accepted_regressions(state, task, command):
+            return
         if not self._visual_review(state, task):
             return
 
@@ -526,6 +540,7 @@ class AutonomousRunner:
             self._retry_or_block(task, state, f"Git checkpoint failed: {error}")
             return
         task.status = TaskStatus.DONE
+        self._record_accepted_regression(state, task, command)
         if task.repair_of:
             original = next((candidate for candidate in state.tasks if candidate.id == task.repair_of), None)
             if original is not None:
@@ -787,21 +802,91 @@ class AutonomousRunner:
             self._mark(state, "MANAGER", "DECOMPOSED", f"Decomposed broad task: {task.title}")
 
     def _repair_environment_failure(self, state: ProjectState, task: Task, command: list[str], result: CommandResult) -> bool:
-        failure = classify_failure(result, command)
+        failure = classify_failure(result, command, self.workspace)
         state.run_history.append(f"Failure classified: {failure.kind.value}")
         self._mark(state, "ENVIRONMENT", failure.kind.value, f"Classified command failure: {failure.kind.value}", task)
-        if failure.kind is FailureKind.IMPORT_PATH:
+        if failure.kind in {FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
             state.run_history.append("Test harness diagnostic: check cwd/package layout/PYTHONPATH before code repair")
             return False
+        self._mark(state, "ENVIRONMENT", "REPAIR_ATTEMPT", f"Environment repair attempt: {failure.kind.value}", task)
         repaired = self.environment_manager.repair(failure, state.environment)
-        if repaired:
+        if repaired and self.environment_manager.verify(failure):
             state.environment["execution_context"] = self.environment_manager.execution_context()
             state.run_history.append(f"Environment repair completed: {failure.kind.value}")
             self._mark(state, "ENVIRONMENT", "REPAIRED", f"Environment repair completed: {failure.kind.value}", task)
             return True
+        if repaired:
+            self._mark(state, "ENVIRONMENT", "REPAIR_FAILED", f"Environment repair did not clear: {failure.kind.value}", task)
         if self.environment_manager.last_diagnostic:
             state.run_history.append(f"Environment limitation: {self.environment_manager.last_diagnostic}")
         return False
+
+    def _is_python_project(self, state: ProjectState) -> bool:
+        contract = state.architecture
+        if str(contract.get("backend_framework", "")).lower() in {"flask", "django", "fastapi"}:
+            return True
+        text = state.original_spec.lower()
+        return any(token in text for token in ("python", "flask", "sqlite", "бэкенд", "backend"))
+
+    def _ensure_project_python(self, state: ProjectState) -> bool:
+        context = state.environment.get("execution_context")
+        interpreter = context.get("python_interpreter") if isinstance(context, dict) else ""
+        if isinstance(interpreter, str) and interpreter and Path(interpreter).is_file():
+            self.tools.require_project_python = True
+            return True
+        if not self.environment_manager.ensure_python_environment():
+            return False
+        state.environment["execution_context"] = self.environment_manager.execution_context()
+        state.run_history.append(f"Project Python environment initialized: {state.environment['execution_context']['python_interpreter']}")
+        self._mark(state, "ENVIRONMENT", "INITIALIZED", "Project-local Python interpreter materialized", None)
+        return True
+
+    def _coder_file_context(self, task: Task) -> list[str]:
+        """Give whole-file writers fresh source rather than a stale filename list."""
+        candidates = [path for path in self.tools.list_files() if path.endswith((".py", ".js", ".html", ".css", ".md"))]
+        words = set(re.findall(r"[a-zA-Z0-9_]+", f"{task.title} {task.description}".lower()))
+        ranked = sorted(candidates, key=lambda path: (not any(word in path.lower() for word in words), path))[:2]
+        snapshots: list[str] = []
+        for path in ranked:
+            try:
+                content = self.tools.read_file(path)
+            except (OSError, UnicodeError):
+                continue
+            if len(content) <= 4000:
+                snapshots.append(f"{path} (current full content):\n{content}")
+        return snapshots
+
+    def _source_fingerprints(self) -> dict[str, str]:
+        fingerprints: dict[str, str] = {}
+        for path in self.tools.list_files():
+            if path.endswith((".py", ".js", ".html", ".css", ".json", ".md")):
+                try:
+                    fingerprints[path] = hashlib.sha256(self.tools.read_file(path).encode("utf-8")).hexdigest()
+                except (OSError, UnicodeError):
+                    continue
+        return fingerprints
+
+    def _record_accepted_regression(self, state: ProjectState, task: Task, command: list[str]) -> None:
+        if not command or command == ["README validator"]:
+            return
+        key = json.dumps(command)
+        if any(item.get("key") == key for item in state.accepted_regressions):
+            return
+        state.accepted_regressions.append({"key": key, "command": command, "task": task.title})
+
+    def _run_accepted_regressions(self, state: ProjectState, task: Task, current_command: list[str]) -> bool:
+        for check in state.accepted_regressions[-8:]:
+            command = check.get("command")
+            if not isinstance(command, list) or command == current_command or not all(isinstance(part, str) for part in command):
+                continue
+            self._mark(state, "REGRESSION", "CHECK", f"Regression guard: {check.get('task', 'accepted capability')}", task)
+            result = self.tools.run_tests(command)
+            if result.exit_code == 0:
+                continue
+            self._mark(state, "REGRESSION", "FAIL", f"Previously accepted capability regressed: {check.get('task', 'unknown')}", task)
+            self._retry_or_block(task, state, f"REGRESSION: accepted capability {check.get('task')} failed: {result.stderr or result.stdout}")
+            return False
+        return True
 
     def _pivot_to_static_frontend(self, state: ProjectState, task: Task) -> None:
         """Replace npm-specific work with a Node-free browser frontend while retaining product goals."""

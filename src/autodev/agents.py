@@ -38,7 +38,7 @@ class RoleAgents:
             self._valid_selection,
         )
 
-    def code(self, state: ProjectState, task: Task) -> AgentReply:
+    def code(self, state: ProjectState, task: Task, relevant_files: list[str] | None = None) -> AgentReply:
         schema = (
             "Return {\"actions\":[...]}. Each action must be exactly one of: "
             "{\"kind\":\"write_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
@@ -48,7 +48,7 @@ class RoleAgents:
             "{\"kind\":\"run_command\",\"command\":[\"program\",\"arg\"]}. "
             "Paths must be relative to the workspace; do not use shell wrappers.\n\n"
         )
-        return self._ask("CODER", schema + self.context.for_task(state, task, []), self._valid_actions)
+        return self._ask("CODER", schema + self.context.for_task(state, task, relevant_files or []), self._valid_actions)
 
     def test(self, state: ProjectState, task: Task) -> AgentReply:
         instruction = (

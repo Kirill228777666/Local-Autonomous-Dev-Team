@@ -192,6 +192,7 @@ class ProjectState:
     event_counters: dict[str, int] = field(default_factory=dict)
     provider_state: dict[str, object] = field(default_factory=dict)
     managed_processes: list[dict[str, object]] = field(default_factory=list)
+    accepted_regressions: list[dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def create(cls, original_spec: str) -> ProjectState:
@@ -231,6 +232,7 @@ class ProjectState:
             event_counters={str(key): int(count) for key, count in dict(value.get("event_counters", {})).items()},  # type: ignore[arg-type]
             provider_state=dict(value.get("provider_state", {})),  # type: ignore[arg-type]
             managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
+            accepted_regressions=[dict(item) for item in value.get("accepted_regressions", []) if isinstance(item, dict)],  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -260,6 +262,7 @@ class ProjectState:
             "event_counters": self.event_counters,
             "provider_state": self.provider_state,
             "managed_processes": self.managed_processes[-100:],
+            "accepted_regressions": self.accepted_regressions[-20:],
         }
 
     def record_event(self, agent: str, phase: str, message: str, task_id: str | None = None) -> None:

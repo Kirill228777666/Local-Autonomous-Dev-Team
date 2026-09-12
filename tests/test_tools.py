@@ -68,6 +68,26 @@ def test_project_venv_rewrites_python_py_and_pip_commands(tmp_path: Path) -> Non
     assert tools.normalize_command(["python", "-m", "pytest"]) == [str(interpreter), "-m", "pytest"]
     assert tools.normalize_command(["py", "-3", "app.py"]) == [str(interpreter), "app.py"]
     assert tools.normalize_command(["pip", "install", "Flask"]) == [str(interpreter), "-m", "pip", "install", "Flask"]
+    assert tools.normalize_command(["pytest", "-q"]) == [str(interpreter), "-m", "pytest", "-q"]
+    assert tools.normalize_command(["unittest", "discover"]) == [str(interpreter), "-m", "unittest", "discover"]
+
+
+def test_workspace_tools_refuses_project_python_commands_until_environment_exists(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path)
+    tools.require_project_python = True
+
+    result = tools.run_command(["python", "-c", "print('no leak')"])
+
+    assert result.exit_code == 126
+    assert "ENVIRONMENT_NOT_INITIALIZED" in result.stderr
+
+
+def test_workspace_tools_rejects_large_destructive_whole_file_rewrite(tmp_path: Path) -> None:
+    tools = WorkspaceTools(tmp_path)
+    tools.write_file("app.py", "@app.route('/api/notes')\n" + ("# preserved capability\n" * 80))
+
+    with pytest.raises(ToolPolicyError, match="DESTRUCTIVE_WRITE"):
+        tools.write_file("app.py", "print('replacement')\n")
 
 
 def test_workspace_tools_rejects_venv_activation_command(tmp_path: Path) -> None:

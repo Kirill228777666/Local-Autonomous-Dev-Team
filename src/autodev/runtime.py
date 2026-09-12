@@ -277,7 +277,7 @@ class ApplicationScreenshotPipeline(ScreenshotPipeline):
         port = free_port()
         resolved_url = url.replace("{port}", str(port))
         resolved_health = self.health_url.replace("{port}", str(port)) if self.health_url else ""
-        command = [part.replace("{port}", str(port)) for part in self.command]
+        command = self.resolve_command(port)
         manager = ManagedProcessManager(self.workspace)
         record = manager.start(command, purpose="screenshot", expected_port=port, timeout=self.ready_timeout)
         try:
@@ -287,3 +287,26 @@ class ApplicationScreenshotPipeline(ScreenshotPipeline):
             return super().capture(resolved_url)
         finally:
             manager.stop(record.id)
+
+    def resolve_command(self, port: int) -> list[str]:
+        """Resolve a configured stale entry point from actual project evidence."""
+        command = [part.replace("{port}", str(port)) for part in self.command]
+        python_positions = [index for index, part in enumerate(command) if part.lower().endswith(".py")]
+        if not python_positions:
+            return command
+        index = python_positions[-1]
+        configured = self.workspace / command[index]
+        if configured.is_file():
+            return command
+        candidates: list[Path] = []
+        readme = self.workspace / "README.md"
+        if readme.is_file():
+            import re
+            for match in re.findall(r"(?:python|py(?:\s+-3)?)\s+([\w./\\-]+\.py)", readme.read_text(encoding="utf-8", errors="ignore"), re.I):
+                candidates.append(self.workspace / match.replace("\\", "/"))
+        candidates.extend(self.workspace / name for name in ("app.py", "main.py", "server.py", "backend/app.py", "backend/main.py", "backend/server.py"))
+        for candidate in candidates:
+            if candidate.is_file():
+                command[index] = str(candidate.relative_to(self.workspace)).replace("\\", "/")
+                return command
+        return command

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .tools import CommandResult
 
@@ -14,6 +15,8 @@ class FailureKind(StrEnum):
     MISSING_PYTHON_DEPENDENCY = "MISSING_PYTHON_DEPENDENCY"
     MISSING_NODE_DEPENDENCY = "MISSING_NODE_DEPENDENCY"
     IMPORT_PATH = "IMPORT_PATH"
+    LOCAL_IMPORT_PATH_ERROR = "LOCAL_IMPORT_PATH_ERROR"
+    ENVIRONMENT_NOT_INITIALIZED = "ENVIRONMENT_NOT_INITIALIZED"
     ASSERTION = "ASSERTION"
     PORT_CONFLICT = "PORT_CONFLICT"
     TIMEOUT = "TIMEOUT"
@@ -41,9 +44,11 @@ class ReadmeResult:
     findings: list[str]
 
 
-def classify_failure(result: CommandResult, command: list[str]) -> Failure:
+def classify_failure(result: CommandResult, command: list[str], workspace: Path | None = None) -> Failure:
     text = f"{result.stdout}\n{result.stderr}"
     lowered = text.lower()
+    if "environment_not_initialized" in lowered:
+        return Failure(FailureKind.ENVIRONMENT_NOT_INITIALIZED, command, text)
     if "syntaxerror" in lowered and "-c" in command:
         return Failure(FailureKind.TEST_HARNESS_FAILURE, command, text)
     if ("connection refused" in lowered or "failed to connect" in lowered) and any("localhost" in item or "127.0.0.1" in item for item in command):
@@ -55,6 +60,8 @@ def classify_failure(result: CommandResult, command: list[str]) -> Failure:
     module = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)", text)
     if module:
         name = module.group(1)
+        if workspace is not None and _is_local_module(workspace, name):
+            return Failure(FailureKind.LOCAL_IMPORT_PATH_ERROR, command, text, name)
         kind = FailureKind.IMPORT_PATH if name in {"app", "src", "tests"} else FailureKind.MISSING_PYTHON_DEPENDENCY
         return Failure(kind, command, text, name)
     if result.exit_code == 127 or "command not found:" in text.lower() or "[winerror 2]" in text.lower():
@@ -72,6 +79,14 @@ def classify_failure(result: CommandResult, command: list[str]) -> Failure:
     if "assert " in text.lower() or "assertionerror" in text.lower() or "failed" in text.lower():
         return Failure(FailureKind.ASSERTION, command, text)
     return Failure(FailureKind.APPLICATION, command, text)
+
+
+def _is_local_module(workspace: Path, module: str) -> bool:
+    """Only a workspace module can be an import-path repair, never a pip install."""
+    root = workspace.resolve()
+    parts = module.split(".")
+    candidate = root.joinpath(*parts)
+    return candidate.is_dir() or candidate.with_suffix(".py").is_file()
 
 
 class EnvironmentManager:
@@ -104,6 +119,21 @@ class EnvironmentManager:
             "pip": f"{self.venv_python} -m pip" if self.venv_python.exists() else "",
         }
 
+    def ensure_python_environment(self) -> bool:
+        """Materialize and select the project interpreter before project commands."""
+        if not self.ensure_venv():
+            return False
+        if not self.venv_python.is_file():
+            self.last_diagnostic = f"Project virtual environment was not materialized: {self.venv_python}"
+            return False
+        # WorkspaceTools consumes this invariant before it accepts python/pytest.
+        setattr(self.tools, "require_project_python", True)
+        probe = self.tools.run_command([str(self.venv_python), "-c", "import site,sys; assert not site.ENABLE_USER_SITE; print(sys.executable)"])
+        if probe.exit_code:
+            self.last_diagnostic = probe.stderr or probe.stdout
+            return False
+        return True
+
     def ensure_venv(self) -> bool:
         if self.venv_python.exists():
             return True
@@ -122,7 +152,7 @@ class EnvironmentManager:
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", package):
                 self.last_diagnostic = f"Unsafe or ambiguous Python package name: {failure.module}"
                 return False
-            if not self.ensure_venv():
+            if not self.ensure_python_environment():
                 return False
             fingerprint = f"{failure.module}|{self.venv_python}"
             dependencies = state.setdefault("dependencies", {}) if state is not None else {}
@@ -148,6 +178,14 @@ class EnvironmentManager:
             if not self.allow_system_package_install:
                 self.last_diagnostic = "Node.js/npm required by chosen architecture but system installation is disabled."
                 return False
+        return False
+
+    def verify(self, failure: Failure) -> bool:
+        """Verify the repaired condition without claiming success from an install exit code."""
+        if failure.kind is FailureKind.MISSING_PYTHON_DEPENDENCY and failure.module:
+            probe = self.tools.run_command([str(self.venv_python), "-c", f"import {failure.module}"])
+            self.last_diagnostic = probe.stderr or probe.stdout
+            return probe.exit_code == 0
         return False
 
 
