@@ -2,6 +2,7 @@ import json
 from urllib.error import HTTPError, URLError
 
 import pytest
+import autodev.providers as providers_module
 
 from autodev.providers import (
     AgentReply,
@@ -38,7 +39,7 @@ def test_ollama_provider_sends_low_temperature_and_parses_json_response() -> Non
 
     def transport(url: str, payload: bytes, timeout: float) -> bytes:
         assert url == "http://127.0.0.1:11434/api/chat"
-        assert timeout == 30
+        assert 29.0 < timeout <= 30
         sent_payloads.append(json.loads(payload))
         return json.dumps({"message": {"content": '{"approved": true}'}}).encode()
 
@@ -51,6 +52,7 @@ def test_ollama_provider_sends_low_temperature_and_parses_json_response() -> Non
     assert sent_payloads[0]["options"] == {"temperature": 0.1, "num_ctx": 16384}
     assert sent_payloads[0]["keep_alive"] == "10m"
     assert sent_payloads[0]["format"] == "json"
+    assert sent_payloads[0]["think"] is False
 
 
 def test_ollama_provider_retries_transient_transport_error() -> None:
@@ -92,3 +94,22 @@ def test_ollama_http_503_is_an_endpoint_outage_after_bounded_retry() -> None:
             AgentRequest(role="CODER", prompt="implement")
         )
     assert attempts == 2
+
+
+def test_retries_share_one_hard_wall_clock_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed_timeouts: list[float] = []
+    clock = iter((100.0, 100.0, 104.0))
+    monkeypatch.setattr(providers_module.time, "monotonic", lambda: next(clock))
+
+    def transport(_url: str, _payload: bytes, timeout: float) -> bytes:
+        observed_timeouts.append(timeout)
+        if len(observed_timeouts) == 1:
+            raise URLError("temporary")
+        return b'{"message":{"content":"{\\"actions\\":[]}"}}'
+
+    reply = OllamaProvider(model="qwen", timeout=5, retries=1, transport=transport).complete(
+        AgentRequest(role="CODER", prompt="implement")
+    )
+
+    assert reply.data == {"actions": []}
+    assert observed_timeouts == [5.0, 1.0]

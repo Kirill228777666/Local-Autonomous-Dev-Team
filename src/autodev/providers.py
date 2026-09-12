@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Protocol
@@ -85,6 +86,10 @@ class OllamaProvider:
                 "stream": False,
                 "format": "json",
                 "keep_alive": self.keep_alive,
+                # A bounded JSON tool decision benefits from a direct answer;
+                # long hidden reasoning can otherwise keep a local 30B request
+                # alive long after useful work has stopped.
+                "think": False,
                 "options": {"temperature": self.temperature, "num_ctx": self.context_limit},
                 "messages": [
                     {"role": "system", "content": request.system_prompt},
@@ -92,11 +97,16 @@ class OllamaProvider:
                 ],
             }
         ).encode("utf-8")
+        deadline = time.monotonic() + self.timeout
         transport_error: Exception | None = None
         response_error: Exception | None = None
         for _attempt in range(self.retries + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                transport_error = TimeoutError(f"Ollama request exceeded hard wall-clock timeout of {self.timeout}s")
+                break
             try:
-                raw = self.transport(f"{self.base_url}/api/chat", payload, self.timeout)
+                raw = self.transport(f"{self.base_url}/api/chat", payload, remaining)
                 envelope = json.loads(raw)
                 content = envelope["message"]["content"]
                 if isinstance(content, str) and content.strip().startswith("```"):

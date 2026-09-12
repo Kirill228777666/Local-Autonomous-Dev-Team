@@ -504,7 +504,7 @@ class AutonomousRunner:
         try:
             self._mark(state, "REVIEWER", "REVIEW", f"Reviewer evaluating: {task.title}", task)
             self._mark(state, "REVIEWER", "LLM_CALL", "Reviewer decision request", task)
-            evidence = self._result_log(task, result) + "\nGit diff:\n" + self._git_diff()
+            evidence = self._result_log(task, result) + "\nGit diff (bounded):\n" + self._git_diff()[-6000:]
             review = self.agents.review(state, task, evidence).data
             self._mark(state, "REVIEWER", "LLM_RESPONSE", "Reviewer decision response received", task)
             if review.get("approved") is not True:
