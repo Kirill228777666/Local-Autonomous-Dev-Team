@@ -710,7 +710,11 @@ class AutonomousRunner:
             "создан", "редакт", "удален", "удалён", "поиск", "категор", "избран",
         )
         for task in list(state.tasks):
-            if task.status is not TaskStatus.PENDING or task.repair_of is not None:
+            if (
+                task.status is not TaskStatus.PENDING
+                or task.repair_of is not None
+                or task.description.startswith("[AUTODEV_ATOMIC]")
+            ):
                 continue
             text = f"{task.title} {task.description}".lower()
             product_is_broad = sum(marker in product for marker in capability_markers) >= 4
@@ -726,7 +730,7 @@ class AutonomousRunner:
             for title, bounded_scope in atoms:
                 state.tasks.append(Task.create(
                     title,
-                    f"{bounded_scope} Independently validate only this capability. Original scope: {task.description}",
+                    f"[AUTODEV_ATOMIC] {bounded_scope} Independently validate only this capability. Original scope: {task.description}",
                     dependencies=task.dependencies,
                 ))
             state.run_history.append(f"Manager decomposed broad task: {task.title}")

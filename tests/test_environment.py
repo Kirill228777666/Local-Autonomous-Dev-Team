@@ -149,6 +149,8 @@ def test_manager_decomposes_broad_russian_backend_scope_into_atomic_tasks(tmp_pa
         "Implement note search and categories",
         "Implement note favorites and validation",
     }
+    runner._decompose_broad_tasks(state)
+    assert len(state.tasks) == 5
 
 
 def test_metrics_counters_survive_event_history_truncation() -> None:
