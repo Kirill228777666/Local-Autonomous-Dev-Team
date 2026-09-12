@@ -90,6 +90,9 @@ class OllamaProvider:
                 raw = self.transport(f"{self.base_url}/api/chat", payload, self.timeout)
                 envelope = json.loads(raw)
                 content = envelope["message"]["content"]
+                if isinstance(content, str) and content.strip().startswith("```"):
+                    lines = content.strip().splitlines()
+                    content = "\n".join(lines[1:-1]) if len(lines) >= 3 else content
                 data = json.loads(content)
                 if not isinstance(data, dict):
                     raise ProviderError("Ollama response content must be a JSON object")

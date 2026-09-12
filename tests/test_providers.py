@@ -68,3 +68,11 @@ def test_ollama_provider_retries_transient_transport_error() -> None:
 
     assert attempts == 2
     assert reply.data == {"actions": []}
+
+
+def test_ollama_provider_accepts_json_wrapped_in_markdown_fence() -> None:
+    reply = OllamaProvider(model="qwen", transport=lambda *_: b'{"message":{"content":"```json\\n{\\\"actions\\\": []}\\n```"}}').complete(
+        AgentRequest(role="CODER", prompt="implement")
+    )
+
+    assert reply.data == {"actions": []}
