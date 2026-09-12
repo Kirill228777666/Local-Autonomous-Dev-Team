@@ -138,10 +138,15 @@ class Task:
     action_fingerprints: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     repair_of: str | None = None
+    root_task_id: str = ""
+    parent_task_id: str | None = None
+    failure_fingerprint: str = ""
+    strategy_generation: int = 0
 
     @classmethod
-    def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None) -> Task:
-        return cls(id=str(uuid4()), title=title, description=description, dependencies=dependencies or [], repair_of=repair_of)
+    def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None, root_task_id: str | None = None, parent_task_id: str | None = None, failure_fingerprint: str = "", strategy_generation: int = 0) -> Task:
+        task_id = str(uuid4())
+        return cls(id=task_id, title=title, description=description, dependencies=dependencies or [], repair_of=repair_of, root_task_id=root_task_id or task_id, parent_task_id=parent_task_id, failure_fingerprint=failure_fingerprint, strategy_generation=strategy_generation)
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> Task:
@@ -157,6 +162,10 @@ class Task:
             ],
             dependencies=[str(dependency) for dependency in value.get("dependencies", [])],  # type: ignore[arg-type]
             repair_of=str(value["repair_of"]) if value.get("repair_of") else None,
+            root_task_id=str(value.get("root_task_id") or value["id"]),
+            parent_task_id=str(value["parent_task_id"]) if value.get("parent_task_id") else None,
+            failure_fingerprint=str(value.get("failure_fingerprint", "")),
+            strategy_generation=int(value.get("strategy_generation", 0)),
         )
 
     def to_dict(self) -> dict[str, object]:

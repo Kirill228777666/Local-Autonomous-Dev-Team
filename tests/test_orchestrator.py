@@ -73,7 +73,9 @@ def test_destructive_write_is_recovered_inside_same_coder_attempt(tmp_path: Path
     assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "kept"
     assert "# updated capability" in (tmp_path / "app.py").read_text(encoding="utf-8")
     assert any(event.phase == "DESTRUCTIVE_WRITE_REJECTED" for event in state.events)
+    assert any(event.phase == "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS" for event in state.events)
     assert not any(event.agent == "ARCHITECT" for event in state.events)
+    assert not any(event.agent == "MANAGER" for event in state.events)
 
 
 def test_tester_executes_regenerated_harness_without_new_coder_attempt(tmp_path: Path) -> None:
@@ -105,6 +107,36 @@ def test_llm_completed_metric_never_exceeds_dispatched_requests() -> None:
     state.event_counters["LLM:RESPONSE"] = 2
 
     assert metrics(state)["llm_responses_completed"] <= metrics(state)["llm_requests_attempted"]
+
+
+def test_regression_rejection_restores_every_project_file_to_pre_attempt_state(tmp_path: Path) -> None:
+    setup_repository(tmp_path)
+    (tmp_path / "app.py").write_bytes(b"good app\r\n")
+    (tmp_path / "keep.txt").write_bytes(b"keep me\r\n")
+    git(tmp_path, "add", "app.py", "keep.txt")
+    git(tmp_path, "commit", "-m", "good baseline")
+    original_app = (tmp_path / "app.py").read_bytes()
+    original_keep = (tmp_path / "keep.txt").read_bytes()
+    provider = ScriptedProvider({
+        "CODER": [AgentReply({"actions": [
+            {"kind": "write_file", "path": "app.py", "content": "rejected app\n"},
+            {"kind": "write_file", "path": "created.txt", "content": "new file\n"},
+            {"kind": "delete_file", "path": "keep.txt"},
+        ]})],
+        "TESTER": [AgentReply({"command": ["py", "-3", "-c", "print('current task passes')"]})],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = runner.initialize("Build Notes")
+    task = Task.create("Risky change", "Change one capability")
+    state.tasks.append(task)
+    state.accepted_regressions.append({"key": "protected", "task": "Accepted capability", "command": ["py", "-3", "-c", "raise SystemExit(1)"]})
+
+    runner._run_task(state, task)
+
+    assert (tmp_path / "app.py").read_bytes() == original_app
+    assert (tmp_path / "keep.txt").read_bytes() == original_keep
+    assert not (tmp_path / "created.txt").exists()
+    assert any(event.agent == "REGRESSION" and event.phase == "FAIL" for event in state.events)
 
 
 def test_runner_completes_multiple_tasks_and_repairs_a_failed_test(tmp_path: Path) -> None:

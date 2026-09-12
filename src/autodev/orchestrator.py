@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +62,7 @@ class AutonomousRunner:
         self.designer = DesignerAgent(provider, structured_retries=1)
         self.environment_manager = EnvironmentManager(workspace, tools, allow_project_dependency_install, allow_system_package_install)
         self.process_manager = ManagedProcessManager(self.workspace)
+        self._attempt_snapshots: dict[str, Path] = {}
         # Scripted and third-party providers without a health endpoint return
         # immediately; a real Ollama-backed run can wait through a short restart.
         self.provider_wait_seconds = (
@@ -363,6 +365,7 @@ class AutonomousRunner:
         task.attempts += 1
         self._mark(state, "CODER", "IMPLEMENTING", f"Coder started attempt {task.attempts}: {task.title}", task)
         before_files = self._source_fingerprints()
+        self._begin_attempt_snapshot(task)
         try:
             self._mark(state, "CODER", "LLM_CALL", "Coder implementation request", task)
             actions = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
@@ -377,6 +380,8 @@ class AutonomousRunner:
                 return
             task.action_fingerprints.append(fingerprint)
             tool_recoveries = 0
+            policy_recoveries = 0
+            policy_recovery_pending = False
             position = 0
             while position < len(actions):
                 action = actions[position]
@@ -385,6 +390,9 @@ class AutonomousRunner:
                         self._pivot_to_static_frontend(state, task)
                         return
                     self._execute_action(state, task, action)
+                    if policy_recovery_pending:
+                        policy_recovery_pending = False
+                        self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS", "Targeted recovery action executed", task)
                 except CommandExecutionError as error:
                     if error.result.exit_code == 125:
                         self._reroute_server_command(state, task, error.command)
@@ -419,7 +427,10 @@ class AutonomousRunner:
                     position = 0
                     continue
                 except ToolPolicyError as error:
-                    if "DESTRUCTIVE_WRITE_REQUIRES_TARGETED_EDIT_OR_CURRENT_FULL_FILE" not in str(error) or tool_recoveries >= 2:
+                    if "DESTRUCTIVE_WRITE_REQUIRES_TARGETED_EDIT_OR_CURRENT_FULL_FILE" not in str(error):
+                        raise
+                    if policy_recoveries >= 2:
+                        self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Targeted recovery budget exhausted", task)
                         raise
                     path = action.get("path") if isinstance(action, dict) else None
                     if not isinstance(path, str):
@@ -428,7 +439,8 @@ class AutonomousRunner:
                     task.errors.append(
                         f"Whole-file replacement rejected for {path}. Use edit_file against current content; preserve unrelated functionality:\n{current[-4000:]}"
                     )
-                    tool_recoveries += 1
+                    policy_recoveries += 1
+                    policy_recovery_pending = True
                     self._mark(state, "CODER", "DESTRUCTIVE_WRITE_REJECTED", f"Whole-file write rejected for {path}", task)
                     self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing current file for targeted edit: {path}", task)
                     self._mark(state, "CODER", "LLM_CALL", "Coder targeted-edit recovery request", task)
@@ -440,6 +452,9 @@ class AutonomousRunner:
                     position = 0
                     continue
                 position += 1
+            if policy_recovery_pending:
+                self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Recovery response contained no executable targeted action", task)
+                raise ToolPolicyError("DESTRUCTIVE_WRITE_RECOVERY_FAILED")
             if before_files == self._source_fingerprints() and any(isinstance(action, dict) and action.get("kind") in {"write_file", "edit_file", "append_file", "delete_file"} for action in actions):
                 self._mark(state, "CODER", "ZERO_DIFF", "Coder file actions produced no semantic file change", task)
             state.run_history.append(f"Coder completed attempt {task.attempts} for {task.title}")
@@ -568,6 +583,7 @@ class AutonomousRunner:
         except GitError as error:
             self._retry_or_block(task, state, f"Git checkpoint failed: {error}")
             return
+        self._discard_attempt_snapshot(task)
         task.status = TaskStatus.DONE
         self._record_accepted_regression(state, task, command)
         if task.repair_of:
@@ -720,6 +736,7 @@ class AutonomousRunner:
 
     def _retry_or_block(self, task: Task, state: ProjectState, error: str) -> None:
         self._stop_task_processes(state, task)
+        self._rollback_attempt_snapshot(task, state)
         task.errors.append(error)
         if task.attempts >= self.max_attempts:
             if task.repair_of is not None:
@@ -734,11 +751,21 @@ class AutonomousRunner:
                 (decision for decision in reversed(state.decisions) if f"Architect diagnosis for {task.title}:" in decision),
                 "No Architect diagnosis available",
             )
+            fingerprint = hashlib.sha256(error.encode("utf-8")).hexdigest()
+            root_id = task.root_task_id or task.id
+            if any(candidate.root_task_id == root_id and candidate.failure_fingerprint == fingerprint for candidate in state.tasks):
+                self._block(task, state, f"Duplicate corrective strategy suppressed: {error}")
+                self._mark(state, "MANAGER", "DUPLICATE_CORRECTIVE_SUPPRESSED", "Suppressed duplicate corrective task", task)
+                return
             corrective = Task.create(
                 f"Repair: {task.title}",
                 f"Repair the failed task without repeating its broken approach. Original task: {task.description}\nFailure: {error}\n{diagnosis}",
                 dependencies=task.dependencies,
                 repair_of=task.id,
+                root_task_id=root_id,
+                parent_task_id=task.id,
+                failure_fingerprint=fingerprint,
+                strategy_generation=task.strategy_generation + 1,
             )
             state.tasks.append(corrective)
             state.run_history.append(f"Created Architect-guided corrective task: {corrective.title}")
@@ -1081,12 +1108,55 @@ class AutonomousRunner:
             # another role-level request; only health probes are allowed now.
             self._mark(state, "PROVIDER", "INCIDENT_DEDUPLICATED", "Provider incident already open", task)
 
-    @staticmethod
-    def _block(task: Task, state: ProjectState, reason: str) -> None:
+    def _block(self, task: Task, state: ProjectState, reason: str) -> None:
+        self._rollback_attempt_snapshot(task, state)
         task.status = TaskStatus.BLOCKED
         task.errors.append(reason)
         state.current_task_id = None
         state.run_history.append(f"Task blocked: {task.title}; {reason}")
+
+    @staticmethod
+    def _snapshot_excluded(path: Path) -> bool:
+        return any(part in {".git", ".autodev", ".venv", "__pycache__", "node_modules"} for part in path.parts)
+
+    def _begin_attempt_snapshot(self, task: Task) -> None:
+        directory = self.workspace / ".autodev" / "attempts" / f"{task.id}-{task.attempts}"
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        for source in self.workspace.rglob("*"):
+            relative = source.relative_to(self.workspace)
+            if self._snapshot_excluded(relative) or not source.is_file():
+                continue
+            target = directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        self._attempt_snapshots[task.id] = directory
+
+    def _rollback_attempt_snapshot(self, task: Task, state: ProjectState) -> None:
+        directory = self._attempt_snapshots.pop(task.id, None)
+        if directory is None or not directory.is_dir():
+            return
+        baseline = {path.relative_to(directory) for path in directory.rglob("*") if path.is_file()}
+        for current in self.workspace.rglob("*"):
+            relative = current.relative_to(self.workspace)
+            if self._snapshot_excluded(relative) or not current.is_file():
+                continue
+            if relative not in baseline:
+                current.unlink()
+        for source in directory.rglob("*"):
+            if not source.is_file():
+                continue
+            target = self.workspace / source.relative_to(directory)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        state.run_history.append(f"Attempt rolled back to pre-attempt workspace: {task.title}")
+        self._mark(state, "REGRESSION", "ROLLBACK", f"Rolled back rejected attempt: {task.title}", task)
+
+    def _discard_attempt_snapshot(self, task: Task) -> None:
+        directory = self._attempt_snapshots.pop(task.id, None)
+        if directory is not None and directory.is_dir():
+            shutil.rmtree(directory)
 
     @staticmethod
     def _result_log(task: Task, result: CommandResult) -> str:
