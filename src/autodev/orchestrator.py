@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -726,10 +727,28 @@ class AutonomousRunner:
             ("Implement frontend search and filters", "Implement category filtering, search and favorite UI behaviour only."),
         ]
         product = state.original_spec.lower()
-        capability_markers = (
-            "crud", "create", "edit", "update", "delete", "search", "categor", "favorite",
-            "создан", "редакт", "удален", "удалён", "поиск", "категор", "избран",
-        )
+        def capability_count(value: str) -> int:
+            """Count real product verbs, not timestamp field substrings.
+
+            ``created_at`` and ``updated_at`` are persistence metadata, never a
+            request to split a database setup task into CRUD work.
+            """
+            tokens = re.findall(r"[a-zа-яё]+", value.lower())
+            exact = {"crud", "create", "edit", "update", "delete", "search"}
+            found = {token for token in tokens if token in exact}
+            if any(token.startswith("categor") or token.startswith("категор") for token in tokens):
+                found.add("category")
+            if any(token.startswith("favorite") or token.startswith("избран") for token in tokens):
+                found.add("favorite")
+            if any(token.startswith("создан") for token in tokens):
+                found.add("create")
+            if any(token.startswith("редакт") for token in tokens):
+                found.add("edit")
+            if any(token.startswith("удален") or token.startswith("удалён") for token in tokens):
+                found.add("delete")
+            if any(token.startswith("поиск") for token in tokens):
+                found.add("search")
+            return len(found)
         for task in list(state.tasks):
             if (
                 task.status is not TaskStatus.PENDING
@@ -738,11 +757,11 @@ class AutonomousRunner:
             ):
                 continue
             text = f"{task.title} {task.description}".lower()
-            product_is_broad = sum(marker in product for marker in capability_markers) >= 4
+            product_is_broad = capability_count(product) >= 4
             # The product may have many capabilities, but a narrow quality task
             # such as "backend tests" must not be split just because its original
             # specification is broad.  Its own text needs several capabilities.
-            scope_capabilities = sum(marker in text for marker in capability_markers)
+            scope_capabilities = capability_count(text)
             broad = product_is_broad and scope_capabilities >= 3
             backend = any(marker in text for marker in ("backend", "back-end", "api", "бэкенд", "сервер"))
             frontend = any(marker in text for marker in ("frontend", "front-end", "ui", "интерфейс", "фронтенд"))

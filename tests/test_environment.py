@@ -164,6 +164,17 @@ def test_manager_does_not_decompose_narrow_russian_backend_test_task(tmp_path: P
     assert task.status is TaskStatus.PENDING
 
 
+def test_timestamp_names_do_not_make_sqlite_setup_look_like_crud_scope(tmp_path: Path) -> None:
+    state = ProjectState.create("Создай Notes: создание, редактирование, удаление, поиск, категории, фильтрация и избранные заметки.")
+    task = Task.create("Настройка базы данных SQLite", "Хранить категории и метаданные created_at, updated_at.")
+    state.tasks = [task]
+
+    AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))._decompose_broad_tasks(state)
+
+    assert state.tasks == [task]
+    assert task.status is TaskStatus.PENDING
+
+
 def test_metrics_counters_survive_event_history_truncation() -> None:
     from autodev.metrics import metrics
     state = ProjectState.create("Build Notes")
