@@ -9,11 +9,12 @@ max_attempts = 3
 
 # Optional role profiles run sequentially and fall back to [models].default.
 [models]
-default = "qwen3:14b"
-coder = "qwen2.5-coder:7b"
+default = "qwen3-coder:30b"
 
 [agents.coder]
 temperature = 0.05
 timeout = 120
 retries = 2
 context_budget = 12000
+context_limit = 16384
+keep_alive = "10m"

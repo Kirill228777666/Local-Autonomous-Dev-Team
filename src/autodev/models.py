@@ -188,6 +188,8 @@ class ProjectState:
     visual_issues: list[str] = field(default_factory=list)
     visual_repair_cycles: int = 0
     environment: dict[str, object] = field(default_factory=dict)
+    architecture: dict[str, object] = field(default_factory=dict)
+    event_counters: dict[str, int] = field(default_factory=dict)
     managed_processes: list[dict[str, object]] = field(default_factory=list)
 
     @classmethod
@@ -224,6 +226,8 @@ class ProjectState:
             visual_issues=[str(issue) for issue in value.get("visual_issues", [])],  # type: ignore[arg-type]
             visual_repair_cycles=int(value.get("visual_repair_cycles", 0)),
             environment=dict(value.get("environment", {})),  # type: ignore[arg-type]
+            architecture=dict(value.get("architecture", {})),  # type: ignore[arg-type]
+            event_counters={str(key): int(count) for key, count in dict(value.get("event_counters", {})).items()},  # type: ignore[arg-type]
             managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
         )
 
@@ -250,9 +254,13 @@ class ProjectState:
             "visual_issues": self.visual_issues[-50:],
             "visual_repair_cycles": self.visual_repair_cycles,
             "environment": self.environment,
+            "architecture": self.architecture,
+            "event_counters": self.event_counters,
             "managed_processes": self.managed_processes[-100:],
         }
 
     def record_event(self, agent: str, phase: str, message: str, task_id: str | None = None) -> None:
         self.events.append(ActivityEvent.create(agent, phase, message, task_id))
+        key = f"{agent}:{phase}"
+        self.event_counters[key] = self.event_counters.get(key, 0) + 1
         self.events = self.events[-500:]

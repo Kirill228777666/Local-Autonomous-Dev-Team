@@ -18,6 +18,7 @@ class ContextBuilder:
         events = "\n".join(f"- {entry}" for entry in recent_log) or "- No prior events"
         sections = [
             "Environment capabilities:\n" + (str(state.environment) if state.environment else "- Not discovered"),
+            "Architecture contract (do not change it without an explicit Architect/Manager pivot):\n" + (str(state.architecture) if state.architecture else "- Not selected"),
             f"Current task ({task.id}): {task.title}\n{task.description}",
             f"Relevant files:\n{files}",
             "Recent errors:\n" + ("\n".join(f"- {error}" for error in task.errors[-4:]) or "- None"),

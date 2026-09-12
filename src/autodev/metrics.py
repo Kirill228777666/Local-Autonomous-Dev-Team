@@ -15,6 +15,8 @@ def metrics(state: ProjectState) -> dict[str, object]:
     except ValueError:
         duration_seconds = 0
     history = state.run_history
+    def count(agent: str, phase: str) -> int:
+        return state.event_counters.get(f"{agent}:{phase}", sum(event.agent == agent and event.phase == phase for event in events))
     return {
         "run_start": state.created_at,
         "updated_at": state.updated_at,
@@ -38,11 +40,11 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "crash_events": sum("Crash recovery" in entry for entry in history),
         "resume_events": sum(entry == "Run resumed" for entry in history),
         "watchdog_events": sum(event.agent == "WATCHDOG" for event in events),
-        "environment_checks": sum(event.agent == "ENVIRONMENT" and event.phase == "CHECK" for event in events),
-        "dependency_installs": sum(event.agent == "ENVIRONMENT" and event.phase == "REPAIRED" for event in events),
+        "environment_checks": count("ENVIRONMENT", "CHECK"),
+        "dependency_installs": count("ENVIRONMENT", "REPAIRED"),
         "dependency_install_failures": sum("Environment limitation:" in entry and "install" in entry.lower() for entry in history),
-        "missing_executables": sum(event.agent == "ENVIRONMENT" and event.phase == "MISSING_EXECUTABLE" for event in events),
-        "environment_repairs": sum(event.agent == "ENVIRONMENT" and event.phase == "REPAIRED" for event in events),
+        "missing_executables": count("ENVIRONMENT", "MISSING_EXECUTABLE"),
+        "environment_repairs": count("ENVIRONMENT", "REPAIRED"),
         "task_superseded_count": sum(task.status.value == "SUPERSEDED" for task in state.tasks),
         "tool_recoveries": sum(event.phase == "TOOL_RECOVERY" for event in events),
         "stale_edit_recoveries": sum(event.phase == "TOOL_RECOVERY" and "stale edit" in event.message.lower() for event in events),

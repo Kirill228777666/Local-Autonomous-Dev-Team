@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from .agents import RoleAgents
+from .architecture import default_contract, validate_architecture
 from .designer import DesignerAgent, detect_ui_project
 from .environment import EnvironmentManager, FailureKind, classify_failure, validate_readme
 from .git import GitError, GitRepository
@@ -78,6 +79,7 @@ class AutonomousRunner:
         self._mark(state, "MANAGER", "PLANNING", "Autonomous run started")
         if not state.tasks:
             self._plan(state)
+        self._decompose_broad_tasks(state)
         if state.status == "BLOCKED":
             return state
         for _ in range(max_cycles):
@@ -273,6 +275,10 @@ class AutonomousRunner:
                 if not isinstance(title, str) or not isinstance(description, str):
                     raise ProviderError("Manager task needs title and description")
                 state.tasks.append(Task.create(title, description))
+            if not state.architecture:
+                state.architecture = default_contract(state.original_spec, state.environment)
+                if state.architecture:
+                    state.decisions.append("Architecture contract selected: " + str(state.architecture))
             state.decisions.append(f"Manager planned {len(state.tasks)} tasks")
             state.run_history.append("Manager created initial plan")
             self.store.save(state)
@@ -373,6 +379,8 @@ class AutonomousRunner:
                 command = reply.get("command")
                 if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
                     raise ProviderError("Tester response needs a string command array")
+                if self._requires_managed_service(command):
+                    self._ensure_validation_service(state, task)
                 result = self.tools.run_tests(command)
             except (ProviderError, ToolPolicyError, ValueError) as error:
                 self._retry_or_block(task, state, f"Tester error: {error}")
@@ -380,6 +388,12 @@ class AutonomousRunner:
         state.run_history.append(self._result_log(task, result))
         if result.exit_code != 0:
             failure = classify_failure(result, command)
+            if failure.kind is FailureKind.TEST_HARNESS_FAILURE:
+                self._mark(state, "TESTER", "HARNESS_FAILURE", "Generated validation command is invalid; regenerate validation without changing application code", task)
+                task.status = TaskStatus.PENDING
+                state.current_task_id = None
+                state.run_history.append(f"Tester harness failure for {task.title}; application implementation was not repaired")
+                return
             if failure.kind is FailureKind.MISSING_EXECUTABLE and command[0].lower() in {"npm", "node"}:
                 self._pivot_to_static_frontend(state, task)
                 return
@@ -392,6 +406,12 @@ class AutonomousRunner:
                 return
 
         if not self._visual_review(state, task):
+            return
+
+        conflicts = validate_architecture(self.workspace, state.architecture)
+        if conflicts:
+            self._mark(state, "ARCHITECTURE", "CONFLICT", "; ".join(conflicts), task)
+            self._retry_or_block(task, state, "; ".join(conflicts))
             return
 
         task.status = TaskStatus.REVIEW
@@ -426,7 +446,7 @@ class AutonomousRunner:
 
     def _reroute_server_command(self, state: ProjectState, task: Task, command: list[str]) -> None:
         port = self._server_port(command)
-        record = self.process_manager.start(command, purpose=f"task:{task.id}", expected_port=port, env={"PORT": str(port)})
+        record = self.process_manager.start(self.tools.normalize_command(command), purpose=f"task:{task.id}", expected_port=port, env={"PORT": str(port)})
         state.managed_processes = self.process_manager.records()
         self._mark(state, "RUNTIME", "PROCESS_START", f"Managed process started: {record.pid}", task)
         if not self.process_manager.wait_ready(record.id, "127.0.0.1", port, timeout=15):
@@ -464,6 +484,19 @@ class AutonomousRunner:
                 except ValueError:
                     break
         return 5000
+
+    @staticmethod
+    def _requires_managed_service(command: list[str]) -> bool:
+        return any("localhost" in item.lower() or "127.0.0.1" in item for item in command)
+
+    def _ensure_validation_service(self, state: ProjectState, task: Task) -> None:
+        if any(record.get("purpose") == f"task:{task.id}" and record.get("status") == "READY" for record in self.process_manager.records()):
+            return
+        candidate = next((path for path in ("app.py", "backend/app.py") if (self.workspace / path).is_file()), None)
+        if candidate is None:
+            raise ValueError("REQUIRES_MANAGED_SERVICE: no known application entry point")
+        self._mark(state, "RUNTIME", "SERVICE_REQUIRED", "HTTP validation requires a managed application process", task)
+        self._reroute_server_command(state, task, ["python", candidate])
 
     def _execute_action(self, state: ProjectState, task: Task, action: object) -> None:
         if not isinstance(action, dict):
@@ -571,6 +604,25 @@ class AutonomousRunner:
         task.status = TaskStatus.PENDING
         state.run_history.append(f"Returning task to Coder: {task.title}; {error}")
 
+    def _decompose_broad_tasks(self, state: ProjectState) -> None:
+        """Replace one multi-feature task with atomic work before Coder receives it."""
+        mapping = {
+            "crud": ["Create notes", "Read notes", "Update notes", "Delete notes"],
+            "create, read, update": ["Create notes", "Read notes", "Update notes", "Delete notes"],
+        }
+        for task in list(state.tasks):
+            if task.status is not TaskStatus.PENDING:
+                continue
+            text = f"{task.title} {task.description}".lower()
+            names = next((parts for marker, parts in mapping.items() if marker in text), None)
+            if names is None:
+                continue
+            task.status = TaskStatus.SUPERSEDED
+            for name in names:
+                state.tasks.append(Task.create(name, f"Implement and independently test only this bounded Notes capability. Original scope: {task.description}", dependencies=task.dependencies))
+            state.run_history.append(f"Manager decomposed broad task: {task.title}")
+            self._mark(state, "MANAGER", "DECOMPOSED", f"Decomposed broad task: {task.title}")
+
     def _repair_environment_failure(self, state: ProjectState, task: Task, command: list[str], result: CommandResult) -> bool:
         failure = classify_failure(result, command)
         state.run_history.append(f"Failure classified: {failure.kind.value}")
@@ -578,8 +630,9 @@ class AutonomousRunner:
         if failure.kind is FailureKind.IMPORT_PATH:
             state.run_history.append("Test harness diagnostic: check cwd/package layout/PYTHONPATH before code repair")
             return False
-        repaired = self.environment_manager.repair(failure)
+        repaired = self.environment_manager.repair(failure, state.environment)
         if repaired:
+            state.environment["execution_context"] = self.environment_manager.execution_context()
             state.run_history.append(f"Environment repair completed: {failure.kind.value}")
             self._mark(state, "ENVIRONMENT", "REPAIRED", f"Environment repair completed: {failure.kind.value}", task)
             return True

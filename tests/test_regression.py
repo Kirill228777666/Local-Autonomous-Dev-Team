@@ -14,7 +14,7 @@ def test_regression_detects_python_and_declared_node_checks(tmp_path: Path) -> N
 
     commands = RegressionRunner(tmp_path, WorkspaceTools(tmp_path)).detect_commands()
 
-    assert ["py", "-3", "-m", "pytest", "-q"] in commands
+    assert any(command[1:] == ["-m", "pytest", "-q"] for command in commands)
     assert ["npm", "test", "--", "--runInBand"] not in commands
     assert ["npm", "test"] in commands
     assert ["npm", "run", "build"] in commands

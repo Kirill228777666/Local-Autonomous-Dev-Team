@@ -57,3 +57,21 @@ def test_workspace_tools_hard_timeout_returns_without_waiting_for_child(tmp_path
     result = tools.run_command(["py", "-3", "-c", "import time; time.sleep(10)"])
     assert result.exit_code == 124
     assert "hard timed out" in result.stderr
+
+
+def test_project_venv_rewrites_python_py_and_pip_commands(tmp_path: Path) -> None:
+    interpreter = tmp_path / ".venv" / "Scripts" / "python.exe"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    tools = WorkspaceTools(tmp_path)
+
+    assert tools.normalize_command(["python", "-m", "pytest"]) == [str(interpreter), "-m", "pytest"]
+    assert tools.normalize_command(["py", "-3", "app.py"]) == [str(interpreter), "app.py"]
+    assert tools.normalize_command(["pip", "install", "Flask"]) == [str(interpreter), "-m", "pip", "install", "Flask"]
+
+
+def test_workspace_tools_rejects_venv_activation_command(tmp_path: Path) -> None:
+    result = WorkspaceTools(tmp_path).run_command([".venv\\Scripts\\activate"])
+
+    assert result.exit_code == 126
+    assert "PROJECT_ENVIRONMENT_IS_ALREADY_MANAGED" in result.stderr

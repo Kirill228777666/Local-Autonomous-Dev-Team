@@ -47,7 +47,8 @@ def test_ollama_provider_sends_low_temperature_and_parses_json_response() -> Non
 
     assert reply.data == {"approved": True}
     assert sent_payloads[0]["model"] == "qwen3:14b"
-    assert sent_payloads[0]["options"] == {"temperature": 0.1}
+    assert sent_payloads[0]["options"] == {"temperature": 0.1, "num_ctx": 16384}
+    assert sent_payloads[0]["keep_alive"] == "10m"
     assert sent_payloads[0]["format"] == "json"
 
 

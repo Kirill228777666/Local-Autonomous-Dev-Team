@@ -24,6 +24,8 @@ class AgentProfile:
     timeout: float = 120.0
     retries: int = 2
     context_budget: int = 12000
+    context_limit: int = 16384
+    keep_alive: str = "10m"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +81,8 @@ def load_config(path: Path | None) -> AppConfig:
             timeout=float(settings.get("timeout", ollama.get("timeout", defaults.timeout))),
             retries=int(settings.get("retries", 2)),
             context_budget=int(settings.get("context_budget", 12000)),
+            context_limit=int(settings.get("context_limit", 16384)),
+            keep_alive=str(settings.get("keep_alive", "10m")),
         )
     command = visual.get("command", [])
     if not isinstance(command, list) or not all(isinstance(part, str) and part for part in command):
@@ -136,6 +140,8 @@ def make_runner(workspace: Path, config: AppConfig, scripted: bool = False) -> A
                 temperature=profile.temperature,
                 timeout=profile.timeout,
                 retries=profile.retries,
+                context_limit=profile.context_limit,
+                keep_alive=profile.keep_alive,
             )
             for role, profile in config.profiles.items()
         }

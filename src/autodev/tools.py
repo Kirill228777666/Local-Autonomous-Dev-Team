@@ -96,6 +96,9 @@ class WorkspaceTools:
     def run_command(self, command: list[str]) -> CommandResult:
         if not command or not command[0].strip():
             raise ToolPolicyError("command must not be empty")
+        if self._is_activation_command(command):
+            return CommandResult(126, "", "PROJECT_ENVIRONMENT_IS_ALREADY_MANAGED; use the project interpreter explicitly")
+        command = self.normalize_command(command)
         executable = Path(command[0]).name.lower()
         if executable in self._BLOCKED_COMMANDS:
             raise ToolPolicyError(f"command '{command[0]}' is not permitted")
@@ -116,6 +119,7 @@ class WorkspaceTools:
                 text=True,
                 shell=False,
                 creationflags=flags,
+                env={**os.environ, "PYTHONNOUSERSITE": "1"} if self.project_python else None,
             )
             try:
                 stdout, stderr = process.communicate(timeout=self.command_timeout)
@@ -132,6 +136,33 @@ class WorkspaceTools:
         except FileNotFoundError as error:
             return CommandResult(127, "", f"command not found: {command[0]} ({error})")
         return CommandResult(process.returncode, stdout, stderr)
+
+    @property
+    def project_python(self) -> Path | None:
+        candidate = self.workspace / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        return candidate if candidate.is_file() else None
+
+    def normalize_command(self, command: list[str]) -> list[str]:
+        """Use the project venv without relying on mutable shell activation."""
+        if not command:
+            return command
+        interpreter = self.project_python
+        if interpreter is None:
+            return list(command)
+        first = Path(command[0]).name.lower()
+        if first in {"python", "python.exe", "py", "py.exe"}:
+            remainder = list(command[1:])
+            if first.startswith("py") and remainder[:1] in (["-3"], ["-3.14"]):
+                remainder = remainder[1:]
+            return [str(interpreter), *remainder]
+        if first in {"pip", "pip.exe"}:
+            return [str(interpreter), "-m", "pip", *command[1:]]
+        return list(command)
+
+    @staticmethod
+    def _is_activation_command(command: list[str]) -> bool:
+        text = " ".join(command).replace("/", "\\").lower()
+        return any(marker in text for marker in (".venv\\scripts\\activate", ".venv\\bin\\activate", "activate.ps1", "source .venv"))
 
     @staticmethod
     def is_long_running(command: list[str]) -> bool:

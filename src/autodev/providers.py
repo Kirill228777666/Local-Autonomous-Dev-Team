@@ -55,6 +55,8 @@ class OllamaProvider:
         temperature: float = 0.1,
         timeout: float = 120.0,
         retries: int = 2,
+        context_limit: int = 16384,
+        keep_alive: str = "10m",
         transport: Transport = _http_transport,
     ) -> None:
         if not model.strip():
@@ -64,6 +66,8 @@ class OllamaProvider:
         self.temperature = temperature
         self.timeout = timeout
         self.retries = retries
+        self.context_limit = context_limit
+        self.keep_alive = keep_alive
         self.transport = transport
 
     def complete(self, request: AgentRequest) -> AgentReply:
@@ -72,7 +76,8 @@ class OllamaProvider:
                 "model": self.model,
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": self.temperature},
+                "keep_alive": self.keep_alive,
+                "options": {"temperature": self.temperature, "num_ctx": self.context_limit},
                 "messages": [
                     {"role": "system", "content": request.system_prompt},
                     {"role": "user", "content": request.prompt, **({"images": list(request.images)} if request.images else {})},

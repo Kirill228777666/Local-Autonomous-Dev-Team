@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,7 +47,8 @@ class RegressionRunner:
     def detect_commands(self) -> list[list[str]]:
         commands: list[list[str]] = []
         if (self.workspace / "tests").is_dir() or (self.workspace / "pyproject.toml").exists():
-            commands.append(["py", "-3", "-m", "pytest", "-q"])
+            interpreter = self.tools.project_python or Path(sys.executable)
+            commands.append([str(interpreter), "-m", "pytest", "-q"])
         package_path = self.workspace / "package.json"
         if package_path.exists():
             package = json.loads(package_path.read_text(encoding="utf-8"))

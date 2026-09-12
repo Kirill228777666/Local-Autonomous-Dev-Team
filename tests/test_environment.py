@@ -24,6 +24,8 @@ def test_classifier_identifies_environment_failures_before_llm_repair() -> None:
     assert classify_failure(CommandResult(1, "", "ModuleNotFoundError: No module named 'flask'"), ["py", "-3", "app.py"]).kind is FailureKind.MISSING_PYTHON_DEPENDENCY
     assert classify_failure(CommandResult(127, "", "command not found: npm"), ["npm", "install"]).kind is FailureKind.MISSING_EXECUTABLE
     assert classify_failure(CommandResult(1, "", "ModuleNotFoundError: No module named 'app'"), ["py", "-3", "-m", "pytest"]).kind is FailureKind.IMPORT_PATH
+    assert classify_failure(CommandResult(1, "", "SyntaxError: invalid syntax"), ["py", "-3", "-c", "import re; with open('x'): pass"]).kind is FailureKind.TEST_HARNESS_FAILURE
+    assert classify_failure(CommandResult(7, "", "curl: (7) Failed to connect to localhost:5000"), ["curl", "http://localhost:5000"]).kind is FailureKind.SERVICE_NOT_RUNNING
 
 
 def test_missing_flask_is_persisted_installed_in_project_venv_and_retried(tmp_path: Path) -> None:
@@ -82,3 +84,35 @@ def test_node_free_pivot_supersedes_obsolete_npm_build_task(tmp_path: Path) -> N
     assert frontend.status is TaskStatus.SUPERSEDED
     assert build.status is TaskStatus.SUPERSEDED
     assert any("Static frontend" in task.title for task in state.tasks)
+
+
+def test_architecture_contract_rejects_mixed_orms(tmp_path: Path) -> None:
+    from autodev.architecture import validate_architecture
+    state = ProjectState.create("Build Notes")
+    state.architecture = {"backend_framework": "Flask", "orm": "Flask-SQLAlchemy", "database": "SQLite", "frontend": "static-html-css-js", "test_framework": "unittest"}
+    (tmp_path / "app.py").write_text("from flask_sqlalchemy import SQLAlchemy\n", encoding="utf-8")
+    (tmp_path / "models.py").write_text("from peewee import Model\n", encoding="utf-8")
+
+    findings = validate_architecture(tmp_path, state.architecture)
+
+    assert any("conflicting ORMs" in finding for finding in findings)
+
+
+def test_manager_decomposes_crud_task_before_coder(tmp_path: Path) -> None:
+    state = ProjectState.create("Build Notes")
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))
+    state.tasks = [Task.create("CRUD Functionality", "Implement create read update delete note API endpoints.")]
+
+    runner._decompose_broad_tasks(state)
+
+    assert state.tasks[0].status is TaskStatus.SUPERSEDED
+    assert {task.title for task in state.tasks[1:]} == {"Create notes", "Read notes", "Update notes", "Delete notes"}
+
+
+def test_metrics_counters_survive_event_history_truncation() -> None:
+    from autodev.metrics import metrics
+    state = ProjectState.create("Build Notes")
+    for _ in range(520):
+        state.record_event("ENVIRONMENT", "CHECK", "capability check")
+
+    assert metrics(state)["environment_checks"] == 520

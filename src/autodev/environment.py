@@ -20,6 +20,11 @@ class FailureKind(StrEnum):
     PERMISSION = "PERMISSION"
     NETWORK = "NETWORK"
     APPLICATION = "APPLICATION"
+    TEST_HARNESS_FAILURE = "TEST_HARNESS_FAILURE"
+    SERVICE_NOT_RUNNING = "SERVICE_NOT_RUNNING"
+    PROJECT_DEPENDENCY_INCOMPATIBLE = "PROJECT_DEPENDENCY_INCOMPATIBLE"
+    GLOBAL_ENVIRONMENT_LEAK = "GLOBAL_ENVIRONMENT_LEAK"
+    ARCHITECTURE_CONFLICT = "ARCHITECTURE_CONFLICT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +43,15 @@ class ReadmeResult:
 
 def classify_failure(result: CommandResult, command: list[str]) -> Failure:
     text = f"{result.stdout}\n{result.stderr}"
+    lowered = text.lower()
+    if "syntaxerror" in lowered and "-c" in command:
+        return Failure(FailureKind.TEST_HARNESS_FAILURE, command, text)
+    if ("connection refused" in lowered or "failed to connect" in lowered) and any("localhost" in item or "127.0.0.1" in item for item in command):
+        return Failure(FailureKind.SERVICE_NOT_RUNNING, command, text)
+    if any(token in lowered for token in ("resolutionimpossible", "conflicting dependencies", "cannot import name 'url_quote'", "typingonly")):
+        return Failure(FailureKind.PROJECT_DEPENDENCY_INCOMPATIBLE, command, text)
+    if "site-packages" in lowered and ("ast.str" in lowered or "pluggy" in lowered):
+        return Failure(FailureKind.GLOBAL_ENVIRONMENT_LEAK, command, text)
     module = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)", text)
     if module:
         name = module.group(1)
@@ -53,7 +67,7 @@ def classify_failure(result: CommandResult, command: list[str]) -> Failure:
         return Failure(FailureKind.TIMEOUT, command, text)
     if "permission denied" in text.lower() or "access is denied" in text.lower():
         return Failure(FailureKind.PERMISSION, command, text)
-    if any(token in text.lower() for token in ("connection refused", "temporary failure", "certificate verify")):
+    if any(token in lowered for token in ("connection refused", "temporary failure", "certificate verify")):
         return Failure(FailureKind.NETWORK, command, text)
     if "assert " in text.lower() or "assertionerror" in text.lower() or "failed" in text.lower():
         return Failure(FailureKind.ASSERTION, command, text)
@@ -81,7 +95,14 @@ class EnvironmentManager:
         git_ok, git_version = available(["git", "--version"])
         node_ok, node_version = available(["node", "--version"])
         npm_ok, npm_version = available(["npm", "--version"])
-        return {"python": {"available": python_ok, "version": python_version, "venv": ".venv"}, "pip": {"available": pip_ok, "version": pip_version}, "git": {"available": git_ok, "version": git_version}, "node": {"available": node_ok, "version": node_version}, "npm": {"available": npm_ok, "version": npm_version}}
+        return {"python": {"available": python_ok, "version": python_version, "venv": ".venv"}, "pip": {"available": pip_ok, "version": pip_version}, "git": {"available": git_ok, "version": git_version}, "node": {"available": node_ok, "version": node_version}, "npm": {"available": npm_ok, "version": npm_version}, "execution_context": self.execution_context()}
+
+    def execution_context(self) -> dict[str, str]:
+        return {
+            "cwd": str(self.workspace),
+            "python_interpreter": str(self.venv_python) if self.venv_python.exists() else "",
+            "pip": f"{self.venv_python} -m pip" if self.venv_python.exists() else "",
+        }
 
     def ensure_venv(self) -> bool:
         if self.venv_python.exists():
@@ -92,7 +113,7 @@ class EnvironmentManager:
             return False
         return True
 
-    def repair(self, failure: Failure) -> bool:
+    def repair(self, failure: Failure, state: dict[str, object] | None = None) -> bool:
         if failure.kind is FailureKind.MISSING_PYTHON_DEPENDENCY and failure.module:
             if not self.allow_project_dependency_install:
                 self.last_diagnostic = "Project dependency installation is disabled."
@@ -103,12 +124,25 @@ class EnvironmentManager:
                 return False
             if not self.ensure_venv():
                 return False
+            fingerprint = f"{failure.module}|{self.venv_python}"
+            dependencies = state.setdefault("dependencies", {}) if state is not None else {}
+            failures = dependencies.setdefault("failed", []) if isinstance(dependencies, dict) else []
+            if isinstance(failures, list) and fingerprint in failures:
+                self.last_diagnostic = f"Dependency repair already failed without environment change: {failure.module}"
+                return False
             manifest = self.workspace / "requirements.txt"
             existing = manifest.read_text(encoding="utf-8").splitlines() if manifest.exists() else []
             if not any(line.lower().split("==")[0] == package.lower() for line in existing):
                 manifest.write_text("\n".join([*existing, package]) + "\n", encoding="utf-8")
             result = self.tools.run_command([str(self.venv_python), "-m", "pip", "install", package])
             self.last_diagnostic = result.stderr or result.stdout
+            if isinstance(dependencies, dict):
+                installed = dependencies.setdefault("installed", [])
+                if result.exit_code == 0 and isinstance(installed, list) and package not in installed:
+                    installed.append(package)
+                if result.exit_code and isinstance(failures, list) and fingerprint not in failures:
+                    failures.append(fingerprint)
+                dependencies["interpreter"] = str(self.venv_python)
             return result.exit_code == 0
         if failure.kind is FailureKind.MISSING_EXECUTABLE and failure.command and failure.command[0].lower() in {"npm", "node"}:
             if not self.allow_system_package_install:
