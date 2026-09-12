@@ -138,7 +138,7 @@ def test_manager_decomposes_broad_russian_backend_scope_into_atomic_tasks(tmp_pa
         "Создай Notes: создание, редактирование, удаление, поиск, категории, фильтрация и избранные заметки."
     )
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))
-    state.tasks = [Task.create("Разработка Backend API", "Реализовать API для всех возможностей Notes.")]
+    state.tasks = [Task.create("Разработка Backend API", "Создание, редактирование, удаление заметок; категории и избранное.")]
 
     runner._decompose_broad_tasks(state)
 
@@ -151,6 +151,17 @@ def test_manager_decomposes_broad_russian_backend_scope_into_atomic_tasks(tmp_pa
     }
     runner._decompose_broad_tasks(state)
     assert len(state.tasks) == 5
+
+
+def test_manager_does_not_decompose_narrow_russian_backend_test_task(tmp_path: Path) -> None:
+    state = ProjectState.create("Создай Notes: создание, редактирование, удаление, поиск, категории, фильтрация и избранные заметки.")
+    task = Task.create("Написание тестов backend", "Покрыть API тестами.")
+    state.tasks = [task]
+
+    AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))._decompose_broad_tasks(state)
+
+    assert state.tasks == [task]
+    assert task.status is TaskStatus.PENDING
 
 
 def test_metrics_counters_survive_event_history_truncation() -> None:

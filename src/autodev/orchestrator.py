@@ -455,20 +455,41 @@ class AutonomousRunner:
             failure = classify_failure(result, command)
             if failure.kind is FailureKind.TEST_HARNESS_FAILURE:
                 self._mark(state, "TESTER", "HARNESS_FAILURE", "Generated validation command is invalid; regenerate validation without changing application code", task)
-                task.status = TaskStatus.PENDING
-                state.current_task_id = None
-                state.run_history.append(f"Tester harness failure for {task.title}; application implementation was not repaired")
-                return
-            if failure.kind is FailureKind.MISSING_EXECUTABLE and command[0].lower() in {"npm", "node"}:
-                self._pivot_to_static_frontend(state, task)
-                return
-            if self._repair_environment_failure(state, task, command, result):
-                result = self.tools.run_tests(command)
-            if result.exit_code == 0:
-                state.run_history.append(self._result_log(task, result))
-            else:
-                self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}")
-                return
+                if any(error.startswith("Tester harness failure:") for error in task.errors):
+                    self._block(task, state, "Tester generated two invalid validation commands; application code was not changed")
+                    return
+                task.errors.append(f"Tester harness failure: {result.stderr or result.stdout}")
+                try:
+                    self._mark(state, "TESTER", "LLM_CALL", "Tester harness regeneration request", task)
+                    retry = self.agents.test(state, task).data
+                    self._mark(state, "TESTER", "LLM_RESPONSE", "Tester harness regeneration response received", task)
+                    command = retry.get("command")
+                    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+                        raise ProviderError("Tester response needs a string command array")
+                    result = self.tools.run_tests(command)
+                    state.run_history.append(self._result_log(task, result))
+                except ProviderUnavailableError as error:
+                    self._preserve_task_for_provider_wait(task, state)
+                    self._mark_provider_wait(state, task, str(error))
+                    return
+                except (ProviderError, ToolPolicyError, ValueError) as error:
+                    self._block(task, state, f"Tester harness regeneration failed: {error}")
+                    return
+                if result.exit_code != 0 and classify_failure(result, command).kind is FailureKind.TEST_HARNESS_FAILURE:
+                    self._block(task, state, "Tester generated two invalid validation commands; application code was not changed")
+                    return
+            if result.exit_code != 0:
+                failure = classify_failure(result, command)
+                if failure.kind is FailureKind.MISSING_EXECUTABLE and command[0].lower() in {"npm", "node"}:
+                    self._pivot_to_static_frontend(state, task)
+                    return
+                if self._repair_environment_failure(state, task, command, result):
+                    result = self.tools.run_tests(command)
+                if result.exit_code == 0:
+                    state.run_history.append(self._result_log(task, result))
+                else:
+                    self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}")
+                    return
 
         if not self._visual_review(state, task):
             return
@@ -718,10 +739,20 @@ class AutonomousRunner:
                 continue
             text = f"{task.title} {task.description}".lower()
             product_is_broad = sum(marker in product for marker in capability_markers) >= 4
-            broad = product_is_broad and sum(marker in f"{text} {product}" for marker in capability_markers) >= 4
+            # The product may have many capabilities, but a narrow quality task
+            # such as "backend tests" must not be split just because its original
+            # specification is broad.  Its own text needs several capabilities.
+            scope_capabilities = sum(marker in text for marker in capability_markers)
+            broad = product_is_broad and scope_capabilities >= 3
             backend = any(marker in text for marker in ("backend", "back-end", "api", "бэкенд", "сервер"))
             frontend = any(marker in text for marker in ("frontend", "front-end", "ui", "интерфейс", "фронтенд"))
-            atoms = backend_atoms if broad and backend else frontend_atoms if broad and frontend else []
+            notes = any(marker in text for marker in ("notes", "note", "замет"))
+            notes_atoms = [
+                ("Implement note create and update", "Implement note creation and editing only."),
+                ("Implement note deletion and timestamps", "Implement deletion plus created_at and updated_at behaviour only."),
+                ("Implement note categories", "Implement note category assignment and filtering only."),
+            ]
+            atoms = backend_atoms if broad and backend else frontend_atoms if broad and frontend else notes_atoms if broad and notes else []
             if not atoms and "crud" in text:
                 atoms = [(name, "Implement and independently test only this bounded Notes capability.") for name in ("Create notes", "Read notes", "Update notes", "Delete notes")]
             if not atoms:

@@ -123,3 +123,29 @@ def test_runner_keeps_an_invalid_initial_plan_blocked(tmp_path: Path) -> None:
     state = runner.run()
 
     assert state.status == "BLOCKED"
+
+
+def test_tester_harness_regeneration_does_not_spend_a_second_coder_attempt(tmp_path: Path) -> None:
+    setup_repository(tmp_path)
+    provider = ScriptedProvider(
+        {
+            "MANAGER": [
+                AgentReply({"tasks": [{"title": "Write artifact", "description": "Create artifact.txt"}]}),
+                AgentReply({}),
+            ],
+            "CODER": [AgentReply({"actions": [{"kind": "write_file", "path": "artifact.txt", "content": "ok"}]})],
+            "TESTER": [
+                AgentReply({"command": ["py", "-3", "-c", "import re; with open('artifact.txt'): pass"]}),
+                AgentReply({"command": ["py", "-3", "-c", "from pathlib import Path; assert Path('artifact.txt').read_text() == 'ok'"]}),
+            ],
+            "REVIEWER": [AgentReply({"approved": True})],
+        }
+    )
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    runner.initialize("Build a small project")
+
+    state = runner.run(max_cycles=1)
+
+    assert state.tasks[0].status is TaskStatus.DONE
+    assert state.tasks[0].attempts == 1
+    assert sum(event.phase == "HARNESS_FAILURE" for event in state.events) == 1
