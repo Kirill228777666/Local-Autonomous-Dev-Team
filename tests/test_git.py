@@ -36,3 +36,16 @@ def test_git_repository_restores_a_tracked_path(tmp_path: Path) -> None:
     GitRepository(tmp_path).restore("settings.txt")
 
     assert path.read_text(encoding="utf-8") == "stable\n"
+def test_git_diff_with_utf8_project_content_is_always_text(tmp_path: Path) -> None:
+    command(tmp_path, "init")
+    command(tmp_path, "config", "user.email", "test@example.com")
+    command(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "notes.txt").write_text("\u0421\u043e\u0437\u0434\u0430\u0439 \u0437\u0430\u043c\u0435\u0442\u043a\u0443\n", encoding="utf-8")
+    command(tmp_path, "add", "notes.txt")
+    command(tmp_path, "commit", "-m", "initial")
+    (tmp_path / "notes.txt").write_text("\u0421\u043e\u0437\u0434\u0430\u0439 \u0437\u0430\u043c\u0435\u0442\u043a\u0443\n\u0418\u0437\u043c\u0435\u043d\u0438 \u0437\u0430\u043c\u0435\u0442\u043a\u0443\n", encoding="utf-8")
+
+    diff = GitRepository(tmp_path).diff()
+
+    assert isinstance(diff, str)
+    assert "\u0418\u0437\u043c\u0435\u043d\u0438" in diff
