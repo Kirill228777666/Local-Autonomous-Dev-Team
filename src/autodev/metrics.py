@@ -22,6 +22,8 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "updated_at": state.updated_at,
         "run_duration_seconds": duration_seconds,
         "total_llm_calls": len(llm_events),
+        "llm_requests_attempted": count("LLM", "REQUEST") or len(llm_events),
+        "llm_responses_completed": count("LLM", "RESPONSE"),
         "llm_calls_by_role": calls_by_role,
         "total_tool_calls": len(tool_events),
         "tasks_created": len(state.tasks),
@@ -62,6 +64,19 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "orphan_processes_cleaned": sum("Cleaned stale managed process" in entry for entry in history),
         "long_running_commands_rerouted": sum("rerouted to managed process" in item.detail for item in state.tool_executions),
         "run_command_hard_timeouts": sum("hard timed out" in item.detail for item in state.tool_executions),
+        "provider_circuit_opens": count("PROVIDER", "CIRCUIT_OPEN"),
+        "provider_health_checks": count("PROVIDER", "HEALTH_CHECK_FAILED"),
+        "provider_circuit_closures": count("PROVIDER", "CIRCUIT_CLOSED"),
+        "provider_circuit_closes": count("PROVIDER", "CIRCUIT_CLOSED"),
+        "provider_wait_timeouts": count("PROVIDER", "CIRCUIT_TIMEOUT"),
+        "provider_outage_occurrences": int(state.provider_state.get("occurrences", 0)),
+        "model_provider_failures": count("PROVIDER", "FAILURE"),
+        "provider_connection_refused": count("PROVIDER", "CONNECTION_REFUSED"),
+        "provider_http_503": count("PROVIDER", "HTTP_503"),
+        "provider_recovery_wait_seconds": state.provider_state.get("recovery_wait_seconds", 0.0),
+        "provider_task_attempts_preserved": count("PROVIDER", "TASK_ATTEMPT_PRESERVED"),
+        "provider_outages": count("PROVIDER", "CIRCUIT_OPEN"),
+        "provider_recoveries": count("PROVIDER", "CIRCUIT_CLOSED"),
         "visual_status": state.visual_status,
     }
 
@@ -71,6 +86,14 @@ def write_metrics(directory: Path, state: ProjectState) -> None:
     completed = [task.title for task in state.tasks if task.status.value == "DONE"]
     blocked = [task.title for task in state.tasks if task.status.value == "BLOCKED"]
     limitations = [entry for entry in state.run_history if "skipped" in entry.lower() or "unavailable" in entry.lower()]
+    incident = state.provider_state
+    incident_summary = "- None"
+    if incident:
+        incident_summary = (
+            f"- {incident.get('incident_type', 'UNAVAILABLE')}: occurrences={incident.get('occurrences', 0)}, "
+            f"first_seen={incident.get('first_seen', 'unknown')}, last_seen={incident.get('last_seen', 'unknown')}, "
+            f"recovered={incident.get('recovered', False)}"
+        )
     report = (
         "# Run Report\n\n"
         f"## Project\n{directory.parent.name}\n\n## Original goal\n{state.original_spec}\n\n"
@@ -80,6 +103,7 @@ def write_metrics(directory: Path, state: ProjectState) -> None:
         f"## Final QA\n{state.final_qa_status}\n" + "\n".join(f"- {item}" for item in state.final_qa_findings) + "\n\n"
         f"## Visual QA\n{state.visual_status}\n" + "\n".join(f"- {item}" for item in state.visual_issues) + "\n\n"
         f"## Last checkpoint\n{state.last_checkpoint or 'None'}\n\n"
+        f"## Model provider incident\n{incident_summary}\n\n"
         f"## Metrics\n```json\n{json.dumps(data, indent=2)}\n```\n\n"
         "## Recovery events\n" + ("\n".join(f"- {item}" for item in state.run_history if "recovery" in item.lower() or "resumed" in item.lower()) or "- None") + "\n\n"
         "## Known limitations\n" + ("\n".join(f"- {item}" for item in limitations) or "- None recorded.") + "\n"

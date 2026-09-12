@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 from autodev.environment import EnvironmentManager, FailureKind, classify_failure, validate_readme
@@ -72,6 +73,29 @@ def test_russian_state_projections_and_json_round_trip_as_utf8(tmp_path: Path) -
     assert text in (tmp_path / ".autodev" / "activity.log").read_text(encoding="utf-8")
 
 
+def test_russian_text_survives_crash_resume_and_all_runtime_artifacts_as_raw_utf8(tmp_path: Path) -> None:
+    for command in (("git", "init"), ("git", "config", "user.email", "test@example.com"), ("git", "config", "user.name", "Test User")):
+        subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / ".gitignore").write_text(".autodev/\n", encoding="utf-8")
+    subprocess.run(("git", "add", ".gitignore"), cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(("git", "commit", "-m", "initial"), cwd=tmp_path, check=True, capture_output=True, text=True)
+    goal = "Создай локальное приложение заметок"
+    title = "Реализовать поиск заметок"
+    description = "Не удается найти указанный файл — показать понятную ошибку"
+    state = ProjectState.create(goal)
+    state.tasks = [Task.create(title, description)]
+    state.record_event("SYSTEM", "INFO", goal)
+    store = StateStore(tmp_path)
+    store.save(state)  # persisted state prior to the simulated process crash
+    AutonomousRunner(tmp_path, store, WorkspaceTools(tmp_path), ScriptedProvider({})).resume()
+
+    for name in ("state.json", "run_report.md", "activity.log"):
+        decoded = (tmp_path / ".autodev" / name).read_bytes().decode("utf-8")
+        assert goal in decoded
+    progress = (tmp_path / ".autodev" / "progress.md").read_bytes().decode("utf-8")
+    assert title in progress and description in progress
+
+
 def test_node_free_pivot_supersedes_obsolete_npm_build_task(tmp_path: Path) -> None:
     frontend = Task.create("Frontend Development", "Build React UI")
     build = Task.create("Frontend Build Process", "Run npm build")
@@ -107,6 +131,24 @@ def test_manager_decomposes_crud_task_before_coder(tmp_path: Path) -> None:
 
     assert state.tasks[0].status is TaskStatus.SUPERSEDED
     assert {task.title for task in state.tasks[1:]} == {"Create notes", "Read notes", "Update notes", "Delete notes"}
+
+
+def test_manager_decomposes_broad_russian_backend_scope_into_atomic_tasks(tmp_path: Path) -> None:
+    state = ProjectState.create(
+        "Создай Notes: создание, редактирование, удаление, поиск, категории, фильтрация и избранные заметки."
+    )
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))
+    state.tasks = [Task.create("Разработка Backend API", "Реализовать API для всех возможностей Notes.")]
+
+    runner._decompose_broad_tasks(state)
+
+    assert state.tasks[0].status is TaskStatus.SUPERSEDED
+    assert {task.title for task in state.tasks[1:]} == {
+        "Create backend application",
+        "Implement note CRUD API",
+        "Implement note search and categories",
+        "Implement note favorites and validation",
+    }
 
 
 def test_metrics_counters_survive_event_history_truncation() -> None:

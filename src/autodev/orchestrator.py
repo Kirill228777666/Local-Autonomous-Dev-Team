@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -13,7 +15,8 @@ from .designer import DesignerAgent, detect_ui_project
 from .environment import EnvironmentManager, FailureKind, classify_failure, validate_readme
 from .git import GitError, GitRepository
 from .models import Heartbeat, ProjectState, Task, TaskStatus, ToolExecution, ToolExecutionStatus
-from .providers import LLMProvider, ProviderError
+from .models import utc_now
+from .providers import LLMProvider, ProviderError, ProviderUnavailableError
 from .regression import RegressionRunner
 from .runtime import ManagedProcessManager, ScreenshotPipeline
 from .state_store import StateStore
@@ -41,11 +44,14 @@ class AutonomousRunner:
         max_visual_repairs: int = 2,
         allow_project_dependency_install: bool = True,
         allow_system_package_install: bool = False,
+        provider_wait_seconds: float | None = None,
+        provider_retry_interval: float = 5.0,
     ) -> None:
         self.workspace = workspace.resolve()
         self.store = store
         self.tools = tools
         self.agents = RoleAgents(provider)
+        self.provider = provider
         self.max_attempts = max_attempts
         self.regression_runner = regression_runner or RegressionRunner(self.workspace, tools)
         self.visual_pipeline = visual_pipeline
@@ -54,6 +60,13 @@ class AutonomousRunner:
         self.designer = DesignerAgent(provider, structured_retries=1)
         self.environment_manager = EnvironmentManager(workspace, tools, allow_project_dependency_install, allow_system_package_install)
         self.process_manager = ManagedProcessManager(self.workspace)
+        # Scripted and third-party providers without a health endpoint return
+        # immediately; a real Ollama-backed run can wait through a short restart.
+        self.provider_wait_seconds = (
+            (600.0 if callable(getattr(provider, "health", None)) else 0.0)
+            if provider_wait_seconds is None else max(0.0, provider_wait_seconds)
+        )
+        self.provider_retry_interval = max(0.1, provider_retry_interval)
 
     def initialize(self, original_spec: str) -> ProjectState:
         existing = self.store.load()
@@ -68,8 +81,11 @@ class AutonomousRunner:
         state = self.store.load()
         if state is None:
             raise ValueError("project is not initialized")
-        if state.status in {"PAUSED", "STOPPED", "COMPLETE"}:
+        if state.status in {"PAUSED", "STOPPED", "COMPLETE", "BLOCKED_PROVIDER"}:
             return state
+        if state.status == "WAITING_FOR_MODEL_PROVIDER":
+            if not self._wait_for_provider(state):
+                return state
         state.status = "RUNNING"
         self._recover_managed_processes(state)
         if not state.environment:
@@ -79,13 +95,24 @@ class AutonomousRunner:
         self._mark(state, "MANAGER", "PLANNING", "Autonomous run started")
         if not state.tasks:
             self._plan(state)
+            if state.status == "WAITING_FOR_MODEL_PROVIDER":
+                if not self._wait_for_provider(state):
+                    return state
+                # No plan was accepted while the provider was down, so retry the
+                # single planning request only after its global circuit closes.
+                self._plan(state)
         self._decompose_broad_tasks(state)
-        if state.status == "BLOCKED":
+        if state.status in {"BLOCKED", "WAITING_FOR_MODEL_PROVIDER", "BLOCKED_PROVIDER"}:
             return state
         for _ in range(max_cycles):
             if state.status in {"PAUSED", "STOPPED"}:
                 break
             task = self._select_next_task(state)
+            if state.status in {"WAITING_FOR_MODEL_PROVIDER", "BLOCKED_PROVIDER"}:
+                self.store.save(state)
+                if state.status == "WAITING_FOR_MODEL_PROVIDER" and self._wait_for_provider(state):
+                    continue
+                break
             if task is None:
                 self._finish_or_continue(state)
                 self.store.save(state)
@@ -94,6 +121,9 @@ class AutonomousRunner:
                 continue
             self._run_task(state, task)
             self.store.save(state)
+            if state.status == "WAITING_FOR_MODEL_PROVIDER":
+                if not self._wait_for_provider(state):
+                    break
         return state
 
     def _finish_or_continue(self, state: ProjectState) -> None:
@@ -129,9 +159,13 @@ class AutonomousRunner:
             self._mark(state, "FINAL_QA", "LLM_CALL", "Final QA request", None)
             self._mark(state, "FINAL_QA", "REVIEW", "Final QA evaluating completed project")
             reply = self.agents.final_qa(state, regression.summary + "\nGit diff:\n" + self._git_diff()).data
+            self._mark(state, "FINAL_QA", "LLM_RESPONSE", "Final QA response received")
+        except ProviderUnavailableError as error:
+            self._mark_provider_wait(state, None, str(error))
+            return
         except ProviderError as error:
             state.status = "BLOCKED"
-            state.run_history.append(f"Final QA unavailable: {error}")
+            state.run_history.append(f"Final QA returned invalid output: {error}")
             return
         status = reply.get("status")
         findings = reply.get("findings", [])
@@ -264,6 +298,7 @@ class AutonomousRunner:
         try:
             self._mark(state, "MANAGER", "LLM_CALL", "Manager planning request")
             reply = self.agents.plan(state).data
+            self._mark(state, "MANAGER", "LLM_RESPONSE", "Manager plan response received")
             raw_tasks = reply.get("tasks")
             if not isinstance(raw_tasks, list) or not raw_tasks:
                 raise ProviderError("Manager returned no initial tasks")
@@ -282,9 +317,12 @@ class AutonomousRunner:
             state.decisions.append(f"Manager planned {len(state.tasks)} tasks")
             state.run_history.append("Manager created initial plan")
             self.store.save(state)
+        except ProviderUnavailableError as error:
+            self._mark_provider_wait(state, None, str(error))
         except ProviderError as error:
             state.status = "BLOCKED"
-            state.run_history.append(f"Planning blocked: {error}")
+            state.run_history.append(f"Planning blocked by invalid Manager output: {error}")
+            self._mark(state, "MANAGER", "INVALID_OUTPUT", "Manager plan was invalid")
             self.store.save(state)
 
     def _select_next_task(self, state: ProjectState) -> Task | None:
@@ -299,12 +337,16 @@ class AutonomousRunner:
         try:
             self._mark(state, "MANAGER", "LLM_CALL", "Manager task-selection request")
             requested_id = self.agents.select(state).data.get("next_task_id")
+            self._mark(state, "MANAGER", "LLM_RESPONSE", "Manager selection response received")
             if isinstance(requested_id, str):
                 selected = next((task for task in pending if task.id == requested_id), None)
                 if selected is not None:
                     return selected
+        except ProviderUnavailableError as error:
+            self._mark_provider_wait(state, None, str(error))
+            return None
         except ProviderError as error:
-            state.run_history.append(f"Manager selection unavailable; using plan order: {error}")
+            state.run_history.append(f"Manager selection invalid; using deterministic plan order: {error}")
         return pending[0]
 
     def _run_task(self, state: ProjectState, task: Task) -> None:
@@ -315,6 +357,7 @@ class AutonomousRunner:
         try:
             self._mark(state, "CODER", "LLM_CALL", "Coder implementation request", task)
             actions = self.agents.code(state, task).data.get("actions")
+            self._mark(state, "CODER", "LLM_RESPONSE", "Coder implementation response received", task)
             if not isinstance(actions, list):
                 raise ProviderError("Coder response needs an actions array")
             fingerprint = hashlib.sha256(json.dumps(actions, sort_keys=True).encode()).hexdigest()
@@ -357,6 +400,7 @@ class AutonomousRunner:
                     tool_recoveries += 1
                     self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing stale edit context for {path}", task)
                     refreshed = self.agents.code(state, task).data.get("actions")
+                    self._mark(state, "CODER", "LLM_RESPONSE", "Coder stale-edit recovery response received", task)
                     if not isinstance(refreshed, list):
                         raise ProviderError("Coder tool recovery response needs actions")
                     actions = refreshed
@@ -364,7 +408,14 @@ class AutonomousRunner:
                     continue
                 position += 1
             state.run_history.append(f"Coder completed attempt {task.attempts} for {task.title}")
-        except (ProviderError, ToolPolicyError, ValueError, KeyError, TypeError) as error:
+        except ProviderUnavailableError as error:
+            self._preserve_task_for_provider_wait(task, state)
+            self._mark_provider_wait(state, task, str(error))
+            return
+        except ProviderError as error:
+            self._retry_or_block(task, state, f"Coder response invalid: {error}")
+            return
+        except (ToolPolicyError, ValueError, KeyError, TypeError) as error:
             self._retry_or_block(task, state, f"Coder error: {error}")
             return
 
@@ -379,6 +430,7 @@ class AutonomousRunner:
                 self._mark(state, "TESTER", "TESTING", f"Tester verifying: {task.title}", task)
                 self._mark(state, "TESTER", "LLM_CALL", "Tester verification request", task)
                 reply = self.agents.test(state, task).data
+                self._mark(state, "TESTER", "LLM_RESPONSE", "Tester verification response received", task)
                 command = reply.get("command")
                 if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
                     raise ProviderError("Tester response needs a string command array")
@@ -388,7 +440,14 @@ class AutonomousRunner:
                 if self._requires_managed_service(command):
                     self._ensure_validation_service(state, task)
                 result = self.tools.run_tests(command)
-            except (ProviderError, ToolPolicyError, ValueError) as error:
+            except ProviderUnavailableError as error:
+                self._preserve_task_for_provider_wait(task, state)
+                self._mark_provider_wait(state, task, str(error))
+                return
+            except ProviderError as error:
+                self._retry_or_block(task, state, f"Tester response invalid: {error}")
+                return
+            except (ToolPolicyError, ValueError) as error:
                 self._retry_or_block(task, state, f"Tester error: {error}")
                 return
         state.run_history.append(self._result_log(task, result))
@@ -426,12 +485,17 @@ class AutonomousRunner:
             self._mark(state, "REVIEWER", "LLM_CALL", "Reviewer decision request", task)
             evidence = self._result_log(task, result) + "\nGit diff:\n" + self._git_diff()
             review = self.agents.review(state, task, evidence).data
+            self._mark(state, "REVIEWER", "LLM_RESPONSE", "Reviewer decision response received", task)
             if review.get("approved") is not True:
                 reasons = review.get("reasons", ["Reviewer rejected implementation"])
                 self._retry_or_block(task, state, f"Review rejected: {reasons}")
                 return
+        except ProviderUnavailableError as error:
+            self._preserve_task_for_provider_wait(task, state)
+            self._mark_provider_wait(state, task, str(error))
+            return
         except ProviderError as error:
-            self._retry_or_block(task, state, f"Reviewer error: {error}")
+            self._retry_or_block(task, state, f"Reviewer response invalid: {error}")
             return
 
         try:
@@ -596,6 +660,8 @@ class AutonomousRunner:
                 self._block(task, state, error)
                 return
             self._diagnose(state, task)
+            if state.status in {"WAITING_FOR_MODEL_PROVIDER", "BLOCKED_PROVIDER"}:
+                return
             task.status = TaskStatus.FAILED
             state.current_task_id = None
             diagnosis = next(
@@ -614,25 +680,55 @@ class AutonomousRunner:
             return
         if len(task.errors) >= 2:
             self._diagnose(state, task)
+            if state.status in {"WAITING_FOR_MODEL_PROVIDER", "BLOCKED_PROVIDER"}:
+                return
         task.status = TaskStatus.PENDING
         state.run_history.append(f"Returning task to Coder: {task.title}; {error}")
 
     def _decompose_broad_tasks(self, state: ProjectState) -> None:
-        """Replace one multi-feature task with atomic work before Coder receives it."""
-        mapping = {
-            "crud": ["Create notes", "Read notes", "Update notes", "Delete notes"],
-            "create, read, update": ["Create notes", "Read notes", "Update notes", "Delete notes"],
-        }
+        """Replace multi-capability Notes tasks before a small local model sees them.
+
+        The plan may be Russian or English.  This deliberately relies on product
+        capability signals rather than an exact English phrase such as ``CRUD``.
+        It applies only to original planning tasks, never a targeted repair.
+        """
+        backend_atoms = [
+            ("Create backend application", "Create the Flask application, configuration, SQLite connection and a health endpoint only."),
+            ("Implement note CRUD API", "Implement create, read, update and delete note API endpoints with isolated persistence tests."),
+            ("Implement note search and categories", "Implement search, category assignment and category filtering API behaviour only."),
+            ("Implement note favorites and validation", "Implement favorite state, timestamps, validation and error responses only."),
+        ]
+        frontend_atoms = [
+            ("Create static frontend shell", "Create HTML structure and serve the static assets from the backend."),
+            ("Implement responsive Notes styling", "Implement responsive CSS for desktop and narrow viewports only."),
+            ("Connect Notes frontend actions", "Implement browser JavaScript for Notes CRUD and backend API calls only."),
+            ("Implement frontend search and filters", "Implement category filtering, search and favorite UI behaviour only."),
+        ]
+        product = state.original_spec.lower()
+        capability_markers = (
+            "crud", "create", "edit", "update", "delete", "search", "categor", "favorite",
+            "создан", "редакт", "удален", "удалён", "поиск", "категор", "избран",
+        )
         for task in list(state.tasks):
-            if task.status is not TaskStatus.PENDING:
+            if task.status is not TaskStatus.PENDING or task.repair_of is not None:
                 continue
             text = f"{task.title} {task.description}".lower()
-            names = next((parts for marker, parts in mapping.items() if marker in text), None)
-            if names is None:
+            product_is_broad = sum(marker in product for marker in capability_markers) >= 4
+            broad = product_is_broad and sum(marker in f"{text} {product}" for marker in capability_markers) >= 4
+            backend = any(marker in text for marker in ("backend", "back-end", "api", "бэкенд", "сервер"))
+            frontend = any(marker in text for marker in ("frontend", "front-end", "ui", "интерфейс", "фронтенд"))
+            atoms = backend_atoms if broad and backend else frontend_atoms if broad and frontend else []
+            if not atoms and "crud" in text:
+                atoms = [(name, "Implement and independently test only this bounded Notes capability.") for name in ("Create notes", "Read notes", "Update notes", "Delete notes")]
+            if not atoms:
                 continue
             task.status = TaskStatus.SUPERSEDED
-            for name in names:
-                state.tasks.append(Task.create(name, f"Implement and independently test only this bounded Notes capability. Original scope: {task.description}", dependencies=task.dependencies))
+            for title, bounded_scope in atoms:
+                state.tasks.append(Task.create(
+                    title,
+                    f"{bounded_scope} Independently validate only this capability. Original scope: {task.description}",
+                    dependencies=task.dependencies,
+                ))
             state.run_history.append(f"Manager decomposed broad task: {task.title}")
             self._mark(state, "MANAGER", "DECOMPOSED", f"Decomposed broad task: {task.title}")
 
@@ -690,6 +786,7 @@ class AutonomousRunner:
             try:
                 self._mark(state, "DESIGNER", "LLM_CALL", f"Designer reviewing {screenshot.name}", task)
                 review = self.designer.review(screenshot, state.original_spec, state, task, viewport)
+                self._mark(state, "DESIGNER", "LLM_RESPONSE", f"Designer response received for {screenshot.name}", task)
             except (ProviderError, ValueError) as error:
                 state.visual_status = "UNAVAILABLE"
                 state.run_history.append(f"Visual QA unavailable: {error}")
@@ -720,9 +817,92 @@ class AutonomousRunner:
         try:
             self._mark(state, "ARCHITECT", "LLM_CALL", "Architect diagnosis request", task)
             diagnosis = self.agents.diagnose(state, task).data
+            self._mark(state, "ARCHITECT", "LLM_RESPONSE", "Architect diagnosis response received", task)
             state.decisions.append(f"Architect diagnosis for {task.title}: {diagnosis}")
+        except ProviderUnavailableError as error:
+            self._preserve_task_for_provider_wait(task, state)
+            self._mark_provider_wait(state, task, str(error))
         except ProviderError as error:
-            state.decisions.append(f"Architect unavailable for {task.title}: {error}")
+            state.decisions.append(f"Architect diagnosis invalid for {task.title}: {error}")
+
+    @staticmethod
+    def _preserve_task_for_provider_wait(task: Task, state: ProjectState) -> None:
+        """A model outage must never consume a coding attempt or create a repair."""
+        if task.attempts > 0:
+            task.attempts -= 1
+        task.status = TaskStatus.PENDING
+        state.current_task_id = None
+        state.event_counters["PROVIDER:TASK_ATTEMPT_PRESERVED"] = state.event_counters.get("PROVIDER:TASK_ATTEMPT_PRESERVED", 0) + 1
+
+    def _provider_is_healthy(self) -> bool:
+        probe = getattr(self.provider, "health", None)
+        return bool(probe()) if callable(probe) else True
+
+    def _wait_for_provider(self, state: ProjectState) -> bool:
+        """Keep a real live run autonomous through a bounded Ollama restart."""
+        deadline = time.monotonic() + self.provider_wait_seconds
+        while True:
+            if self._provider_is_healthy():
+                state.status = "RUNNING"
+                recovered_at = utc_now()
+                state.provider_state.update({"circuit": "CLOSED", "recovered_at": recovered_at, "recovered": True})
+                first_seen = str(state.provider_state.get("first_seen", ""))
+                try:
+                    waited = max(0.0, (datetime.fromisoformat(recovered_at) - datetime.fromisoformat(first_seen)).total_seconds())
+                except ValueError:
+                    waited = 0.0
+                state.provider_state["recovery_wait_seconds"] = waited
+                state.run_history.append("Model provider recovered; circuit closed")
+                self._mark(state, "PROVIDER", "CIRCUIT_CLOSED", "Model provider recovered")
+                return True
+            state.provider_state["health_checks"] = int(state.provider_state.get("health_checks", 0)) + 1
+            self._mark_provider_wait(state, None, "provider health probe failed", health_probe=True)
+            if time.monotonic() >= deadline:
+                state.status = "BLOCKED_PROVIDER"
+                state.run_history.append("Model provider remained unavailable past the configured wait budget")
+                self._mark(state, "PROVIDER", "CIRCUIT_TIMEOUT", "Provider wait budget exhausted")
+                return False
+            time.sleep(min(self.provider_retry_interval, max(0.0, deadline - time.monotonic())))
+
+    @staticmethod
+    def _provider_incident_type(detail: str) -> str:
+        text = detail.lower()
+        if "10061" in text or "connection refused" in text or "отверг" in text:
+            return "CONNECTION_REFUSED"
+        if "503" in text:
+            return "HTTP_503"
+        if "timed out" in text or "timeout" in text:
+            return "TIMEOUT"
+        return "UNAVAILABLE"
+
+    def _mark_provider_wait(self, state: ProjectState, task: Task | None, detail: str, *, health_probe: bool = False) -> None:
+        previous = str(state.provider_state.get("fingerprint", ""))
+        was_open = state.provider_state.get("circuit") == "OPEN"
+        fingerprint = detail[:240]
+        occurrences = int(state.provider_state.get("occurrences", 0)) + (0 if health_probe else 1)
+        incident_type = self._provider_incident_type(detail)
+        state.provider_state.update({
+            "circuit": "OPEN",
+            "fingerprint": fingerprint if not health_probe else previous,
+            "incident_type": state.provider_state.get("incident_type", incident_type) if health_probe else incident_type,
+            "occurrences": occurrences,
+            "last_seen": utc_now(),
+            "recovered": False,
+        })
+        if not state.provider_state.get("first_seen"):
+            state.provider_state["first_seen"] = utc_now()
+        state.status = "WAITING_FOR_MODEL_PROVIDER"
+        if health_probe:
+            self._mark(state, "PROVIDER", "HEALTH_CHECK_FAILED", "Model provider still unavailable", task)
+        elif not was_open or not previous:
+            state.run_history.append(f"Model provider circuit opened: {fingerprint}")
+            self._mark(state, "PROVIDER", "FAILURE", f"Provider incident: {incident_type}", task)
+            self._mark(state, "PROVIDER", incident_type, f"Provider incident: {incident_type}", task)
+            self._mark(state, "PROVIDER", "CIRCUIT_OPEN", "Model provider unavailable; preserving project task", task)
+        else:
+            # The circuit is already open. Do not emit duplicate incident prose or
+            # another role-level request; only health probes are allowed now.
+            self._mark(state, "PROVIDER", "INCIDENT_DEDUPLICATED", "Provider incident already open", task)
 
     @staticmethod
     def _block(task: Task, state: ProjectState, reason: str) -> None:
@@ -751,4 +931,8 @@ class AutonomousRunner:
             attempt=task.attempts if task is not None else 0,
         )
         state.record_event(agent, phase, message, task.id if task is not None else state.current_task_id)
+        if phase == "LLM_CALL":
+            state.event_counters["LLM:REQUEST"] = state.event_counters.get("LLM:REQUEST", 0) + 1
+        elif phase == "LLM_RESPONSE":
+            state.event_counters["LLM:RESPONSE"] = state.event_counters.get("LLM:RESPONSE", 0) + 1
         self.store.save(state)

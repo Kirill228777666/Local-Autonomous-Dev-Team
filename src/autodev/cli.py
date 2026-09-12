@@ -21,7 +21,7 @@ from .tools import WorkspaceTools
 class AgentProfile:
     model: str
     temperature: float = 0.1
-    timeout: float = 120.0
+    timeout: float = 600.0
     retries: int = 2
     context_budget: int = 12000
     context_limit: int = 16384
@@ -45,13 +45,14 @@ class PermissionConfig:
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:
-    model: str = "qwen3:14b"
-    base_url: str = "http://localhost:11434"
-    timeout: float = 120.0
+    model: str = "qwen3-coder:30b"
+    base_url: str = "http://127.0.0.1:11434"
+    timeout: float = 600.0
     max_attempts: int = 3
     profiles: dict[str, AgentProfile] = field(default_factory=dict)
     visual: VisualConfig = field(default_factory=VisualConfig)
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
+    provider_max_wait_seconds: float = 600.0
 
 
 def load_config(path: Path | None) -> AppConfig:
@@ -103,6 +104,7 @@ def load_config(path: Path | None) -> AppConfig:
         profiles=profiles,
         visual=visual_config,
         permissions=permission_config,
+        provider_max_wait_seconds=float(runner.get("provider_max_wait_seconds", defaults.provider_max_wait_seconds)),
     )
 
 
@@ -162,6 +164,7 @@ def make_runner(workspace: Path, config: AppConfig, scripted: bool = False) -> A
         max_visual_repairs=config.visual.max_repairs,
         allow_project_dependency_install=config.permissions.allow_project_dependency_install,
         allow_system_package_install=config.permissions.allow_system_package_install,
+        provider_wait_seconds=config.provider_max_wait_seconds,
     )
 
 

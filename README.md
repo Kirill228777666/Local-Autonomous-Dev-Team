@@ -7,7 +7,7 @@ Windows-first local MVP for an autonomous software-development loop. Give it a p
 - Windows 11
 - Python 3.11+ (`py -3`)
 - Git
-- [Ollama](https://ollama.com/) running locally with a pulled model, for example `ollama pull qwen3:14b`
+- [Ollama](https://ollama.com/) running locally with `qwen3-coder:30b` (the default live profile)
 
 ## Quick start
 
@@ -41,6 +41,8 @@ py -3 -m autodev requirement add C:\work\my-app "Add JSON export"
 ```
 
 `pause` preserves state for a later `resume`. `stop` deliberately ends the current run. `requirement add` keeps an amendment separate from the original specification and returns it to the autonomous task queue. The LLM has no shell access: all actions are validated and executed through the workspace-only tool layer.
+
+The default live endpoint is `http://127.0.0.1:11434` rather than `localhost`, avoiding Windows IPv6/IPv4 resolution ambiguity. If Ollama becomes unavailable, AutoDev opens a durable global provider circuit: no role prompts, task attempts, or corrective tasks are generated while it waits through health probes. A configurable `[runner] provider_max_wait_seconds` bounds that wait; its terminal state is `BLOCKED_PROVIDER` and a later `resume` preserves the original task graph.
 
 ## Reliability and inspection
 

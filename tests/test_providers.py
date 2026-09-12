@@ -1,5 +1,5 @@
 import json
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -8,6 +8,7 @@ from autodev.providers import (
     AgentRequest,
     OllamaProvider,
     ProviderError,
+    ProviderUnavailableError,
     ScriptedProvider,
 )
 
@@ -36,7 +37,7 @@ def test_ollama_provider_sends_low_temperature_and_parses_json_response() -> Non
     sent_payloads: list[dict[str, object]] = []
 
     def transport(url: str, payload: bytes, timeout: float) -> bytes:
-        assert url == "http://localhost:11434/api/chat"
+        assert url == "http://127.0.0.1:11434/api/chat"
         assert timeout == 30
         sent_payloads.append(json.loads(payload))
         return json.dumps({"message": {"content": '{"approved": true}'}}).encode()
@@ -76,3 +77,18 @@ def test_ollama_provider_accepts_json_wrapped_in_markdown_fence() -> None:
     )
 
     assert reply.data == {"actions": []}
+
+
+def test_ollama_http_503_is_an_endpoint_outage_after_bounded_retry() -> None:
+    attempts = 0
+
+    def transport(_url: str, _payload: bytes, _timeout: float) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        raise HTTPError("http://127.0.0.1:11434/api/chat", 503, "busy", {}, None)
+
+    with pytest.raises(ProviderUnavailableError, match="endpoint unavailable"):
+        OllamaProvider(model="qwen", transport=transport, retries=1).complete(
+            AgentRequest(role="CODER", prompt="implement")
+        )
+    assert attempts == 2

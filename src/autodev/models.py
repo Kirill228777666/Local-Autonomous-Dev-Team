@@ -190,6 +190,7 @@ class ProjectState:
     environment: dict[str, object] = field(default_factory=dict)
     architecture: dict[str, object] = field(default_factory=dict)
     event_counters: dict[str, int] = field(default_factory=dict)
+    provider_state: dict[str, object] = field(default_factory=dict)
     managed_processes: list[dict[str, object]] = field(default_factory=list)
 
     @classmethod
@@ -228,6 +229,7 @@ class ProjectState:
             environment=dict(value.get("environment", {})),  # type: ignore[arg-type]
             architecture=dict(value.get("architecture", {})),  # type: ignore[arg-type]
             event_counters={str(key): int(count) for key, count in dict(value.get("event_counters", {})).items()},  # type: ignore[arg-type]
+            provider_state=dict(value.get("provider_state", {})),  # type: ignore[arg-type]
             managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
         )
 
@@ -256,6 +258,7 @@ class ProjectState:
             "environment": self.environment,
             "architecture": self.architecture,
             "event_counters": self.event_counters,
+            "provider_state": self.provider_state,
             "managed_processes": self.managed_processes[-100:],
         }
 
