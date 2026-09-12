@@ -327,6 +327,9 @@ class AutonomousRunner:
             while position < len(actions):
                 action = actions[position]
                 try:
+                    if isinstance(action, dict) and action.get("kind") == "run_command" and self._known_missing_npm(state, action.get("command")):
+                        self._pivot_to_static_frontend(state, task)
+                        return
                     self._execute_action(state, task, action)
                 except CommandExecutionError as error:
                     if error.result.exit_code == 125:
@@ -379,6 +382,9 @@ class AutonomousRunner:
                 command = reply.get("command")
                 if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
                     raise ProviderError("Tester response needs a string command array")
+                if self._known_missing_npm(state, command):
+                    self._pivot_to_static_frontend(state, task)
+                    return
                 if self._requires_managed_service(command):
                     self._ensure_validation_service(state, task)
                 result = self.tools.run_tests(command)
@@ -488,6 +494,13 @@ class AutonomousRunner:
     @staticmethod
     def _requires_managed_service(command: list[str]) -> bool:
         return any("localhost" in item.lower() or "127.0.0.1" in item for item in command)
+
+    @staticmethod
+    def _known_missing_npm(state: ProjectState, command: object) -> bool:
+        if not isinstance(command, list) or not command or not isinstance(command[0], str):
+            return False
+        npm = state.environment.get("npm")
+        return command[0].lower() in {"npm", "npx"} and isinstance(npm, dict) and npm.get("available") is False
 
     def _ensure_validation_service(self, state: ProjectState, task: Task) -> None:
         if any(record.get("purpose") == f"task:{task.id}" and record.get("status") == "READY" for record in self.process_manager.records()):

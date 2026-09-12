@@ -10,7 +10,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .cli import AppConfig, ensure_workspace, make_runner
+from .cli import AppConfig, VisualConfig, ensure_workspace, make_runner
 from .metrics import metrics
 from .regression import RegressionRunner
 from .state_store import StateStore
@@ -109,6 +109,8 @@ def run_notes_live(config: AppConfig, config_path: Path | None, artifact_root: P
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     root = (artifact_root / run_id).resolve()
     workspace = prepare_notes_workspace(root / "notes")
+    if not config.visual.command:
+        config = AppConfig(config.model, config.base_url, config.timeout, config.max_attempts, config.profiles, VisualConfig(("python", "app.py"), "http://127.0.0.1:{port}", "", 30, 2), config.permissions)
     crash = controlled_crash(workspace, config_path, max_cycles)
     runner = make_runner(workspace, config)
     runner.resume()
