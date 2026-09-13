@@ -52,6 +52,8 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "run_start": state.created_at,
         "updated_at": state.updated_at,
         "run_duration_seconds": duration_seconds,
+        "system_terminal_status": state.terminal_status,
+        "system_terminal_reason": state.terminal_reason,
         "total_llm_calls": sum(calls_by_role.values()),
         "llm_requests_attempted": provider_attempts or legacy_requests,
         "llm_responses_completed": provider_outcomes.get("SUCCESS", 0) if provider_attempts else min(legacy_responses, legacy_requests),
@@ -104,6 +106,12 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "destructive_write_rejections": count("CODER", "DESTRUCTIVE_WRITE_REJECTED"),
         "destructive_write_recoveries": count("CODER", "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS"),
         "destructive_write_recovery_failures": count("CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED"),
+        "destructive_write_recovery_open": max(
+            0,
+            count("CODER", "DESTRUCTIVE_WRITE_REJECTED")
+            - count("CODER", "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS")
+            - count("CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED"),
+        ),
         "targeted_edit_reprompts": count("CODER", "DESTRUCTIVE_WRITE_REJECTED"),
         "environment_capability_cache_hits": sum("known unavailable" in entry.lower() for entry in history),
         "task_decompositions": sum("decomposed" in entry.lower() for entry in history),
@@ -120,6 +128,10 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "coder_repeated_noop_failures": sum("repeated identical coder action" in entry for entry in history),
         "coder_zero_diff_attempts": count("CODER", "ZERO_DIFF"),
         "coder_regressive_attempts": sum("REGRESSION:" in entry for entry in history),
+        "coder_structured_output_invalid": count("CODER", "CODER_STRUCTURED_OUTPUT_INVALID"),
+        "coder_structured_output_repairs": count("CODER", "CODER_STRUCTURED_OUTPUT_REPAIR"),
+        "coder_structured_output_repair_successes": count("CODER", "CODER_STRUCTURED_OUTPUT_REPAIR_SUCCESS"),
+        "coder_structured_output_blocks": count("CODER", "CODER_STRUCTURED_OUTPUT_BLOCKED"),
         "tasks_progressed_after_attempt": count("CONTROLLER", "MEANINGFUL_PROGRESS"),
         "tester_harness_failures": count("TESTER", "HARNESS_FAILURE"),
         "tester_harness_regenerations": count("TESTER", "HARNESS_EXECUTE"),

@@ -22,6 +22,9 @@ class RoleAgents:
         self.provider = provider
         self.context = context or ContextBuilder()
         self.structured_retries = structured_retries
+        self.last_structured_role = ""
+        self.last_structured_invalid_count = 0
+        self.last_structured_repaired = False
 
     def plan(self, state: ProjectState) -> AgentReply:
         return self._ask(
@@ -46,6 +49,7 @@ class RoleAgents:
             "{\"kind\":\"delete_file\",\"path\":\"relative/path\"}; "
             "{\"kind\":\"append_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
             "{\"kind\":\"run_command\",\"command\":[\"program\",\"arg\"]}. "
+            "For a valid no-op return exactly {\"actions\":[]}; never emit an action with empty content. "
             "Paths must be relative to the workspace; do not use shell wrappers.\n\n"
         )
         return self._ask("CODER", schema + self.context.for_task(state, task, relevant_files or []), self._valid_actions)
@@ -76,6 +80,9 @@ class RoleAgents:
 
     def _ask(self, role: str, prompt: str, validator: callable) -> AgentReply:
         error = ""
+        self.last_structured_role = role
+        self.last_structured_invalid_count = 0
+        self.last_structured_repaired = False
         for attempt in range(self.structured_retries + 1):
             reply = self.provider.complete(
                 AgentRequest(
@@ -86,9 +93,11 @@ class RoleAgents:
             )
             try:
                 validator(reply.data)
+                self.last_structured_repaired = self.last_structured_invalid_count > 0
                 return reply
             except ValueError as exc:
                 error = str(exc)
+                self.last_structured_invalid_count += 1
         raise ProviderError(f"{role} returned invalid structured output after {self.structured_retries + 1} attempt(s): {error}")
 
     @staticmethod

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 import os
 import subprocess
 from dataclasses import dataclass
@@ -91,9 +93,48 @@ class WorkspaceTools:
             handle.write(content)
 
     def file_snapshot(self, relative_path: str) -> tuple[str, str]:
-        import hashlib
         content = self.read_file(relative_path)
         return hashlib.sha256(content.encode("utf-8")).hexdigest(), content
+
+    def apply_deterministic_patch(
+        self,
+        relative_path: str,
+        expected_hash: str,
+        old: str,
+        desired: str,
+    ) -> bool:
+        """Apply an exact, compare-and-swap textual patch for a rejected write.
+
+        This is deliberately not a general bypass for ``write_file``.  It is used
+        only by the controller after the destructive-write policy has rejected a
+        proposed full replacement and therefore has both the exact pre-image and
+        desired post-image.  The expected content hash closes the stale-context
+        race; a caller must fall back to a refreshed edit if it no longer matches.
+        """
+        path = self._path(relative_path)
+        if not path.is_file():
+            return False
+        current = path.read_text(encoding="utf-8")
+        if current != old or hashlib.sha256(current.encode("utf-8")).hexdigest() != expected_hash:
+            return False
+
+        old_lines = old.splitlines(keepends=True)
+        desired_lines = desired.splitlines(keepends=True)
+        candidate = list(old_lines)
+        matcher = difflib.SequenceMatcher(a=old_lines, b=desired_lines, autojunk=False)
+        for _tag, start, end, desired_start, desired_end in reversed(matcher.get_opcodes()):
+            candidate[start:end] = desired_lines[desired_start:desired_end]
+        patched = "".join(candidate)
+        if patched != desired:
+            return False
+
+        # Verify immediately before writing as well: a file changed after the
+        # initial snapshot must never be overwritten by recovery code.
+        current = path.read_text(encoding="utf-8")
+        if current != old or hashlib.sha256(current.encode("utf-8")).hexdigest() != expected_hash:
+            return False
+        path.write_text(patched, encoding="utf-8", newline="")
+        return path.read_text(encoding="utf-8") == desired
 
     def delete_file(self, relative_path: str) -> None:
         path = self._path(relative_path)

@@ -215,6 +215,8 @@ class ProjectState:
     managed_processes: list[dict[str, object]] = field(default_factory=list)
     accepted_regressions: list[dict[str, object]] = field(default_factory=list)
     provider_request_stats: dict[str, object] = field(default_factory=dict)
+    terminal_status: str = ""
+    terminal_reason: str = ""
 
     @classmethod
     def create(cls, original_spec: str) -> ProjectState:
@@ -256,6 +258,8 @@ class ProjectState:
             managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
             accepted_regressions=[dict(item) for item in value.get("accepted_regressions", []) if isinstance(item, dict)],  # type: ignore[arg-type]
             provider_request_stats=dict(value.get("provider_request_stats", {})),  # type: ignore[arg-type]
+            terminal_status=str(value.get("terminal_status", "")),
+            terminal_reason=str(value.get("terminal_reason", "")),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -287,6 +291,8 @@ class ProjectState:
             "managed_processes": self.managed_processes[-100:],
             "accepted_regressions": self.accepted_regressions[-20:],
             "provider_request_stats": self.provider_request_stats,
+            "terminal_status": self.terminal_status,
+            "terminal_reason": self.terminal_reason,
         }
 
     def record_event(self, agent: str, phase: str, message: str, task_id: str | None = None) -> None:

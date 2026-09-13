@@ -51,6 +51,8 @@ def test_provider_outage_preserves_task_attempt_and_does_not_create_repairs(tmp_
     result = runner.run(max_cycles=1)
 
     assert result.status == "BLOCKED_PROVIDER"
+    assert result.terminal_status == "BLOCKED_PROVIDER"
+    assert sum(event.agent == "SYSTEM" and event.phase == "BLOCKED_PROVIDER" for event in result.events) == 1
     assert result.tasks == [task]
     assert task.status is TaskStatus.PENDING
     assert task.attempts == 0

@@ -71,7 +71,7 @@ def test_destructive_write_is_recovered_inside_same_coder_attempt(tmp_path: Path
     assert task.attempts == 1
     assert task.status is TaskStatus.DONE
     assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "kept"
-    assert "# updated capability" in (tmp_path / "app.py").read_text(encoding="utf-8")
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "too short\n"
     assert any(event.phase == "DESTRUCTIVE_WRITE_REJECTED" for event in state.events)
     assert any(event.phase == "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS" for event in state.events)
     assert not any(event.agent == "ARCHITECT" for event in state.events)

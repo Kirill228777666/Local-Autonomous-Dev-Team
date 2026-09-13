@@ -35,6 +35,14 @@ class CommandExecutionError(ValueError):
         self.result = result
 
 
+class TaskFailureError(ValueError):
+    """Expected task-local failure which must never end the runner process."""
+
+
+class DestructiveWriteRecoveryError(TaskFailureError):
+    """A bounded safe-edit recovery could not produce a valid mutation."""
+
+
 @dataclass(frozen=True, slots=True)
 class EnvironmentRepairOutcome:
     attempted: bool
@@ -101,8 +109,35 @@ class AutonomousRunner:
         if state is None:
             raise ValueError("project is not initialized")
         self._active_state = state
-        if state.status in {"PAUSED", "STOPPED", "COMPLETE", "BLOCKED_PROVIDER"}:
+        if state.status in {"PAUSED", "STOPPED", "COMPLETE", "BLOCKED", "BLOCKED_PROVIDER"}:
+            if state.status in {"COMPLETE", "BLOCKED", "BLOCKED_PROVIDER"} and not state.terminal_status:
+                self._record_terminal(state, state.status, "Existing terminal project state")
+                self.store.save(state)
             return state
+        state.terminal_status = ""
+        state.terminal_reason = ""
+        try:
+            return self._run_active(state, max_cycles)
+        except Exception as error:
+            # This boundary is intentionally narrow: normal task-level failures
+            # are contained by _run_task.  Anything that escapes is evidence of
+            # an infrastructure defect, but it must still leave durable evidence
+            # rather than silently terminating the process.
+            try:
+                self.process_manager.stop_all()
+                state.managed_processes = self.process_manager.records()
+            except Exception:
+                pass
+            state.status = "CRASHED"
+            self._record_terminal(state, "CRASHED", f"{type(error).__name__}: {error}")
+            self.store.save(state)
+            raise
+        finally:
+            if state.status in {"COMPLETE", "BLOCKED", "BLOCKED_PROVIDER"}:
+                self._record_terminal(state, state.status, self._terminal_reason(state))
+                self.store.save(state)
+
+    def _run_active(self, state: ProjectState, max_cycles: int) -> ProjectState:
         if state.status == "WAITING_FOR_MODEL_PROVIDER":
             if not self._wait_for_provider(state):
                 return state
@@ -153,12 +188,27 @@ class AutonomousRunner:
                     break
         return state
 
+    @staticmethod
+    def _terminal_reason(state: ProjectState) -> str:
+        if state.status == "COMPLETE":
+            return "Final QA passed"
+        if state.status == "BLOCKED_PROVIDER":
+            return str(state.provider_state.get("fingerprint", "Model provider remained unavailable"))
+        blocked = [task.title for task in state.tasks if task.status is TaskStatus.BLOCKED]
+        return "Completion blocked by unresolved tasks" + (": " + ", ".join(blocked) if blocked else "")
+
+    def _record_terminal(self, state: ProjectState, status: str, reason: str) -> None:
+        if state.terminal_status:
+            return
+        state.terminal_status = status
+        state.terminal_reason = reason
+        self._mark(state, "SYSTEM", status, reason, None)
+
     def _finish_or_continue(self, state: ProjectState) -> None:
         blocked = [task for task in state.tasks if task.status is TaskStatus.BLOCKED]
         if blocked:
             state.status = "BLOCKED"
             state.run_history.append("Completion blocked by unresolved tasks: " + ", ".join(task.title for task in blocked))
-            self._mark(state, "SYSTEM", "BLOCKED", "Completion blocked by unresolved tasks")
             return
         if detect_ui_project(self.workspace) and self.visual_pipeline is not None and self.visual_url:
             final_visual = Task.create("Final visual QA", "Verify desktop and narrow UI before completion")
@@ -242,7 +292,7 @@ class AutonomousRunner:
             state.status = "BLOCKED"
             message = "Resume invariant violation: " + "; ".join(problems)
             state.run_history.append(message)
-            state.record_event("SYSTEM", "BLOCKED", message)
+            self._record_terminal(state, "BLOCKED", message)
             self.store.save(state)
             return state
         self._recover_managed_processes(state)
@@ -344,17 +394,34 @@ class AutonomousRunner:
     def _select_next_task(self, state: ProjectState) -> Task | None:
         return self.controller.next_ready(state)
 
-    def _request_coder_actions(self, state: ProjectState, task: Task, message: str) -> list[object]:
+    def _request_coder_actions(
+        self,
+        state: ProjectState,
+        task: Task,
+        message: str,
+        relevant_files: list[str] | None = None,
+    ) -> list[object]:
         """Make one semantic Coder call with an explicit terminal outcome."""
         self._mark(state, "CODER", "LLM_CALL", message, task)
         try:
-            actions = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
+            actions = self.agents.code(state, task, relevant_files if relevant_files is not None else self._coder_file_context(task)).data.get("actions")
         except ProviderUnavailableError:
             self._mark(state, "CODER", "CODER_PROVIDER_FAILURE", "Coder request interrupted by provider", task)
             raise
         except ProviderError as error:
+            invalid_count = self.agents.last_structured_invalid_count if self.agents.last_structured_role == "CODER" else 0
+            for _ in range(invalid_count):
+                self._mark(state, "CODER", "CODER_STRUCTURED_OUTPUT_INVALID", str(error), task)
+            if invalid_count:
+                self._mark(state, "CODER", "CODER_STRUCTURED_OUTPUT_BLOCKED", "Structured-output repair budget exhausted", task)
             self._mark(state, "CODER", "CODER_MALFORMED_RESPONSE", str(error), task)
             raise
+        invalid_count = self.agents.last_structured_invalid_count if self.agents.last_structured_role == "CODER" else 0
+        for _ in range(invalid_count):
+            self._mark(state, "CODER", "CODER_STRUCTURED_OUTPUT_INVALID", "Coder response failed schema validation", task)
+            self._mark(state, "CODER", "CODER_STRUCTURED_OUTPUT_REPAIR", "Requesting structured-output repair", task)
+        if self.agents.last_structured_repaired:
+            self._mark(state, "CODER", "CODER_STRUCTURED_OUTPUT_REPAIR_SUCCESS", "Coder structured output repaired", task)
         if not isinstance(actions, list):
             self._mark(state, "CODER", "CODER_MALFORMED_RESPONSE", "Coder response needs an actions array", task)
             raise ProviderError("Coder response needs an actions array")
@@ -370,7 +437,6 @@ class AutonomousRunner:
         actions = initial
         tool_recoveries = 0
         policy_recoveries = 0
-        policy_recovery_pending = False
         position = 0
         while position < len(actions):
             action = actions[position]
@@ -379,9 +445,6 @@ class AutonomousRunner:
                     self._pivot_to_static_frontend(state, task)
                     return None
                 self._execute_action(state, task, action)
-                if policy_recovery_pending:
-                    policy_recovery_pending = False
-                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS", "Targeted recovery action executed", task)
             except CommandExecutionError as error:
                 if error.result.exit_code == 125:
                     self._reroute_server_command(state, task, error.command)
@@ -415,28 +478,66 @@ class AutonomousRunner:
             except ToolPolicyError as error:
                 if "DESTRUCTIVE_WRITE_REQUIRES_TARGETED_EDIT_OR_CURRENT_FULL_FILE" not in str(error):
                     raise
-                if policy_recoveries >= 2:
-                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Targeted recovery budget exhausted", task)
-                    raise
                 path = action.get("path") if isinstance(action, dict) else None
-                if not isinstance(path, str):
-                    raise
-                _hash, current = self.tools.file_snapshot(path)
-                task.errors.append(
-                    f"Whole-file replacement rejected for {path}. Use edit_file against current content; preserve unrelated functionality:\n{current[-4000:]}"
-                )
-                policy_recoveries += 1
-                policy_recovery_pending = True
+                desired = action.get("content") if isinstance(action, dict) else None
+                if not isinstance(path, str) or not isinstance(desired, str):
+                    raise DestructiveWriteRecoveryError("DESTRUCTIVE_WRITE_RECOVERY_FAILED: rejected write lacks path/content") from error
+                expected_hash, current = self.tools.file_snapshot(path)
                 self._mark(state, "CODER", "DESTRUCTIVE_WRITE_REJECTED", f"Whole-file write rejected for {path}", task)
+                # The policy rejection contains a precise old/new pair.  Apply a
+                # compare-and-swap textual patch before involving the model: this
+                # preserves the guard while avoiding an avoidable 30B retry.
+                if self.tools.apply_deterministic_patch(path, expected_hash, current, desired):
+                    if state.tool_executions:
+                        state.tool_executions[-1].finish(ToolExecutionStatus.SUCCEEDED, "recovered by deterministic safe patch")
+                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS", f"Deterministic safe patch applied: {path}", task)
+                    position += 1
+                    continue
+                if policy_recoveries >= 1:
+                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Targeted recovery budget exhausted", task)
+                    raise DestructiveWriteRecoveryError("DESTRUCTIVE_WRITE_RECOVERY_FAILED") from error
+                policy_recoveries += 1
                 self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing current file for targeted edit: {path}", task)
-                actions = self._request_coder_actions(state, task, "Coder targeted-edit recovery request")
-                position = 0
+                recovery_context = [
+                    "SAFE EDIT RECOVERY. Whole-file replacement is not allowed for this existing file. "
+                    "Use edit_file against the exact current content below. Preserve unrelated functionality.\n"
+                    f"Target path: {path}\n\nCURRENT FULL CONTENT:\n{current}\n\nDESIRED FULL CONTENT:\n{desired}"
+                ]
+                recovery_actions = self._request_coder_actions(
+                    state,
+                    task,
+                    "Coder targeted-edit recovery request",
+                    recovery_context,
+                )
+                if not recovery_actions:
+                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Recovery response contained no executable targeted action", task)
+                    raise DestructiveWriteRecoveryError("DESTRUCTIVE_WRITE_RECOVERY_FAILED") from error
+                try:
+                    self._execute_targeted_edit_recovery(state, task, path, recovery_actions)
+                except (ToolPolicyError, ValueError, KeyError, TypeError) as recovery_error:
+                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", f"Targeted recovery failed: {recovery_error}", task)
+                    raise DestructiveWriteRecoveryError("DESTRUCTIVE_WRITE_RECOVERY_FAILED") from recovery_error
+                self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS", f"Targeted recovery action executed: {path}", task)
+                # Continue the original response after the rejected action.
+                position += 1
                 continue
             position += 1
-        if policy_recovery_pending:
-            self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Recovery response contained no executable targeted action", task)
-            raise ToolPolicyError("DESTRUCTIVE_WRITE_RECOVERY_FAILED")
         return actions
+
+    def _execute_targeted_edit_recovery(
+        self,
+        state: ProjectState,
+        task: Task,
+        target_path: str,
+        actions: list[object],
+    ) -> None:
+        """Execute only bounded, target-focused edits returned by the fallback."""
+        if len(actions) > 2:
+            raise ValueError("targeted recovery may contain at most two actions")
+        for action in actions:
+            if not isinstance(action, dict) or action.get("kind") != "edit_file" or action.get("path") != target_path:
+                raise ValueError("targeted recovery must use edit_file on the rejected path")
+            self._execute_action(state, task, action)
 
     def _run_task(self, state: ProjectState, task: Task) -> None:
         self._active_state = state
@@ -471,6 +572,9 @@ class AutonomousRunner:
             return
         except ProviderError as error:
             self._retry_or_block(task, state, f"Coder response invalid: {error}", "malformed_model_action")
+            return
+        except DestructiveWriteRecoveryError as error:
+            self._retry_or_block(task, state, f"Coder error: {error}", "tool_policy_recovery_failure")
             return
         except (ToolPolicyError, ValueError, KeyError, TypeError) as error:
             self._retry_or_block(task, state, f"Coder error: {error}", "policy_failure")
