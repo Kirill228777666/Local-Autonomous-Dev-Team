@@ -30,6 +30,18 @@ def metrics(state: ProjectState) -> dict[str, object]:
     provider_outcomes = {name: count("PROVIDER_REQUEST", name) for name in provider_outcome_names if count("PROVIDER_REQUEST", name)}
     provider_attempts = count("PROVIDER_REQUEST", "ATTEMPT")
     terminal_provider_outcomes = sum(provider_outcomes.values())
+    latency_totals = state.provider_request_stats.get("latency_ms_total_by_role", {})
+    latency_maxima = state.provider_request_stats.get("max_latency_ms_by_role", {})
+    terminal_by_role = state.provider_request_stats.get("terminal_requests_by_role", {})
+    average_latency = {
+        role: round(float(total) / max(1, int(terminal_by_role.get(role, 0))) / 1000.0, 3)
+        for role, total in latency_totals.items()
+        if isinstance(latency_totals, dict) and isinstance(terminal_by_role, dict) and int(terminal_by_role.get(role, 0)) > 0
+    }
+    maximum_latency = {
+        role: round(float(value) / 1000.0, 3)
+        for role, value in latency_maxima.items()
+    } if isinstance(latency_maxima, dict) else {}
     legacy_requests = count("LLM", "REQUEST") or sum(calls_by_role.values())
     legacy_responses = count("LLM", "RESPONSE") or sum(calls_by_role.values())
     rollback_reasons: dict[str, int] = {}
@@ -46,6 +58,8 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "llm_calls_by_role": calls_by_role,
         "provider_request_outcomes": provider_outcomes,
         "provider_request_outcome_gap": max(0, provider_attempts - terminal_provider_outcomes),
+        "average_llm_latency_seconds_by_role": average_latency,
+        "max_llm_latency_seconds_by_role": maximum_latency,
         "total_tool_calls": len(tool_events),
         "tasks_created": len(state.tasks),
         "tasks_completed": sum(task.status.value == "DONE" for task in state.tasks),
@@ -69,8 +83,14 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "missing_executables": count("ENVIRONMENT", "MISSING_EXECUTABLE"),
         "environment_repairs": count("ENVIRONMENT", "REPAIRED"),
         "environment_repair_attempts": count("ENVIRONMENT", "REPAIR_ATTEMPT"),
-        "environment_repair_successes": count("ENVIRONMENT", "REPAIRED"),
+        "environment_repair_successes": count("ENVIRONMENT", "REPAIR_SUCCEEDED"),
         "environment_repair_failures": count("ENVIRONMENT", "REPAIR_FAILED"),
+        "environment_repair_open": max(
+            0,
+            count("ENVIRONMENT", "REPAIR_ATTEMPT")
+            - count("ENVIRONMENT", "REPAIR_SUCCEEDED")
+            - count("ENVIRONMENT", "REPAIR_FAILED"),
+        ),
         "environment_repair_skipped": count("ENVIRONMENT", "REPAIR_SKIPPED"),
         "repeated_environment_failure_fingerprints": sum("already failed without environment change" in entry.lower() for entry in history),
         "task_superseded_count": sum(task.status.value == "SUPERSEDED" for task in state.tasks),
@@ -99,7 +119,7 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "coder_repeated_noop_failures": sum("repeated identical coder action" in entry for entry in history),
         "coder_zero_diff_attempts": count("CODER", "ZERO_DIFF"),
         "coder_regressive_attempts": sum("REGRESSION:" in entry for entry in history),
-        "tasks_progressed_after_attempt": sum("Coder completed attempt" in entry for entry in history),
+        "tasks_progressed_after_attempt": count("CONTROLLER", "MEANINGFUL_PROGRESS"),
         "tester_harness_failures": count("TESTER", "HARNESS_FAILURE"),
         "tester_harness_regenerations": count("TESTER", "HARNESS_EXECUTE"),
         "tester_harness_recovery_successes": count("TESTER", "HARNESS_RECOVERED"),

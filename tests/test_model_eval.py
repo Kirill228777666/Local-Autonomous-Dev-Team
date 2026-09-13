@@ -36,3 +36,20 @@ def test_model_eval_scores_noop_and_unnecessary_existing_file_rewrite(tmp_path: 
     assert noop["noop"] is True and noop["successful_task_fix"] is False
     assert rewrite["successful_task_fix"] is True
     assert rewrite["full_file_rewrites"] == 1
+
+
+def test_model_eval_rejects_dependency_constraint_that_still_allows_known_bad_version(tmp_path: Path) -> None:
+    case = EvalCase(
+        "dependency_incompatibility",
+        {"requirements.txt": "SQLAlchemy==2.0.23\n"},
+        "Exclude the incompatible release.",
+        {"requirements.txt": ("SQLAlchemy",)},
+    )
+
+    result = evaluate_reply(
+        tmp_path,
+        case,
+        {"actions": [{"kind": "edit_file", "path": "requirements.txt", "old": "SQLAlchemy==2.0.23", "new": "SQLAlchemy>=2.0.23,<3"}]},
+    )
+
+    assert result["successful_task_fix"] is False

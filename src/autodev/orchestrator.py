@@ -632,6 +632,7 @@ class AutonomousRunner:
         state.current_task_id = None
         state.run_history.append(f"Task approved and checkpointed: {task.title}")
         self._mark(state, "GIT", "CHECKPOINT", f"Task approved and checkpointed: {task.title}", task)
+        self._mark(state, "CONTROLLER", "MEANINGFUL_PROGRESS", f"Acceptance, regression and review passed: {task.title}", task)
         self._stop_task_processes(state, task)
 
     def _reroute_server_command(self, state: ProjectState, task: Task, command: list[str]) -> None:
@@ -1250,7 +1251,9 @@ class AutonomousRunner:
         state.event_counters[key] = state.event_counters.get(key, 0) + 1
         totals = state.provider_request_stats.setdefault("latency_ms_total_by_role", {})
         maxima = state.provider_request_stats.setdefault("max_latency_ms_by_role", {})
-        if isinstance(totals, dict) and isinstance(maxima, dict) and outcome != "ATTEMPT":
+        terminals = state.provider_request_stats.setdefault("terminal_requests_by_role", {})
+        if isinstance(totals, dict) and isinstance(maxima, dict) and isinstance(terminals, dict) and outcome != "ATTEMPT":
             milliseconds = latency * 1000.0
             totals[role] = float(totals.get(role, 0.0)) + milliseconds
             maxima[role] = max(float(maxima.get(role, 0.0)), milliseconds)
+            terminals[role] = int(terminals.get(role, 0)) + 1

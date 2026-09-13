@@ -142,6 +142,49 @@ def test_attempt_rollback_metrics_distinguish_acceptance_from_regression() -> No
     assert data["regression_rollbacks"] == 1
 
 
+def test_progress_metric_requires_confirmed_meaningful_progress_event() -> None:
+    state = ProjectState.create("Build Notes")
+    state.run_history.extend([
+        "Coder completed attempt 1 for API",
+        "Returning task to Coder: API; acceptance failed",
+    ])
+
+    assert metrics(state)["tasks_progressed_after_attempt"] == 0
+
+    state.record_event("CONTROLLER", "MEANINGFUL_PROGRESS", "Task accepted and checkpointed")
+
+    assert metrics(state)["tasks_progressed_after_attempt"] == 1
+
+
+def test_environment_repair_metrics_use_terminal_outcomes_and_report_open_attempts() -> None:
+    state = ProjectState.create("Build Notes")
+    state.event_counters.update({
+        "ENVIRONMENT:REPAIR_ATTEMPT": 3,
+        "ENVIRONMENT:REPAIR_SUCCEEDED": 1,
+        "ENVIRONMENT:REPAIR_FAILED": 1,
+    })
+
+    data = metrics(state)
+
+    assert data["environment_repair_successes"] == 1
+    assert data["environment_repair_failures"] == 1
+    assert data["environment_repair_open"] == 1
+
+
+def test_provider_latency_metrics_are_averaged_by_completed_request_role() -> None:
+    state = ProjectState.create("Build Notes")
+    state.provider_request_stats = {
+        "latency_ms_total_by_role": {"CODER": 4500.0},
+        "max_latency_ms_by_role": {"CODER": 3000.0},
+        "terminal_requests_by_role": {"CODER": 2},
+    }
+
+    data = metrics(state)
+
+    assert data["average_llm_latency_seconds_by_role"] == {"CODER": 2.25}
+    assert data["max_llm_latency_seconds_by_role"] == {"CODER": 3.0}
+
+
 def test_regression_rejection_restores_every_project_file_to_pre_attempt_state(tmp_path: Path) -> None:
     setup_repository(tmp_path)
     (tmp_path / "app.py").write_bytes(b"good app\r\n")

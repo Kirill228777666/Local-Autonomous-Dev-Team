@@ -52,6 +52,12 @@ Before `COMPLETE`, AutoDev runs detected project-wide checks (Python tests and d
 
 `[models]` and `[agents.<role>]` in the config can select a model and generation settings per role. Roles remain sequential, so the machine does not need multiple large models resident in VRAM.
 
+The default remains `qwen3-coder:30b`. A sequential eight-case Coder benchmark using the production structured-action schema compared it with `qwen3.6:27b` at temperature `0.05`, a 16K context, and thinking disabled. Both produced valid tool actions in all cases, but the strict task checks scored `qwen3-coder:30b` at 8/8 versus 7/8 for `qwen3.6:27b`; average latency was 3.57s versus 12.13s. See [the benchmark record](docs/model-eval-2026-09-13.md). Re-run it against disposable fixtures with:
+
+```powershell
+py -3 scripts\model_ab_eval.py --models qwen3-coder:30b qwen3.6:27b --output .model-eval\comparison.json
+```
+
 ## v0.3 recovery and visual QA
 
 Every tool action is persisted as `STARTED` before execution and as `SUCCEEDED` or `FAILED` afterwards. A forced process termination leaves a tool at `UNKNOWN`; `resume` validates the project specification, task graph, active-task invariant, Git repository and checkpoint before returning that task to safe pending work. `STOPPED` projects never resume, and a completed project remains completed.

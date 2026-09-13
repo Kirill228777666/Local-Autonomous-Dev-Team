@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from autodev.agents import ROLE_PROMPTS, RoleAgents
-from autodev.providers import AgentRequest, OllamaProvider, ProviderError
+from autodev.agents import RoleAgents
+from autodev.models import ProjectState, Task
+from autodev.providers import OllamaProvider, ProviderError
 from autodev.tools import WorkspaceTools
 
 
@@ -34,6 +36,34 @@ CASES = (
 )
 
 
+def _version_tuple(value: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", value))
+
+
+def _excludes_incompatible_sqlalchemy(content: str) -> bool:
+    """Return whether the manifest cannot resolve the known-bad 2.0.23 release."""
+    line = next((item.strip() for item in content.splitlines() if item.strip().lower().startswith("sqlalchemy")), "")
+    if not line:
+        return False
+    constraints = line[len("SQLAlchemy"):].replace(" ", "").split(",")
+    bad = _version_tuple("2.0.23")
+    for constraint in constraints:
+        if constraint == "!=2.0.23":
+            return True
+        match = re.fullmatch(r"(==|>=|>)([0-9][0-9.]*)", constraint)
+        if not match:
+            continue
+        operator, version = match.groups()
+        parsed = _version_tuple(version)
+        if operator == "==" and parsed != bad:
+            return True
+        if operator == ">" and parsed >= bad:
+            return True
+        if operator == ">=" and parsed > bad:
+            return True
+    return False
+
+
 def evaluate_reply(workspace: Path, case: EvalCase, data: object) -> dict[str, object]:
     workspace.mkdir(parents=True, exist_ok=True)
     for relative, content in case.files.items():
@@ -48,6 +78,7 @@ def evaluate_reply(workspace: Path, case: EvalCase, data: object) -> dict[str, o
         "tool_actions": 0,
         "full_file_rewrites": 0,
         "successful_task_fix": False,
+        "raw_reply": data,
     }
     if not isinstance(data, dict):
         return result
@@ -89,20 +120,13 @@ def evaluate_reply(workspace: Path, case: EvalCase, data: object) -> dict[str, o
     result["successful_task_fix"] = all(
         (workspace / relative).is_file()
         and all(text in (workspace / relative).read_text(encoding="utf-8", errors="replace") for text in required)
-        and not (case.name == "dependency_incompatibility" and "SQLAlchemy==2.0.23" in (workspace / relative).read_text(encoding="utf-8"))
+        and not (
+            case.name == "dependency_incompatibility"
+            and not _excludes_incompatible_sqlalchemy((workspace / relative).read_text(encoding="utf-8"))
+        )
         for relative, required in case.required.items()
     )
     return result
-
-
-def _prompt(case: EvalCase) -> str:
-    files = "\n\n".join(f"FILE {path}:\n{content}" for path, content in case.files.items())
-    return (
-        "Return JSON only: {\"actions\":[...]}. Allowed actions: write_file(path,content), "
-        "edit_file(path,old,new), append_file(path,content), delete_file(path), run_command(command array). "
-        "Prefer a targeted edit for an existing file and preserve unrelated behavior.\n\n"
-        f"TASK: {case.instruction}\n\n{files}"
-    )
 
 
 def run_benchmark(models: list[str], output: Path, *, think: bool = False, limit: int | None = None) -> dict[str, object]:
@@ -110,13 +134,22 @@ def run_benchmark(models: list[str], output: Path, *, think: bool = False, limit
     report: dict[str, object] = {"settings": {"temperature": 0.05, "context_limit": 16384, "think": think}, "models": {}}
     for model in models:
         provider = OllamaProvider(model=model, temperature=0.05, timeout=600, retries=0, context_limit=16384, think=think)
+        agents = RoleAgents(provider, structured_retries=1)
         case_results: list[dict[str, object]] = []
         for case in selected_cases:
             started = time.monotonic()
             try:
-                reply = provider.complete(AgentRequest("CODER", _prompt(case), ROLE_PROMPTS["CODER"]))
                 with tempfile.TemporaryDirectory(prefix="autodev-model-eval-") as directory:
-                    result = evaluate_reply(Path(directory), case, reply.data)
+                    fixture = Path(directory)
+                    for relative, content in case.files.items():
+                        path = fixture / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(content, encoding="utf-8")
+                    state = ProjectState.create("Build the requested generic software capability.")
+                    task = Task.create(case.name, case.instruction)
+                    relevant = [f"{path} (current full content):\n{content}" for path, content in case.files.items()]
+                    reply = agents.code(state, task, relevant)
+                    result = evaluate_reply(fixture, case, reply.data)
             except ProviderError as error:
                 result = evaluate_reply(Path(tempfile.mkdtemp(prefix="autodev-model-eval-failed-")), case, None)
                 result["error"] = str(error)
