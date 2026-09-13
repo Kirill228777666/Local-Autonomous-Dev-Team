@@ -51,8 +51,11 @@ def classify_failure(result: CommandResult, command: list[str], workspace: Path 
         return Failure(FailureKind.ENVIRONMENT_NOT_INITIALIZED, command, text)
     if "syntaxerror" in lowered and "-c" in command:
         return Failure(FailureKind.TEST_HARNESS_FAILURE, command, text)
-    if "unittest.loader._failedtest" in lowered or ("has no attribute" in lowered and "unittest" in lowered):
-        return Failure(FailureKind.TEST_HARNESS_FAILURE, command, text)
+    # _FailedTest is a runner wrapper around an import/application error, not
+    # malformed unittest syntax.  The underlying traceback belongs to Coder or
+    # dependency compatibility routing below.
+    if "unittest.loader._failedtest" in lowered and "syntaxerror" not in lowered:
+        return Failure(FailureKind.APPLICATION, command, text)
     if ("connection refused" in lowered or "failed to connect" in lowered) and any("localhost" in item or "127.0.0.1" in item for item in command):
         return Failure(FailureKind.SERVICE_NOT_RUNNING, command, text)
     if any(token in lowered for token in ("resolutionimpossible", "conflicting dependencies", "cannot import name 'url_quote'", "typingonly")):

@@ -18,12 +18,13 @@ class ContextBuilder:
         events = "\n".join(f"- {entry}" for entry in recent_log) or "- No prior events"
         sections = [
             "Environment capabilities:\n" + (str(state.environment) if state.environment else "- Not discovered"),
-            "Architecture contract (do not change it without an explicit Architect/Manager pivot):\n" + (str(state.architecture) if state.architecture else "- Not selected"),
-            f"Current task ({task.id}): {task.title}\n{task.description}",
+            "Project contract (authoritative; do not change without an explicit migration):\n" + (str(state.project_contract or state.architecture) if (state.project_contract or state.architecture) else "- Not selected"),
+            f"Current capability ({task.capability_id or 'unassigned'}): {task.title}\nIntent: {task.intent or task.description}\nAcceptance: {task.acceptance_criteria or ['contract-derived']}",
             f"Relevant files:\n{files}",
             "Recent errors:\n" + ("\n".join(f"- {error}" for error in task.errors[-4:]) or "- None"),
             "Architectural decisions:\n" + ("\n".join(f"- {decision}" for decision in state.decisions[-8:]) or "- None"),
             "Amendments:\n" + ("\n".join(f"- {amendment}" for amendment in state.amendments[-8:]) or "- None"),
+            "Protected capabilities (must remain working):\n" + (str({key: value for key, value in state.capability_graph.items() if value.get("status") == "DONE"}) if state.capability_graph else "- None"),
             f"Recent execution evidence:\n{events}",
         ]
         reserved = sum(len(section) + 2 for section in sections)

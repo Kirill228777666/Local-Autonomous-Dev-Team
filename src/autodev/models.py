@@ -148,11 +148,15 @@ class Task:
     strategy_history: list[str] = field(default_factory=list)
     rollback_count: int = 0
     rollback_reasons: dict[str, int] = field(default_factory=dict)
+    capability_id: str = ""
+    intent: str = ""
+    acceptance_criteria: list[str] = field(default_factory=list)
+    contract_version: int = 1
 
     @classmethod
-    def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None, root_task_id: str | None = None, parent_task_id: str | None = None, failure_fingerprint: str = "", strategy_generation: int = 0) -> Task:
+    def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None, root_task_id: str | None = None, parent_task_id: str | None = None, failure_fingerprint: str = "", strategy_generation: int = 0, capability_id: str = "", intent: str = "", acceptance_criteria: list[str] | None = None, contract_version: int = 1) -> Task:
         task_id = str(uuid4())
-        return cls(id=task_id, title=title, description=description, dependencies=dependencies or [], repair_of=repair_of, root_task_id=root_task_id or task_id, parent_task_id=parent_task_id, failure_fingerprint=failure_fingerprint, strategy_generation=strategy_generation)
+        return cls(id=task_id, title=title, description=description, dependencies=dependencies or [], repair_of=repair_of, root_task_id=root_task_id or task_id, parent_task_id=parent_task_id, failure_fingerprint=failure_fingerprint, strategy_generation=strategy_generation, capability_id=capability_id, intent=intent, acceptance_criteria=acceptance_criteria or [], contract_version=contract_version)
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> Task:
@@ -178,6 +182,10 @@ class Task:
             strategy_history=[str(item) for item in value.get("strategy_history", [])],  # type: ignore[arg-type]
             rollback_count=int(value.get("rollback_count", 0)),
             rollback_reasons={str(key): int(count) for key, count in dict(value.get("rollback_reasons", {})).items()},  # type: ignore[arg-type]
+            capability_id=str(value.get("capability_id", "")),
+            intent=str(value.get("intent", "")),
+            acceptance_criteria=[str(item) for item in value.get("acceptance_criteria", [])],  # type: ignore[arg-type]
+            contract_version=int(value.get("contract_version", 1)),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -210,6 +218,8 @@ class ProjectState:
     visual_repair_cycles: int = 0
     environment: dict[str, object] = field(default_factory=dict)
     architecture: dict[str, object] = field(default_factory=dict)
+    project_contract: dict[str, object] = field(default_factory=dict)
+    capability_graph: dict[str, dict[str, object]] = field(default_factory=dict)
     event_counters: dict[str, int] = field(default_factory=dict)
     provider_state: dict[str, object] = field(default_factory=dict)
     managed_processes: list[dict[str, object]] = field(default_factory=list)
@@ -253,6 +263,8 @@ class ProjectState:
             visual_repair_cycles=int(value.get("visual_repair_cycles", 0)),
             environment=dict(value.get("environment", {})),  # type: ignore[arg-type]
             architecture=dict(value.get("architecture", {})),  # type: ignore[arg-type]
+            project_contract=dict(value.get("project_contract", {})),  # type: ignore[arg-type]
+            capability_graph={str(key): dict(item) for key, item in dict(value.get("capability_graph", {})).items() if isinstance(item, dict)},  # type: ignore[arg-type]
             event_counters={str(key): int(count) for key, count in dict(value.get("event_counters", {})).items()},  # type: ignore[arg-type]
             provider_state=dict(value.get("provider_state", {})),  # type: ignore[arg-type]
             managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
@@ -286,6 +298,8 @@ class ProjectState:
             "visual_repair_cycles": self.visual_repair_cycles,
             "environment": self.environment,
             "architecture": self.architecture,
+            "project_contract": self.project_contract,
+            "capability_graph": self.capability_graph,
             "event_counters": self.event_counters,
             "provider_state": self.provider_state,
             "managed_processes": self.managed_processes[-100:],

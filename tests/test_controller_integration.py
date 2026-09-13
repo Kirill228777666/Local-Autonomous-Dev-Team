@@ -157,7 +157,7 @@ def test_import_failure_inside_discovered_test_does_not_trigger_harness_regenera
     task = state.tasks[0]
     assert task.status is TaskStatus.PENDING
     assert task.failures_in_strategy == 1
-    assert any(event.phase == "VALIDATION_IMPORT_OR_ENVIRONMENT_ERROR" for event in state.events)
+    assert any(event.phase == "VALIDATION_APPLICATION_IMPORT_ERROR" for event in state.events)
     assert not any(event.phase == "HARNESS_FAILURE" for event in state.events)
     assert provider.calls["TESTER"] == 0
     assert provider.calls["MANAGER"] == 0

@@ -29,7 +29,10 @@ class RoleAgents:
     def plan(self, state: ProjectState) -> AgentReply:
         return self._ask(
             "MANAGER",
-            f"Create the minimal major task list for this project. Return {{\"tasks\":[{{\"title\":str,\"description\":str}}]}}.\n\n{state.original_spec}",
+            "Create the minimal major task list for this project. Return "
+            "{\"tasks\":[{\"title\":str,\"description\":str,\"capability_id\":str,\"intent\":str,\"acceptance_criteria\":[str]}]}. "
+            "capability_id is stable lowercase dotted identity; never duplicate an existing capability. "
+            f"Authoritative project contract: {state.project_contract or state.architecture}\n\n{state.original_spec}",
             self._valid_plan,
         )
 

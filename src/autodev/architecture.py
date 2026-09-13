@@ -8,7 +8,7 @@ from pathlib import Path
 def default_contract(specification: str, environment: dict[str, object]) -> dict[str, str]:
     text = specification.lower()
     npm = bool(((environment.get("npm") or {}) if isinstance(environment.get("npm"), dict) else {}).get("available"))
-    if "notes" in text or "sqlite" in text:
+    if any(token in text for token in ("python", "flask", "sqlite", "backend", "бэкенд")):
         return {
             "backend_framework": "Flask",
             "orm": "Flask-SQLAlchemy",

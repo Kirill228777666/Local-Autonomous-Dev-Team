@@ -101,7 +101,15 @@ def test_test_module_import_error_is_not_a_harness_error(tmp_path: Path) -> None
 
     outcome = classify_validation_result(result, ["python", "-m", "unittest", "discover", "-s", "tests"], tmp_path)
 
-    assert outcome.kind is ValidationOutcome.IMPORT_OR_ENVIRONMENT_ERROR
+    assert outcome.kind is ValidationOutcome.APPLICATION_IMPORT_ERROR
+
+
+def test_framework_api_mismatch_is_application_owned_not_environment_repair(tmp_path: Path) -> None:
+    result = CommandResult(1, "", "AttributeError: 'Flask' object has no attribute 'before_first_request'")
+
+    outcome = classify_validation_result(result, ["python", "-m", "unittest", "discover", "-s", "tests"], tmp_path)
+
+    assert outcome.kind is ValidationOutcome.DEPENDENCY_API_MISMATCH
 
 
 def test_malformed_python_validator_is_command_invalid(tmp_path: Path) -> None:

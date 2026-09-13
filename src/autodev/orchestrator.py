@@ -14,6 +14,7 @@ from typing import Callable
 
 from .agents import RoleAgents
 from .architecture import default_contract, validate_architecture
+from .capabilities import build_project_contract, contract_conflicting_review_reasons, contract_conflicting_test_action, normalize_plan
 from .controller import FailureDecision, TaskController, TaskPhase
 from .designer import DesignerAgent, detect_ui_project
 from .environment import EnvironmentManager, FailureKind, classify_failure, validate_readme
@@ -147,8 +148,7 @@ class AutonomousRunner:
             state.environment = self.environment_manager.discover()
             state.run_history.append("Environment capabilities discovered")
             self._mark(state, "ENVIRONMENT", "CHECK", "Environment capabilities discovered")
-        if not state.architecture:
-            state.architecture = default_contract(state.original_spec, state.environment)
+        self._ensure_project_contract(state)
         if self._is_python_project(state) and not self._ensure_project_python(state):
             state.status = "BLOCKED"
             self._mark(state, "ENVIRONMENT", "NOT_INITIALIZED", self.environment_manager.last_diagnostic, None)
@@ -163,7 +163,9 @@ class AutonomousRunner:
                 # No plan was accepted while the provider was down, so retry the
                 # single planning request only after its global circuit closes.
                 self._plan(state)
-        self._decompose_broad_tasks(state)
+        # `_plan` normalizes new work before it is persisted.  Do not mutate an
+        # already persisted plan merely because a provider outage/resume enters
+        # this method; this preserves the task attempt exactly.
         if state.status in {"BLOCKED", "WAITING_FOR_MODEL_PROVIDER", "BLOCKED_PROVIDER"}:
             return state
         for _ in range(max_cycles):
@@ -375,11 +377,18 @@ class AutonomousRunner:
                 description = raw_task.get("description")
                 if not isinstance(title, str) or not isinstance(description, str):
                     raise ProviderError("Manager task needs title and description")
-                state.tasks.append(Task.create(title, description))
-            if not state.architecture:
-                state.architecture = default_contract(state.original_spec, state.environment)
-                if state.architecture:
-                    state.decisions.append("Architecture contract selected: " + str(state.architecture))
+                capability_id = raw_task.get("capability_id")
+                intent = raw_task.get("intent")
+                acceptance = raw_task.get("acceptance_criteria")
+                state.tasks.append(Task.create(
+                    title, description,
+                    capability_id=capability_id if isinstance(capability_id, str) else "",
+                    intent=intent if isinstance(intent, str) else description,
+                    acceptance_criteria=[item for item in acceptance if isinstance(item, str)] if isinstance(acceptance, list) else [],
+                    contract_version=int(state.project_contract.get("version", 1)),
+                ))
+            self._ensure_project_contract(state)
+            normalize_plan(state)
             state.decisions.append(f"Manager planned {len(state.tasks)} tasks")
             state.run_history.append("Manager created initial plan")
             self.store.save(state)
@@ -390,6 +399,28 @@ class AutonomousRunner:
             state.run_history.append(f"Planning blocked by invalid Manager output: {error}")
             self._mark(state, "MANAGER", "INVALID_OUTPUT", "Manager plan was invalid")
             self.store.save(state)
+
+    def _ensure_project_contract(self, state: ProjectState) -> None:
+        """Select architecture once and make it durable before implementation."""
+        if not state.project_contract:
+            contract = build_project_contract(state.original_spec, state.environment)
+            # Preserve old persisted architecture fields for dashboard/state
+            # compatibility while contract becomes the source of truth.
+            if state.architecture:
+                contract_architecture = contract.setdefault("architecture", {})
+                if isinstance(contract_architecture, dict):
+                    contract_architecture.update(state.architecture)
+            state.project_contract = contract
+            state.decisions.append("Project contract frozen: " + json.dumps(contract.get("architecture", {}), ensure_ascii=False, sort_keys=True))
+            self._mark(state, "ARCHITECTURE", "CONTRACT_FROZEN", "Reliable project contract selected", None)
+        architecture = state.project_contract.get("architecture", {})
+        if isinstance(architecture, dict):
+            state.architecture = dict(architecture)
+            # Legacy validators use `frontend`; retain a one-way projection.
+            if "frontend_strategy" in architecture:
+                state.architecture["frontend"] = architecture["frontend_strategy"]
+        elif not state.architecture:
+            state.architecture = default_contract(state.original_spec, state.environment)
 
     def _select_next_task(self, state: ProjectState) -> Task | None:
         return self.controller.next_ready(state)
@@ -441,6 +472,10 @@ class AutonomousRunner:
         while position < len(actions):
             action = actions[position]
             try:
+                contract_conflict = contract_conflicting_test_action(state.project_contract, action)
+                if contract_conflict:
+                    self._mark(state, "TESTER", "TEST_CONTRACT_CONFLICT", contract_conflict, task)
+                    raise ToolPolicyError(contract_conflict)
                 if isinstance(action, dict) and action.get("kind") == "run_command" and self._known_missing_npm(state, action.get("command")):
                     self._pivot_to_static_frontend(state, task)
                     return None
@@ -741,8 +776,22 @@ class AutonomousRunner:
             self._mark(state, "REVIEWER", "LLM_RESPONSE", "Reviewer decision response received", task)
             if review.get("approved") is not True:
                 reasons = review.get("reasons", ["Reviewer rejected implementation"])
-                self._retry_or_block(task, state, f"Review rejected: {reasons}")
-                return
+                contract_conflicts = contract_conflicting_review_reasons(state.project_contract, reasons)
+                if contract_conflicts:
+                    self._mark(
+                        state, "REVIEWER", "CONTRACT_CONFLICT",
+                        "Ignored reviewer requirement inconsistent with frozen contract: " + "; ".join(contract_conflicts), task,
+                    )
+                    remaining = [reason for reason in reasons if reason not in contract_conflicts] if isinstance(reasons, list) else []
+                    if not remaining:
+                        review = {"approved": True}
+                    else:
+                        reasons = remaining
+                if review.get("approved") is True:
+                    pass
+                else:
+                    self._retry_or_block(task, state, f"Review rejected: {reasons}")
+                    return
         except ProviderUnavailableError as error:
             self._preserve_task_for_provider_wait(task, state)
             self._mark_provider_wait(state, task, str(error))
@@ -1128,16 +1177,36 @@ class AutonomousRunner:
     def _record_accepted_regression(self, state: ProjectState, task: Task, command: list[str]) -> None:
         if not command or command == ["README validator"]:
             return
-        key = json.dumps(command)
-        if any(item.get("key") == key for item in state.accepted_regressions):
+        capability_id = task.capability_id or task.id
+        if any(item.get("capability_id") == capability_id for item in state.accepted_regressions):
             return
-        state.accepted_regressions.append({"key": key, "command": command, "task": task.title})
+        state.accepted_regressions.append({
+            "key": capability_id,
+            "capability_id": capability_id,
+            "command": command,
+            "task": task.title,
+            "contract_version": task.contract_version,
+            "checkpoint": state.last_checkpoint or "",
+        })
+        entry = state.capability_graph.get(capability_id)
+        if entry is not None:
+            entry["status"] = TaskStatus.DONE.value
+            entry["validator"] = command
+            entry["last_known_good_checkpoint"] = state.last_checkpoint or ""
 
     def _run_accepted_regressions(self, state: ProjectState, task: Task, current_command: list[str]) -> bool:
+        # A shared full-suite command still protects every later checkpoint.
+        # Run it once per gate, even when it equals this task's acceptance
+        # command; prior code skipped that path and emitted zero Run-12 checks.
+        executed: set[str] = set()
         for check in state.accepted_regressions[-8:]:
             command = check.get("command")
-            if not isinstance(command, list) or command == current_command or not all(isinstance(part, str) for part in command):
+            if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
                 continue
+            key = json.dumps(command)
+            if key in executed:
+                continue
+            executed.add(key)
             self._mark(state, "REGRESSION", "CHECK", f"Regression guard: {check.get('task', 'accepted capability')}", task)
             result = self.tools.run_tests(command)
             if result.exit_code == 0:

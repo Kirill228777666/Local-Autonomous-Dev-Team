@@ -18,6 +18,9 @@ class ValidationOutcome(StrEnum):
     COMMAND_INVALID = "VALIDATION_COMMAND_INVALID"
     TOOL_MISSING = "VALIDATION_TOOL_MISSING"
     IMPORT_OR_ENVIRONMENT_ERROR = "VALIDATION_IMPORT_OR_ENVIRONMENT_ERROR"
+    APPLICATION_IMPORT_ERROR = "VALIDATION_APPLICATION_IMPORT_ERROR"
+    DEPENDENCY_API_MISMATCH = "VALIDATION_DEPENDENCY_API_MISMATCH"
+    TEST_IMPLEMENTATION_BUG = "VALIDATION_TEST_IMPLEMENTATION_BUG"
     TIMEOUT = "VALIDATION_TIMEOUT"
 
 
@@ -108,7 +111,15 @@ def classify_validation_result(result: CommandResult, command: list[str], worksp
         return ValidationResult(ValidationOutcome.COMMAND_INVALID, detail)
     if "no module named pytest" in lowered or "no module named unittest" in lowered:
         return ValidationResult(ValidationOutcome.TOOL_MISSING, detail)
-    if "importerror" in lowered or "modulenotfounderror" in lowered or "unittest.loader._failedtest" in lowered:
+    if any(token in lowered for token in ("before_first_request", "detachedinstanceerror", "has no attribute")):
+        return ValidationResult(ValidationOutcome.DEPENDENCY_API_MISMATCH, detail)
+    if "cannot import name" in lowered:
+        return ValidationResult(ValidationOutcome.APPLICATION_IMPORT_ERROR, detail)
+    if "unittest.loader._failedtest" in lowered and ("tests" in lowered or "test_" in lowered):
+        return ValidationResult(ValidationOutcome.TEST_IMPLEMENTATION_BUG, detail)
+    if "importerror" in lowered or "modulenotfounderror" in lowered:
+        return ValidationResult(ValidationOutcome.APPLICATION_IMPORT_ERROR, detail)
+    if "unittest.loader._failedtest" in lowered:
         return ValidationResult(ValidationOutcome.IMPORT_OR_ENVIRONMENT_ERROR, detail)
     return ValidationResult(ValidationOutcome.APPLICATION_FAILURE, detail)
 
