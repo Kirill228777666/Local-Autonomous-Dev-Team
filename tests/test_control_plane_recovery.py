@@ -146,6 +146,41 @@ def test_failed_local_destructive_recovery_rolls_back_and_runs_independent_task(
     assert data["attempt_rollbacks_by_reason"]["tool_policy_recovery_failure"] == 1
 
 
+def test_noop_evidence_recovery_failure_is_task_local_not_process_fatal(tmp_path: Path) -> None:
+    old = "# accepted capability\n" * 80
+    (tmp_path / "app.py").write_text(old, encoding="utf-8")
+    provider = RecordingProvider({
+        "CODER": [
+            AgentReply({"actions": []}),
+            AgentReply({"actions": [{"kind": "write_file", "path": "app.py", "content": "short\n"}]}),
+            AgentReply({"actions": []}),
+            AgentReply({"actions": [{"kind": "write_file", "path": "result.txt", "content": "ok"}]}),
+        ],
+        "TESTER": [
+            AgentReply({"command": [sys.executable, "-c", "raise SystemExit(1)"]}),
+            AgentReply({"command": [sys.executable, "-c", "assert open('result.txt').read() == 'ok'"]}),
+        ],
+        "REVIEWER": [AgentReply({"approved": True, "reasons": []})],
+    })
+    repository(tmp_path)
+    first = Task.create("Unsafe update", "Update source")
+    second = Task.create("Independent result", "Create result")
+    state = ProjectState.create("Build a generic local application")
+    state.tasks = [first, second]
+    StateStore(tmp_path).save(state)
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), PatchUnavailableTools(tmp_path), provider)
+    runner.controller = TaskController(local_failures_per_strategy=1, max_strategy_changes=0)
+
+    state = runner.run(max_cycles=2)
+
+    assert state.tasks[0].status is TaskStatus.BLOCKED
+    assert state.tasks[1].status is TaskStatus.DONE
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == old
+    assert any(event.phase == "NOOP_EVIDENCE_REPROMPT" for event in state.events)
+    assert any(event.phase == "DESTRUCTIVE_WRITE_RECOVERY_FAILED" for event in state.events)
+    assert not any(event.agent == "SYSTEM" and event.phase == "CRASHED" for event in state.events)
+
+
 def test_unexpected_runner_exception_persists_crashed_terminal_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runner = make_runner(tmp_path, RecordingProvider({}), [Task.create("Ready", "work")])
     monkeypatch.setattr(runner, "_select_next_task", lambda state: (_ for _ in ()).throw(RuntimeError("boom")))

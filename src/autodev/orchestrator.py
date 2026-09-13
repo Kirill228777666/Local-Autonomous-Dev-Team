@@ -677,18 +677,32 @@ class AutonomousRunner:
                     )
                     task.phase = TaskPhase.LOCAL_RECOVERY.value
                     self._mark(state, "CODER", "NOOP_EVIDENCE_REPROMPT", "Retrying no-op locally with exact acceptance evidence", task)
-                    recovered = self._request_coder_actions(state, task, "Coder no-op evidence recovery request")
-                    if recovered:
-                        task.phase = TaskPhase.CODING.value
-                        executed = self._execute_coder_actions(state, task, recovered)
-                        if executed is None:
-                            return
-                        actions = executed
-                        task.phase = TaskPhase.VALIDATING.value
-                        result = self.tools.run_tests(command)
-                        state.run_history.append(self._result_log(task, result))
-                    else:
-                        self._mark(state, "CODER", "REPEATED_NOOP", "Evidence recovery also returned no actions", task)
+                    try:
+                        recovered = self._request_coder_actions(state, task, "Coder no-op evidence recovery request")
+                        if recovered:
+                            task.phase = TaskPhase.CODING.value
+                            executed = self._execute_coder_actions(state, task, recovered)
+                            if executed is None:
+                                return
+                            actions = executed
+                            task.phase = TaskPhase.VALIDATING.value
+                            result = self.tools.run_tests(command)
+                            state.run_history.append(self._result_log(task, result))
+                        else:
+                            self._mark(state, "CODER", "REPEATED_NOOP", "Evidence recovery also returned no actions", task)
+                    except ProviderUnavailableError as error:
+                        self._preserve_task_for_provider_wait(task, state)
+                        self._mark_provider_wait(state, task, str(error))
+                        return
+                    except ProviderError as error:
+                        self._retry_or_block(task, state, f"Coder recovery response invalid: {error}", "malformed_model_action")
+                        return
+                    except DestructiveWriteRecoveryError as error:
+                        self._retry_or_block(task, state, f"Coder error: {error}", "tool_policy_recovery_failure")
+                        return
+                    except (ToolPolicyError, ValueError, KeyError, TypeError) as error:
+                        self._retry_or_block(task, state, f"Coder recovery error: {error}", "policy_failure")
+                        return
                 failure = classify_failure(result, command, self.workspace)
                 if failure.kind is FailureKind.MISSING_EXECUTABLE and command[0].lower() in {"npm", "node"}:
                     self._pivot_to_static_frontend(state, task)
