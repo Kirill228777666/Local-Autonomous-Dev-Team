@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -272,13 +273,21 @@ class ApplicationScreenshotPipeline(ScreenshotPipeline):
         self.command = command
         self.health_url = health_url
         self.ready_timeout = ready_timeout
+        self.manager: ManagedProcessManager | None = None
+
+    def bind_manager(self, manager: ManagedProcessManager) -> None:
+        """Use the runner-owned lifecycle instead of launching a rival tree."""
+        self.manager = manager
 
     def capture(self, url: str) -> list[Path]:
-        port = free_port()
+        # Generated applications frequently expose no configurable PORT option
+        # (Flask's standard `app.run()` defaults to 5000).  A random port is
+        # correct only when the configured command can actually consume it.
+        port = self.expected_port() or free_port()
         resolved_url = url.replace("{port}", str(port))
         resolved_health = self.health_url.replace("{port}", str(port)) if self.health_url else ""
         command = self.resolve_command(port)
-        manager = ManagedProcessManager(self.workspace)
+        manager = self.manager or ManagedProcessManager(self.workspace)
         record = manager.start(command, purpose="screenshot", expected_port=port, timeout=self.ready_timeout)
         try:
             if not manager.wait_ready(record.id, "127.0.0.1", port, health_url=resolved_health or None, timeout=self.ready_timeout):
@@ -287,6 +296,19 @@ class ApplicationScreenshotPipeline(ScreenshotPipeline):
             return super().capture(resolved_url)
         finally:
             manager.stop(record.id)
+
+    def expected_port(self) -> int | None:
+        """Return a concrete command port, or None when dynamic injection works."""
+        joined = " ".join(self.command)
+        if "{port}" in joined:
+            return None
+        match = re.search(r"(?:--port|(?:^|\s)-p)\s+(\d{2,5})\b", joined)
+        if match:
+            return int(match.group(1))
+        # Flask, `python app.py`, and common single-process dev servers use
+        # 5000 absent an explicit configurable port.  Do not probe a port the
+        # command was never told to bind.
+        return 5000
 
     def resolve_command(self, port: int) -> list[str]:
         """Resolve a configured stale entry point from actual project evidence."""

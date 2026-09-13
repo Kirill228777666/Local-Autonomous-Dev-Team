@@ -60,7 +60,7 @@ def test_live_preflight_uses_explicit_ipv4_and_16k_context(monkeypatch: pytest.M
         seen.append(request)
         if isinstance(request, str):
             assert request == "http://127.0.0.1:11434/api/tags"
-            return Response(b'{"models":[{"name":"qwen3-coder:30b"}]}')
+            return Response(("{\"models\":[{\"name\":\"" + AppConfig().model + "\"}]}").encode("utf-8"))
         assert timeout == 600
         return Response(b'{"message":{"content":"{\\\"ok\\\":true}"}}')
 
@@ -68,7 +68,7 @@ def test_live_preflight_uses_explicit_ipv4_and_16k_context(monkeypatch: pytest.M
     result = preflight_ollama(AppConfig())
 
     assert result == {
-        "base_url": "http://127.0.0.1:11434", "model": "qwen3-coder:30b",
+        "base_url": "http://127.0.0.1:11434", "model": AppConfig().model,
         "context_limit": 16384, "endpoint": "ok", "chat": "ok",
     }
     assert len(seen) == 2

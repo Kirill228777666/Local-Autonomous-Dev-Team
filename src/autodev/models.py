@@ -152,6 +152,7 @@ class Task:
     intent: str = ""
     acceptance_criteria: list[str] = field(default_factory=list)
     contract_version: int = 1
+    last_repair_packet: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None, root_task_id: str | None = None, parent_task_id: str | None = None, failure_fingerprint: str = "", strategy_generation: int = 0, capability_id: str = "", intent: str = "", acceptance_criteria: list[str] | None = None, contract_version: int = 1) -> Task:
@@ -186,6 +187,7 @@ class Task:
             intent=str(value.get("intent", "")),
             acceptance_criteria=[str(item) for item in value.get("acceptance_criteria", [])],  # type: ignore[arg-type]
             contract_version=int(value.get("contract_version", 1)),
+            last_repair_packet=dict(value.get("last_repair_packet", {})),  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -220,6 +222,9 @@ class ProjectState:
     architecture: dict[str, object] = field(default_factory=dict)
     project_contract: dict[str, object] = field(default_factory=dict)
     capability_graph: dict[str, dict[str, object]] = field(default_factory=dict)
+    repair_memory: list[dict[str, object]] = field(default_factory=list)
+    research_cache: dict[str, dict[str, object]] = field(default_factory=dict)
+    selected_primary_model: str = ""
     event_counters: dict[str, int] = field(default_factory=dict)
     provider_state: dict[str, object] = field(default_factory=dict)
     managed_processes: list[dict[str, object]] = field(default_factory=list)
@@ -265,6 +270,9 @@ class ProjectState:
             architecture=dict(value.get("architecture", {})),  # type: ignore[arg-type]
             project_contract=dict(value.get("project_contract", {})),  # type: ignore[arg-type]
             capability_graph={str(key): dict(item) for key, item in dict(value.get("capability_graph", {})).items() if isinstance(item, dict)},  # type: ignore[arg-type]
+            repair_memory=[dict(item) for item in value.get("repair_memory", []) if isinstance(item, dict)],  # type: ignore[arg-type]
+            research_cache={str(key): dict(item) for key, item in dict(value.get("research_cache", {})).items() if isinstance(item, dict)},  # type: ignore[arg-type]
+            selected_primary_model=str(value.get("selected_primary_model", "")),
             event_counters={str(key): int(count) for key, count in dict(value.get("event_counters", {})).items()},  # type: ignore[arg-type]
             provider_state=dict(value.get("provider_state", {})),  # type: ignore[arg-type]
             managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
@@ -300,6 +308,9 @@ class ProjectState:
             "architecture": self.architecture,
             "project_contract": self.project_contract,
             "capability_graph": self.capability_graph,
+            "repair_memory": self.repair_memory[-100:],
+            "research_cache": self.research_cache,
+            "selected_primary_model": self.selected_primary_model,
             "event_counters": self.event_counters,
             "provider_state": self.provider_state,
             "managed_processes": self.managed_processes[-100:],

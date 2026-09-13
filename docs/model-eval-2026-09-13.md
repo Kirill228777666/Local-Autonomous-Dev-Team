@@ -2,21 +2,21 @@
 
 ## Decision
 
-Keep `qwen3-coder:30b` as the default model for the next live endurance run.
+Use `qwen3.6:35b-coding` as the one primary model for the next live endurance run.
 
 ## Method
 
-The benchmark ran sequentially against eight disposable generic coding fixtures. It called `RoleAgents.code` with the production Coder system prompt, action schema, structured-output repair, temperature `0.05`, context limit `16384`, and Ollama thinking disabled. Each response was executed only inside its disposable fixture and checked programmatically. Existing-file full rewrites were counted separately.
+The benchmark ran sequentially against six disposable repair fixtures based on Run-13: SQLAlchemy's removed `Engine.has_table`, a Flask module-level-app contract conflict, a missing category response id, 404/409 error behavior, managed Flask startup, and preservation of accepted behavior. It called `RoleAgents.code` with the production Coder system prompt, action schema, structured-output repair, temperature `0.05`, context limit `16384`, and Ollama thinking disabled. Each response was executed only inside its disposable fixture and checked programmatically. Existing-file full rewrites were counted separately.
 
-| Metric | qwen3-coder:30b | qwen3.6:27b |
+| Metric | qwen3-coder:30b | qwen3.6:35b-coding |
 | --- | ---: | ---: |
-| Valid structured responses | 8/8 | 8/8 |
-| Valid tool actions | 8/8 | 8/8 |
-| Strict task fixes | 8/8 | 7/8 |
+| Valid structured responses | 6/6 | 6/6 |
+| Valid tool actions | 6/6 | 6/6 |
+| Strict task fixes | 4/6 | 5/6 |
 | NOOP responses | 0 | 0 |
 | Existing-file full rewrites | 0 | 0 |
-| Mean latency | 3.57s | 12.13s |
+| Mean latency | 4.14s | 5.48s |
 
-`qwen3.6:27b` failed the strict dependency-incompatibility fixture: it replaced `SQLAlchemy==2.0.23` with `SQLAlchemy>=2.0.23,<3.0.0`, which still permits the known-bad release. The earlier substring-only scorer incorrectly called that a success; a regression test now rejects constraints which still admit `2.0.23`.
+Both models produced strict JSON and valid tool actions on every request; no reasoning text leaked into the structured response with Ollama `think=false`. `qwen3.6:35b-coding` repaired one additional strict fixture (the SQLAlchemy compatibility repair). Both missed the deliberately combined 404/409 fixture, so the product still keeps deterministic contract evidence and validation rather than relying on model memory alone.
 
-This is a focused Coder action benchmark, not a claim of general model superiority or end-to-end success. The model stays unchanged because the established Coder was about 3.4 times faster and passed one more deterministic fixture in this workload.
+This is a focused Coder action benchmark, not a claim of general model superiority or end-to-end success. The 35B model is selected because it passed one more strict repair fixture at comparable mean latency and remained stable through the exact production structured-output API path.

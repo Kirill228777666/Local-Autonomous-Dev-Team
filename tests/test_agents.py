@@ -25,6 +25,7 @@ def test_coder_prompt_documents_the_only_supported_action_schema() -> None:
     assert "write_file" in prompt
     assert "edit_file" in prompt
     assert "run_command" in prompt
+    assert "start_process" in prompt
 
 
 def test_tester_prompt_requires_an_independent_command_array() -> None:

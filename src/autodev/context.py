@@ -22,6 +22,7 @@ class ContextBuilder:
             f"Current capability ({task.capability_id or 'unassigned'}): {task.title}\nIntent: {task.intent or task.description}\nAcceptance: {task.acceptance_criteria or ['contract-derived']}",
             f"Relevant files:\n{files}",
             "Recent errors:\n" + ("\n".join(f"- {error}" for error in task.errors[-4:]) or "- None"),
+            "Focused repair evidence:\n" + (str(task.last_repair_packet) if task.last_repair_packet else "- None"),
             "Architectural decisions:\n" + ("\n".join(f"- {decision}" for decision in state.decisions[-8:]) or "- None"),
             "Amendments:\n" + ("\n".join(f"- {amendment}" for amendment in state.amendments[-8:]) or "- None"),
             "Protected capabilities (must remain working):\n" + (str({key: value for key, value in state.capability_graph.items() if value.get("status") == "DONE"}) if state.capability_graph else "- None"),

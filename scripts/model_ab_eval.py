@@ -22,17 +22,19 @@ class EvalCase:
     files: dict[str, str]
     instruction: str
     required: dict[str, tuple[str, ...]]
+    required_actions: tuple[str, ...] = ()
 
 
+# These fixtures are deliberately small, but mirror failures observed in the
+# live endurance runs.  They exercise the same Coder schema/API route as the
+# product rather than asking a general chat question.
 CASES = (
-    EvalCase("targeted_python_edit", {"calculator.py": "def add(a, b):\n    return a - b\n"}, "Fix add without replacing unrelated code.", {"calculator.py": ("return a + b",)}),
-    EvalCase("small_test_fix", {"slug.py": "def slug(value):\n    return value\n"}, "Make slug return lowercase text with spaces replaced by hyphens.", {"slug.py": ("lower", "replace")}),
-    EvalCase("failed_noop", {"feature.py": "enabled = False\n"}, "Acceptance proves enabled must be True. A no-action answer is insufficient.", {"feature.py": ("True",)}),
-    EvalCase("refreshed_stale_context", {"config.py": "HOST = '127.0.0.1'\nPORT = 4000\n"}, "Current content is authoritative. Change only PORT to 8000.", {"config.py": ("HOST = '127.0.0.1'", "PORT = 8000")}),
-    EvalCase("api_crud", {"api.py": "from flask import Flask\napp = Flask(__name__)\n"}, "Add GET and POST /api/items routes while preserving app creation.", {"api.py": ("/api/items", "GET", "POST")}),
-    EvalCase("frontend_behavior", {"app.js": "const button = document.querySelector('button');\n"}, "Add a click listener that fetches /api/items.", {"app.js": ("addEventListener", "fetch", "/api/items")}),
-    EvalCase("dependency_incompatibility", {"requirements.txt": "Flask-SQLAlchemy==3.1.1\nSQLAlchemy==2.0.23\n"}, "Python 3.14 rejects SQLAlchemy 2.0.23. Update the SQLAlchemy constraint without changing Flask-SQLAlchemy.", {"requirements.txt": ("Flask-SQLAlchemy==3.1.1", "SQLAlchemy")}),
-    EvalCase("preserve_regression", {"service.py": "def core():\n    return 'ok'\n\ndef feature():\n    raise NotImplementedError\n"}, "Implement feature returning 'ready'; preserve the accepted core behavior.", {"service.py": ("return 'ok'", "return 'ready'")}),
+    EvalCase("sqlalchemy_engine_has_table", {"db.py": "def table_exists(engine, name):\n    return engine.has_table(name)\n"}, "SQLAlchemy 2.x raises AttributeError because Engine.has_table is removed. Make the minimal compatible repair using the current public inspection API; preserve function signature.", {"db.py": ("inspect", "has_table")}),
+    EvalCase("module_level_flask_contract", {"app.py": "from flask import Flask\napp = Flask(__name__)\n", "tests/test_app.py": "from app import create_app\nclient = create_app().test_client()\n"}, "The authoritative project contract says app.py exports module-level symbol app, not create_app. Repair only the lower-authority generated test; do not rewrite app architecture.", {"tests/test_app.py": ("from app import app", "app.test_client")}),
+    EvalCase("category_response_requires_id", {"api.py": "def create_category(name):\n    category = {'name': name}\n    return category, 201\n"}, "Acceptance requires POST category response to include persisted category id and name. Make the minimal implementation repair; do not weaken the response contract.", {"api.py": ("'id'", "'name'")}),
+    EvalCase("http_error_contract", {"api.py": "def delete_note(store, note_id):\n    note = store[note_id]\n    del store[note_id]\n    return '', 204\n"}, "Deleting a missing note must return HTTP 404 and duplicate category creation must return 409 rather than an unhandled 500. Repair application error handling without weakening requirements.", {"api.py": ("404", "409")}),
+    EvalCase("managed_flask_runtime", {"app.py": "from flask import Flask\napp = Flask(__name__)\nif __name__ == '__main__':\n    app.run()\n"}, "Start this long-running Flask server for validation using the managed process runtime. Do not use finite run_command for a server.", {}, ("start_process",)),
+    EvalCase("preserve_accepted_regression", {"service.py": "def core():\n    return 'ok'\n\ndef feature():\n    raise NotImplementedError\n"}, "Implement feature returning 'ready'. core() is protected accepted behavior and must remain exactly 'ok'; make a minimal regression-safe change.", {"service.py": ("return 'ok'", "return 'ready'")}),
 )
 
 
@@ -125,6 +127,9 @@ def evaluate_reply(workspace: Path, case: EvalCase, data: object) -> dict[str, o
             and not _excludes_incompatible_sqlalchemy((workspace / relative).read_text(encoding="utf-8"))
         )
         for relative, required in case.required.items()
+    ) and all(
+        any(isinstance(action, dict) and action.get("kind") == kind for action in actions)
+        for kind in case.required_actions
     )
     return result
 

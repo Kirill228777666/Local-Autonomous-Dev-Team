@@ -170,6 +170,45 @@ def contract_conflicting_test_action(contract: dict[str, object], action: object
     return None
 
 
+def repair_generated_test_for_contract(contract: dict[str, object], content: str) -> str | None:
+    """Apply a mechanical lower-authority test repair for app-factory drift."""
+    architecture = contract.get("architecture", {})
+    if not isinstance(architecture, dict) or architecture.get("app_factory") is not False:
+        return None
+    module = str(architecture.get("application_entry_point", "app.py")).removesuffix(".py").replace("/", ".")
+    symbol = str(architecture.get("application_symbol", "app"))
+    expected_import = f"from {module} import create_app"
+    if expected_import not in content or "create_app()" not in content:
+        return None
+    return content.replace(expected_import, f"from {module} import {symbol}").replace("create_app()", symbol)
+
+
+def reviewer_scope_violations(title: str, description: str, contract: dict[str, object], reasons: object) -> list[str]:
+    """Reject reviewer demands for unrelated, future capability work."""
+    if not isinstance(reasons, list):
+        return []
+    current = f"{title} {description}".lower()
+    architecture = contract.get("architecture", {})
+    entry = str(architecture.get("application_entry_point", "")) if isinstance(architecture, dict) else ""
+    future_markers = {
+        "frontend": ("frontend", "html", "css", "javascript", "static asset"),
+        "documentation": ("readme", "documentation", "setup instruction"),
+    }
+    violations: list[str] = []
+    for reason in reasons:
+        if not isinstance(reason, str):
+            continue
+        lowered = reason.lower()
+        if entry and "backend/app.py" in lowered and entry.lower() != "backend/app.py":
+            violations.append(reason)
+            continue
+        for capability, markers in future_markers.items():
+            if any(marker in lowered for marker in markers) and not any(marker in current for marker in markers):
+                violations.append(reason)
+                break
+    return violations
+
+
 def _signature(value: str) -> str:
     import hashlib
     return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()

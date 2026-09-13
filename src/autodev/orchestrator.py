@@ -14,7 +14,7 @@ from typing import Callable
 
 from .agents import RoleAgents
 from .architecture import default_contract, validate_architecture
-from .capabilities import build_project_contract, contract_conflicting_review_reasons, contract_conflicting_test_action, normalize_plan
+from .capabilities import build_project_contract, contract_conflicting_review_reasons, contract_conflicting_test_action, repair_generated_test_for_contract, reviewer_scope_violations, normalize_plan
 from .controller import FailureDecision, TaskController, TaskPhase
 from .designer import DesignerAgent, detect_ui_project
 from .environment import EnvironmentManager, FailureKind, classify_failure, validate_readme
@@ -22,6 +22,8 @@ from .git import GitError, GitRepository
 from .models import Heartbeat, ProjectState, Task, TaskStatus, ToolExecution, ToolExecutionStatus
 from .models import utc_now
 from .providers import LLMProvider, ProviderError, ProviderUnavailableError
+from .repair import FailureClass, RepairEvidencePacket, RepairMemory
+from .research import WebResearch
 from .regression import RegressionRunner
 from .runtime import ManagedProcessManager, ScreenshotPipeline
 from .state_store import StateStore
@@ -67,6 +69,7 @@ class AutonomousRunner:
         allow_system_package_install: bool = False,
         provider_wait_seconds: float | None = None,
         provider_retry_interval: float = 5.0,
+        research: WebResearch | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.store = store
@@ -81,8 +84,12 @@ class AutonomousRunner:
         self.designer = DesignerAgent(provider, structured_retries=1)
         self.environment_manager = EnvironmentManager(workspace, tools, allow_project_dependency_install, allow_system_package_install)
         self.process_manager = ManagedProcessManager(self.workspace)
+        bind_manager = getattr(self.visual_pipeline, "bind_manager", None)
+        if callable(bind_manager):
+            bind_manager(self.process_manager)
         self.controller = TaskController(local_failures_per_strategy=2, max_strategy_changes=1)
         self.validation_planner = ValidationPlanner()
+        self.research = research or WebResearch()
         self._active_state: ProjectState | None = None
         set_observer = getattr(provider, "set_outcome_observer", None)
         if callable(set_observer):
@@ -472,10 +479,29 @@ class AutonomousRunner:
         while position < len(actions):
             action = actions[position]
             try:
+                if isinstance(action, dict) and action.get("kind") == "start_process":
+                    command = action.get("command")
+                    if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
+                        raise ValueError("start_process requires a non-empty string command array")
+                    execution = ToolExecution.create(task.id, "start_process", command)
+                    state.tool_executions.append(execution)
+                    self._mark(state, "CODER", "TOOL_STARTED", "Started tool: start_process", task)
+                    self._reroute_server_command(state, task, command)
+                    execution.finish(ToolExecutionStatus.SUCCEEDED, "managed process ready")
+                    self._mark(state, "CODER", "TOOL_SUCCEEDED", "Completed tool: start_process", task)
+                    position += 1
+                    continue
                 contract_conflict = contract_conflicting_test_action(state.project_contract, action)
                 if contract_conflict:
-                    self._mark(state, "TESTER", "TEST_CONTRACT_CONFLICT", contract_conflict, task)
-                    raise ToolPolicyError(contract_conflict)
+                    content = action.get("content") if isinstance(action, dict) else None
+                    repaired = repair_generated_test_for_contract(state.project_contract, content) if isinstance(content, str) else None
+                    self._mark(state, "TESTER", "CONTRACT_CONFLICT_DETECTED", contract_conflict, task)
+                    if repaired is None or not isinstance(action, dict):
+                        self._mark(state, "TESTER", "CONTRACT_CONFLICT_UNRESOLVED", contract_conflict, task)
+                        raise ToolPolicyError(contract_conflict)
+                    action = dict(action)
+                    action["content"] = repaired
+                    self._mark(state, "TESTER", "CONTRACT_CONFLICT_RESOLVED", "Repaired lower-authority generated test to match frozen contract", task)
                 if isinstance(action, dict) and action.get("kind") == "run_command" and self._known_missing_npm(state, action.get("command")):
                     self._pivot_to_static_frontend(state, task)
                     return None
@@ -654,6 +680,7 @@ class AutonomousRunner:
         state.run_history.append(self._result_log(task, result))
         validation = classify_validation_result(result, command, self.workspace)
         self._mark(state, "TESTER", validation.kind.value, f"Validation outcome: {validation.kind.value}", task)
+        self._capture_repair_evidence(state, task, command, validation.kind, result)
         if validation.kind is ValidationOutcome.NO_TESTS:
             fallback = self.validation_planner.fallback_for_no_tests(self.workspace, task, state.environment)
             if fallback is None:
@@ -665,6 +692,7 @@ class AutonomousRunner:
             state.run_history.append(self._result_log(task, result))
             validation = classify_validation_result(result, command, self.workspace)
             self._mark(state, "TESTER", validation.kind.value, f"Validation outcome: {validation.kind.value}", task)
+            self._capture_repair_evidence(state, task, command, validation.kind, result)
             if validation.kind is ValidationOutcome.NO_TESTS:
                 self._validation_unavailable(state, task, command, validation.detail)
                 return
@@ -696,6 +724,7 @@ class AutonomousRunner:
                 harness_attempts += 1
                 validation = classify_validation_result(result, command, self.workspace)
                 self._mark(state, "TESTER", validation.kind.value, f"Validation outcome: {validation.kind.value}", task)
+                self._capture_repair_evidence(state, task, command, validation.kind, result)
                 if validation.kind is ValidationOutcome.NO_TESTS:
                     self._validation_unavailable(state, task, command, validation.detail)
                     return
@@ -776,6 +805,12 @@ class AutonomousRunner:
             self._mark(state, "REVIEWER", "LLM_RESPONSE", "Reviewer decision response received", task)
             if review.get("approved") is not True:
                 reasons = review.get("reasons", ["Reviewer rejected implementation"])
+                scope_violations = reviewer_scope_violations(task.title, task.description, state.project_contract, reasons)
+                if scope_violations:
+                    self._mark(state, "REVIEWER", "SCOPE_VIOLATION", "Ignored unrelated reviewer requirements: " + "; ".join(scope_violations), task)
+                    reasons = [reason for reason in reasons if reason not in scope_violations] if isinstance(reasons, list) else []
+                    if not reasons:
+                        review = {"approved": True}
                 contract_conflicts = contract_conflicting_review_reasons(state.project_contract, reasons)
                 if contract_conflicts:
                     self._mark(
@@ -1114,6 +1149,69 @@ class AutonomousRunner:
         if self.environment_manager.last_diagnostic:
             state.run_history.append(f"Environment limitation: {self.environment_manager.last_diagnostic}")
         return EnvironmentRepairOutcome(True, False, retried)
+
+    def _capture_repair_evidence(self, state: ProjectState, task: Task, command: list[str], validation: ValidationOutcome, result: CommandResult) -> None:
+        """Persist compact failure evidence before a later Coder retry."""
+        if result.exit_code == 0:
+            return
+        dependency_versions = self._dependency_versions(state, result.stderr + "\n" + result.stdout)
+        packet = RepairEvidencePacket.from_validation(
+            capability_id=task.capability_id or task.id,
+            contract_version=task.contract_version,
+            attempt_number=task.attempts,
+            command=command,
+            outcome=validation,
+            result=result,
+            contract=state.project_contract,
+            dependency_versions=dependency_versions,
+            acceptance_intent=task.acceptance_criteria,
+            protected_capabilities=[key for key, entry in state.capability_graph.items() if entry.get("status") == TaskStatus.DONE.value],
+            previous_repair_strategies=task.strategy_history[-3:],
+        )
+        if packet.failure_class is FailureClass.DEPENDENCY_API_MISMATCH:
+            package, version = next(iter(dependency_versions.items()), ("", ""))
+            if package:
+                research = self.research.official_docs_search(package, packet.research_query(), version, packet.exception_type)
+                packet.research_evidence.append({"url": research.url, "text": research.text[:2000], "official": str(research.official), "error": research.error})
+                state.research_cache = self.research.cache
+                self._mark(state, "RESEARCH", "REQUEST", f"Official docs research: {research.query}", task)
+                self._mark(state, "RESEARCH", "SUCCESS" if research.ok else "FAILURE", research.url if research.ok else research.error, task)
+        memory = RepairMemory(state.repair_memory)
+        # Evidence creation is not a repair attempt.  Record a failed focused
+        # strategy only when a prior packet for the same fingerprint has already
+        # been delivered to Coder and the exact failure recurs.
+        if task.last_repair_packet.get("failure_id") == packet.failure_id:
+            memory.record(RepairEvidencePacket.from_dict(task.last_repair_packet), "focused-coder", "failed")
+            self._mark(state, "REPAIR", "REPEAT_SUPPRESSED", "Repeated failure recorded; avoid replaying the same focused repair", task)
+        task.last_repair_packet = packet.to_dict()
+        state.repair_memory = memory.records
+        self._mark(state, "REPAIR", "EVIDENCE_PACKET", f"Prepared {packet.failure_class.value} evidence for {task.capability_id or task.id}", task)
+
+    def _dependency_versions(self, state: ProjectState, detail: str) -> dict[str, str]:
+        """Collect only installed public-package versions needed for API research."""
+        candidates: list[str] = []
+        lowered = detail.lower()
+        if any(token in lowered for token in ("engine", "sqlalchemy", "detachedinstance")):
+            candidates.append("SQLAlchemy")
+        if "flask" in lowered:
+            candidates.extend(["Flask", "Flask-SQLAlchemy"])
+        if not candidates:
+            return {}
+        context = state.environment.get("execution_context")
+        interpreter = context.get("python_interpreter") if isinstance(context, dict) else ""
+        if not isinstance(interpreter, str) or not interpreter:
+            return {}
+        # This stays a workspace-local interpreter command with no source
+        # disclosure; it reports only public installed package versions.
+        script = "import importlib.metadata as m,json; names=" + repr(candidates) + "; out={};\nfor n in names:\n    try: out[n]=m.version(n)\n    except m.PackageNotFoundError: pass\nprint(json.dumps(out))"
+        probe = self.tools.run_command([interpreter, "-c", script])
+        if probe.exit_code:
+            return {}
+        try:
+            value = json.loads(probe.stdout)
+        except json.JSONDecodeError:
+            return {}
+        return {str(key): str(version) for key, version in value.items()} if isinstance(value, dict) else {}
 
     def _sync_environment_snapshot(self, task: Task) -> None:
         """Keep verified dependency metadata outside application rollback."""

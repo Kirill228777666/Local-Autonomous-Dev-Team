@@ -100,6 +100,32 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "duplicate_corrective_tasks_suppressed": count("MANAGER", "DUPLICATE_CORRECTIVE_SUPPRESSED"),
         "root_tasks_blocked": sum(task.status.value == "BLOCKED" and task.root_task_id == task.id for task in state.tasks),
         "repair_strategy_changes": sum(task.strategy_generation > 0 for task in state.tasks),
+        "repair_failure_packets_created": count("REPAIR", "EVIDENCE_PACKET"),
+        "repair_fingerprints_seen": len({str(item.get("failure_id", "")) for item in state.repair_memory if item.get("failure_id")}),
+        "repeat_repairs_suppressed": count("REPAIR", "REPEAT_SUPPRESSED"),
+        "focused_repairs_attempted": sum(item.get("strategy") == "focused-coder" for item in state.repair_memory),
+        "focused_repairs_succeeded": sum(item.get("strategy") == "focused-coder" and item.get("outcome") == "succeeded" for item in state.repair_memory),
+        "research_escalations": count("RESEARCH", "REQUEST"),
+        "repair_attempts_with_research": sum(
+            bool(task.last_repair_packet.get("research_evidence")) for task in state.tasks
+        ),
+        "research_backed_repair_successes": sum(
+            task.status.value == "DONE" and bool(task.last_repair_packet.get("research_evidence")) for task in state.tasks
+        ),
+        "architect_escalations": count("ARCHITECT", "LLM_CALL"),
+        "web_research_requests": count("RESEARCH", "REQUEST"),
+        "web_research_successes": count("RESEARCH", "SUCCESS"),
+        "web_research_failures": count("RESEARCH", "FAILURE"),
+        "web_research_cache_hits": count("RESEARCH", "CACHE_HIT"),
+        "official_docs_hits": count("RESEARCH", "SUCCESS"),
+        "contract_conflicts_detected": count("TESTER", "CONTRACT_CONFLICT_DETECTED"),
+        "contract_conflicts_resolved": count("TESTER", "CONTRACT_CONFLICT_RESOLVED"),
+        "contract_conflicts_unresolved": count("TESTER", "CONTRACT_CONFLICT_UNRESOLVED"),
+        "generated_tests_repaired_for_contract": count("TESTER", "CONTRACT_CONFLICT_RESOLVED"),
+        "reviewer_scope_violations_prevented": count("REVIEWER", "SCOPE_VIOLATION"),
+        "reviewer_invalid_rejections": count("REVIEWER", "SCOPE_VIOLATION") + count("REVIEWER", "CONTRACT_CONFLICT"),
+        "reviewer_valid_rejections": max(0, sum("Review rejected" in entry for entry in history) - count("REVIEWER", "SCOPE_VIOLATION")),
+        "selected_primary_model": state.selected_primary_model or state.model,
         "tool_recoveries": sum(event.phase == "TOOL_RECOVERY" for event in events),
         "stale_edit_recoveries": sum(event.phase == "TOOL_RECOVERY" and "stale edit" in event.message.lower() for event in events),
         "tool_recovery_failures": sum("Tool stale edit recovery" in entry and "Coder error" in entry for entry in history),
@@ -146,6 +172,14 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "validation_dependency_api_mismatches": count("TESTER", "VALIDATION_DEPENDENCY_API_MISMATCH"),
         "validation_test_implementation_bugs": count("TESTER", "VALIDATION_TEST_IMPLEMENTATION_BUG"),
         "validation_timeouts": count("TESTER", "VALIDATION_TIMEOUT"),
+        "exact_validator_reruns": sum(1 for event in events if event.agent == "TESTER" and event.phase == "DETERMINISTIC_VALIDATION" and bool(event.task_id)),
+        "exact_validator_passes": count("TESTER", "VALIDATION_PASS"),
+        "exact_validator_failures": sum(
+            count("TESTER", phase) for phase in ("VALIDATION_APPLICATION_FAIL", "VALIDATION_APPLICATION_IMPORT_ERROR", "VALIDATION_DEPENDENCY_API_MISMATCH", "VALIDATION_TEST_IMPLEMENTATION_BUG")
+        ),
+        "exact_validator_repair_successes": sum(
+            task.status.value == "DONE" and bool(task.last_repair_packet) for task in state.tasks
+        ),
         "screenshot_attempts": sum("Screenshot" in event.message for event in events),
         "screenshot_successes": sum("screenshots captured" in event.message.lower() for event in events),
         "managed_process_starts": sum(event.agent == "RUNTIME" and event.phase == "PROCESS_START" for event in events),
@@ -153,6 +187,9 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "managed_process_failures": sum(event.agent == "RUNTIME" and event.phase == "READINESS_FAILED" for event in events),
         "readiness_checks": sum(event.agent == "RUNTIME" and event.phase in {"READINESS", "READINESS_FAILED"} for event in events),
         "readiness_failures": sum(event.agent == "RUNTIME" and event.phase == "READINESS_FAILED" for event in events),
+        "designer_managed_runtime_uses": sum(event.agent == "DESIGNER" and "Screenshot" in event.message for event in events),
+        "designer_readiness_successes": sum(event.agent == "RUNTIME" and event.phase == "READINESS" for event in events),
+        "designer_readiness_failures": sum(event.agent == "RUNTIME" and event.phase == "READINESS_FAILED" for event in events),
         "process_tree_kills": sum(event.agent == "RUNTIME" and event.phase == "PROCESS_STOP" for event in events),
         "orphan_processes_cleaned": sum("Cleaned stale managed process" in entry for entry in history),
         "long_running_commands_rerouted": sum("rerouted to managed process" in item.detail for item in state.tool_executions),

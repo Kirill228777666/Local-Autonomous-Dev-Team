@@ -1,6 +1,6 @@
 # Copy and adjust this file, then pass it to `autodev start --config`.
 [ollama]
-model = "qwen3-coder:30b"
+model = "qwen3.6:35b-coding"
 base_url = "http://127.0.0.1:11434"
 timeout = 600
 
@@ -10,7 +10,7 @@ provider_max_wait_seconds = 600
 
 # Optional role profiles run sequentially and fall back to [models].default.
 [models]
-default = "qwen3-coder:30b"
+default = "qwen3.6:35b-coding"
 
 [agents.coder]
 temperature = 0.05

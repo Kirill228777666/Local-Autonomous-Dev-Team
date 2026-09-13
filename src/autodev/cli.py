@@ -45,7 +45,7 @@ class PermissionConfig:
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:
-    model: str = "qwen3-coder:30b"
+    model: str = "qwen3.6:35b-coding"
     base_url: str = "http://127.0.0.1:11434"
     timeout: float = 600.0
     max_attempts: int = 3
@@ -269,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         runner = make_runner(workspace, config)
         state = runner._required_state()
         state.model = config.model
+        state.selected_primary_model = config.model
         runner.store.save(state)
         if args.command == "resume":
             runner.resume()
