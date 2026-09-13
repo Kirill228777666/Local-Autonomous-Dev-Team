@@ -185,6 +185,40 @@ def test_provider_latency_metrics_are_averaged_by_completed_request_role() -> No
     assert data["max_llm_latency_seconds_by_role"] == {"CODER": 3.0}
 
 
+def test_model_timeout_metric_counts_provider_timeouts_not_runtime_readiness_messages() -> None:
+    state = ProjectState.create("Build Notes")
+    state.run_history.append("Application readiness timed out. Logs: server failed")
+
+    assert metrics(state)["model_timeouts"] == 0
+
+    state.event_counters["PROVIDER_REQUEST:TIMEOUT"] = 2
+
+    assert metrics(state)["model_timeouts"] == 2
+
+
+def test_validation_metrics_keep_no_tests_and_harness_failures_separate() -> None:
+    state = ProjectState.create("Build Notes")
+    state.event_counters.update({
+        "TESTER:VALIDATION_PASS": 3,
+        "TESTER:VALIDATION_APPLICATION_FAIL": 2,
+        "TESTER:VALIDATION_NO_TESTS": 1,
+        "TESTER:VALIDATION_COMMAND_INVALID": 1,
+        "TESTER:VALIDATION_IMPORT_OR_ENVIRONMENT_ERROR": 2,
+        "TESTER:VALIDATION_TIMEOUT": 1,
+        "TESTER:HARNESS_FAILURE": 1,
+    })
+
+    data = metrics(state)
+
+    assert data["validation_passes"] == 3
+    assert data["validation_application_failures"] == 2
+    assert data["validation_no_tests"] == 1
+    assert data["validation_command_invalid"] == 1
+    assert data["validation_environment_failures"] == 2
+    assert data["validation_timeouts"] == 1
+    assert data["tester_harness_failures"] == 1
+
+
 def test_regression_rejection_restores_every_project_file_to_pre_attempt_state(tmp_path: Path) -> None:
     setup_repository(tmp_path)
     (tmp_path / "app.py").write_bytes(b"good app\r\n")
@@ -303,6 +337,8 @@ def test_runner_blocks_repeated_identical_coder_actions(tmp_path: Path) -> None:
 
     assert state.tasks[0].status is TaskStatus.BLOCKED
     assert any("repeated" in error for error in state.tasks[0].errors)
+    assert state.tasks[0].rollback_reasons["repeated_coder_action"] == 1
+    assert "other" not in state.tasks[0].rollback_reasons
 
 
 def test_runner_keeps_an_invalid_initial_plan_blocked(tmp_path: Path) -> None:

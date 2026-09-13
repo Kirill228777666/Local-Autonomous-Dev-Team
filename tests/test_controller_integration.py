@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -119,3 +120,63 @@ def test_exhausted_changed_strategy_blocks_root_without_repair_chain(tmp_path: P
     assert provider.calls["MANAGER"] == 0
     assert provider.calls["ARCHITECT"] == 1
     assert any("BLOCKED_ROOT_TASK" in error for error in state.tasks[0].errors)
+
+
+def test_empty_deterministic_unittest_discovery_is_validation_unavailable_without_harness_retry(tmp_path: Path) -> None:
+    provider = RecordingProvider({
+        "CODER": [AgentReply({"actions": [{"kind": "write_file", "path": "tests/test_empty.py", "content": "# intentionally empty\n"}]})],
+    })
+    runner, state = runner_with_task(tmp_path, provider, Task.create("Backend tests", "Implement backend tests"))
+    state.environment = {"execution_context": {"python_interpreter": sys.executable}}
+    runner.store.save(state)
+
+    state = runner.run(max_cycles=1)
+
+    task = state.tasks[0]
+    assert state.status == "BLOCKED"
+    assert task.status is TaskStatus.PENDING
+    assert task.failures_in_strategy == 0
+    assert any(event.phase == "VALIDATION_NO_TESTS" for event in state.events)
+    assert provider.calls["TESTER"] == 0
+    assert provider.calls["MANAGER"] == 0
+
+
+def test_import_failure_inside_discovered_test_does_not_trigger_harness_regeneration(tmp_path: Path) -> None:
+    provider = RecordingProvider({
+        "CODER": [AgentReply({"actions": [
+            {"kind": "write_file", "path": "app.py", "content": "value = 1\n"},
+            {"kind": "write_file", "path": "tests/test_api.py", "content": "import unittest\nfrom app import missing_value\n"},
+        ]})],
+    })
+    runner, state = runner_with_task(tmp_path, provider, Task.create("Backend API", "Implement endpoint"))
+    state.environment = {"execution_context": {"python_interpreter": sys.executable}}
+    runner.store.save(state)
+
+    state = runner.run(max_cycles=1)
+
+    task = state.tasks[0]
+    assert task.status is TaskStatus.PENDING
+    assert task.failures_in_strategy == 1
+    assert any(event.phase == "VALIDATION_IMPORT_OR_ENVIRONMENT_ERROR" for event in state.events)
+    assert not any(event.phase == "HARNESS_FAILURE" for event in state.events)
+    assert provider.calls["TESTER"] == 0
+    assert provider.calls["MANAGER"] == 0
+
+
+def test_repeated_invalid_tester_command_is_bounded_with_validation_rollback_reason(tmp_path: Path) -> None:
+    provider = RecordingProvider({
+        "CODER": [AgentReply({"actions": [{"kind": "write_file", "path": "result.txt", "content": "ok"}]})],
+        "TESTER": [
+            AgentReply({"command": [sys.executable, "-c", "import re; with open('result.txt'): pass"]}),
+            AgentReply({"command": [sys.executable, "-c", "import re; with open('result.txt'): pass"]}),
+            AgentReply({"command": [sys.executable, "-c", "import re; with open('result.txt'): pass"]}),
+        ],
+    })
+    runner, _ = runner_with_task(tmp_path, provider, Task.create("Result", "Create result.txt"))
+
+    state = runner.run(max_cycles=1)
+
+    task = state.tasks[0]
+    assert task.status is TaskStatus.BLOCKED
+    assert task.rollback_reasons == {"validation_command_invalid": 1}
+    assert provider.calls["MANAGER"] == 0

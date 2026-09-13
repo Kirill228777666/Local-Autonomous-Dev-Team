@@ -25,7 +25,7 @@ from .regression import RegressionRunner
 from .runtime import ManagedProcessManager, ScreenshotPipeline
 from .state_store import StateStore
 from .tools import CommandResult, ToolPolicyError, WorkspaceTools
-from .validation import ValidationPlanner
+from .validation import ValidationOutcome, ValidationPlanner, classify_validation_result
 
 
 class CommandExecutionError(ValueError):
@@ -455,7 +455,7 @@ class AutonomousRunner:
             actions = self._request_coder_actions(state, task, "Coder implementation request")
             fingerprint = hashlib.sha256(json.dumps(actions, sort_keys=True).encode()).hexdigest()
             if fingerprint in task.action_fingerprints:
-                self._block(task, state, "repeated identical coder action without progress")
+                self._block(task, state, "repeated identical coder action without progress", "repeated_coder_action")
                 return
             task.action_fingerprints.append(fingerprint)
             executed = self._execute_coder_actions(state, task, actions)
@@ -507,19 +507,34 @@ class AutonomousRunner:
                 self._mark_provider_wait(state, task, str(error))
                 return
             except ProviderError as error:
-                self._retry_or_block(task, state, f"Tester response invalid: {error}")
+                self._retry_or_block(task, state, f"Tester response invalid: {error}", "model_output_invalid")
                 return
             except (ToolPolicyError, ValueError) as error:
-                self._retry_or_block(task, state, f"Tester error: {error}")
+                self._retry_or_block(task, state, f"Tester error: {error}", "validation_command_invalid")
                 return
         state.run_history.append(self._result_log(task, result))
+        validation = classify_validation_result(result, command, self.workspace)
+        self._mark(state, "TESTER", validation.kind.value, f"Validation outcome: {validation.kind.value}", task)
+        if validation.kind is ValidationOutcome.NO_TESTS:
+            fallback = self.validation_planner.fallback_for_no_tests(self.workspace, task, state.environment)
+            if fallback is None:
+                self._validation_unavailable(state, task, command, validation.detail)
+                return
+            command = fallback
+            self._mark(state, "TESTER", "VALIDATION_FALLBACK", f"Selected fallback validator: {command}", task)
+            result = self.tools.run_tests(command)
+            state.run_history.append(self._result_log(task, result))
+            validation = classify_validation_result(result, command, self.workspace)
+            self._mark(state, "TESTER", validation.kind.value, f"Validation outcome: {validation.kind.value}", task)
+            if validation.kind is ValidationOutcome.NO_TESTS:
+                self._validation_unavailable(state, task, command, validation.detail)
+                return
         if result.exit_code != 0:
-            failure = classify_failure(result, command, self.workspace)
             harness_attempts = 0
-            while result.exit_code != 0 and failure.kind in {FailureKind.TEST_HARNESS_FAILURE, FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
+            while result.exit_code != 0 and validation.kind is ValidationOutcome.COMMAND_INVALID:
                 self._mark(state, "TESTER", "HARNESS_FAILURE", "Generated validation command is invalid; regenerate validation without changing application code", task)
                 if harness_attempts >= 2:
-                    self._block(task, state, "TEST_HARNESS_BLOCKED: Tester generated three invalid validation commands; application code was not changed")
+                    self._block(task, state, "TEST_HARNESS_BLOCKED: Tester generated three invalid validation commands; application code was not changed", "validation_command_invalid")
                     return
                 task.errors.append(f"Tester harness failure: {result.stderr or result.stdout}")
                 try:
@@ -537,10 +552,14 @@ class AutonomousRunner:
                     self._mark_provider_wait(state, task, str(error))
                     return
                 except (ProviderError, ToolPolicyError, ValueError) as error:
-                    self._block(task, state, f"Tester harness regeneration failed: {error}")
+                    self._block(task, state, f"Tester harness regeneration failed: {error}", "validation_command_invalid")
                     return
                 harness_attempts += 1
-                failure = classify_failure(result, command, self.workspace)
+                validation = classify_validation_result(result, command, self.workspace)
+                self._mark(state, "TESTER", validation.kind.value, f"Validation outcome: {validation.kind.value}", task)
+                if validation.kind is ValidationOutcome.NO_TESTS:
+                    self._validation_unavailable(state, task, command, validation.detail)
+                    return
             if harness_attempts and result.exit_code == 0:
                 self._mark(state, "TESTER", "HARNESS_RECOVERED", "Regenerated validation command passed", task)
             if result.exit_code != 0:
@@ -1168,11 +1187,28 @@ class AutonomousRunner:
             # another role-level request; only health probes are allowed now.
             self._mark(state, "PROVIDER", "INCIDENT_DEDUPLICATED", "Provider incident already open", task)
 
-    def _block(self, task: Task, state: ProjectState, reason: str) -> None:
-        self._rollback_attempt_snapshot(task, state, "other")
+    def _block(self, task: Task, state: ProjectState, reason: str, rollback_reason: str = "other") -> None:
+        self._rollback_attempt_snapshot(task, state, rollback_reason)
         self.controller.block(task, reason)
         state.current_task_id = None
         state.run_history.append(f"Task blocked: {task.title}; {reason}")
+
+    def _validation_unavailable(self, state: ProjectState, task: Task, command: list[str], detail: str) -> None:
+        """Stop safely when the selected validator supplied no usable evidence.
+
+        This is an infrastructure terminal state, not an application strategy
+        failure: retain no mutation, do not increment strategy accounting, and
+        do not manufacture a Tester command with an LLM.
+        """
+        self._stop_task_processes(state, task)
+        self._rollback_attempt_snapshot(task, state, "validation_unavailable")
+        task.phase = TaskPhase.READY.value
+        task.status = TaskStatus.PENDING
+        task.errors.append(f"VALIDATION_UNAVAILABLE: {command!r}; {detail[-2000:]}")
+        state.current_task_id = None
+        state.status = "BLOCKED"
+        state.run_history.append(f"Validation unavailable for {task.title}: no deterministic evidence from {command!r}")
+        self._mark(state, "TESTER", "VALIDATION_UNAVAILABLE", "No valid deterministic validation evidence is available", task)
 
     @staticmethod
     def _snapshot_excluded(path: Path) -> bool:
