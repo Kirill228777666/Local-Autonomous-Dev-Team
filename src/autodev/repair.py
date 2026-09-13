@@ -15,6 +15,7 @@ class FailureClass(StrEnum):
     CONTRACT_CONFLICT = "CONTRACT_CONFLICT"
     DEPENDENCY_API_MISMATCH = "DEPENDENCY_API_MISMATCH"
     TEST_IMPLEMENTATION_BUG = "TEST_IMPLEMENTATION_BUG"
+    TEST_STATE_ISOLATION_FAILURE = "TEST_STATE_ISOLATION_FAILURE"
     APPLICATION_LOGIC_FAILURE = "APPLICATION_LOGIC_FAILURE"
     APPLICATION_IMPORT_ERROR = "APPLICATION_IMPORT_ERROR"
     RUNTIME_PROCESS_FAILURE = "RUNTIME_PROCESS_FAILURE"
@@ -28,6 +29,8 @@ def route_failure(outcome: ValidationOutcome, detail: str = "") -> FailureClass:
         return FailureClass.DEPENDENCY_API_MISMATCH
     if outcome is ValidationOutcome.TEST_IMPLEMENTATION_BUG:
         return FailureClass.TEST_IMPLEMENTATION_BUG
+    if outcome is ValidationOutcome.TEST_STATE_ISOLATION_FAILURE:
+        return FailureClass.TEST_STATE_ISOLATION_FAILURE
     if outcome is ValidationOutcome.APPLICATION_IMPORT_ERROR:
         return FailureClass.APPLICATION_IMPORT_ERROR
     if outcome in {ValidationOutcome.TOOL_MISSING, ValidationOutcome.IMPORT_OR_ENVIRONMENT_ERROR}:

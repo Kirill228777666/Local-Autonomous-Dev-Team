@@ -27,8 +27,9 @@ from .research import WebResearch
 from .regression import RegressionRunner
 from .runtime import ManagedProcessManager, ScreenshotPipeline
 from .state_store import StateStore
+from .test_state import ValidationStateManager
 from .tools import CommandResult, ToolPolicyError, WorkspaceTools
-from .validation import ValidationOutcome, ValidationPlanner, classify_validation_result
+from .validation import ValidationOutcome, ValidationPlanner, ValidationResult, classify_validation_result
 
 
 class CommandExecutionError(ValueError):
@@ -493,14 +494,15 @@ class AutonomousRunner:
                     continue
                 contract_conflict = contract_conflicting_test_action(state.project_contract, action)
                 if contract_conflict:
-                    content = action.get("content") if isinstance(action, dict) else None
+                    content_key = "new" if isinstance(action, dict) and action.get("kind") == "edit_file" else "content"
+                    content = action.get(content_key) if isinstance(action, dict) else None
                     repaired = repair_generated_test_for_contract(state.project_contract, content) if isinstance(content, str) else None
                     self._mark(state, "TESTER", "CONTRACT_CONFLICT_DETECTED", contract_conflict, task)
                     if repaired is None or not isinstance(action, dict):
                         self._mark(state, "TESTER", "CONTRACT_CONFLICT_UNRESOLVED", contract_conflict, task)
                         raise ToolPolicyError(contract_conflict)
                     action = dict(action)
-                    action["content"] = repaired
+                    action[content_key] = repaired
                     self._mark(state, "TESTER", "CONTRACT_CONFLICT_RESOLVED", "Repaired lower-authority generated test to match frozen contract", task)
                 if isinstance(action, dict) and action.get("kind") == "run_command" and self._known_missing_npm(state, action.get("command")):
                     self._pivot_to_static_frontend(state, task)
@@ -650,9 +652,19 @@ class AutonomousRunner:
         else:
             try:
                 self._mark(state, "TESTER", "TESTING", f"Tester verifying: {task.title}", task)
-                deterministic = self.validation_planner.command_for(self.workspace, task, state.environment)
+                owned = task.acceptance_validator.get("command") if task.acceptance_validator else None
+                deterministic = owned if isinstance(owned, list) and all(isinstance(item, str) for item in owned) else self.validation_planner.command_for(self.workspace, task, state.environment, acceptance_only=True)
                 if deterministic is not None:
                     command = deterministic
+                    if not task.acceptance_validator:
+                        validator_id = hashlib.sha256(json.dumps(command, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+                        task.acceptance_validator = {
+                            "validator_id": validator_id,
+                            "capability_id": task.capability_id or task.id,
+                            "scope": "acceptance",
+                            "contract_version": task.contract_version,
+                            "command": list(command),
+                        }
                     self._mark(state, "TESTER", "DETERMINISTIC_VALIDATION", f"Selected deterministic validator: {command}", task)
                 else:
                     self._mark(state, "TESTER", "LLM_CALL", "Tester verification request", task)
@@ -666,7 +678,7 @@ class AutonomousRunner:
                     return
                 if self._requires_managed_service(command):
                     self._ensure_validation_service(state, task)
-                result = self.tools.run_tests(command)
+                result = self._run_validator(state, task, command)
             except ProviderUnavailableError as error:
                 self._preserve_task_for_provider_wait(task, state)
                 self._mark_provider_wait(state, task, str(error))
@@ -688,7 +700,7 @@ class AutonomousRunner:
                 return
             command = fallback
             self._mark(state, "TESTER", "VALIDATION_FALLBACK", f"Selected fallback validator: {command}", task)
-            result = self.tools.run_tests(command)
+            result = self._run_validator(state, task, command)
             state.run_history.append(self._result_log(task, result))
             validation = classify_validation_result(result, command, self.workspace)
             self._mark(state, "TESTER", validation.kind.value, f"Validation outcome: {validation.kind.value}", task)
@@ -712,7 +724,7 @@ class AutonomousRunner:
                     if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
                         raise ProviderError("Tester response needs a string command array")
                     self._mark(state, "TESTER", "HARNESS_EXECUTE", "Executing regenerated validation command", task)
-                    result = self.tools.run_tests(command)
+                    result = self._run_validator(state, task, command)
                     state.run_history.append(self._result_log(task, result))
                 except ProviderUnavailableError as error:
                     self._preserve_task_for_provider_wait(task, state)
@@ -730,6 +742,10 @@ class AutonomousRunner:
                     return
             if harness_attempts and result.exit_code == 0:
                 self._mark(state, "TESTER", "HARNESS_RECOVERED", "Regenerated validation command passed", task)
+            if result.exit_code != 0:
+                focused = self._try_focused_repair(state, task, command, result, validation) if actions else None
+                if focused is not None:
+                    actions, result, validation = focused
             if result.exit_code != 0:
                 if not actions:
                     self._mark(state, "CODER", "NOOP_FAILED_ACCEPTANCE", "No-op Coder response did not satisfy acceptance", task)
@@ -750,7 +766,7 @@ class AutonomousRunner:
                                 return
                             actions = executed
                             task.phase = TaskPhase.VALIDATING.value
-                            result = self.tools.run_tests(command)
+                            result = self._run_validator(state, task, command)
                             state.run_history.append(self._result_log(task, result))
                         else:
                             self._mark(state, "CODER", "REPEATED_NOOP", "Evidence recovery also returned no actions", task)
@@ -1175,17 +1191,77 @@ class AutonomousRunner:
                 packet.research_evidence.append({"url": research.url, "text": research.text[:2000], "official": str(research.official), "error": research.error})
                 state.research_cache = self.research.cache
                 self._mark(state, "RESEARCH", "REQUEST", f"Official docs research: {research.query}", task)
+                if research.cache_hit:
+                    self._mark(state, "RESEARCH", "CACHE_HIT", research.url, task)
                 self._mark(state, "RESEARCH", "SUCCESS" if research.ok else "FAILURE", research.url if research.ok else research.error, task)
-        memory = RepairMemory(state.repair_memory)
-        # Evidence creation is not a repair attempt.  Record a failed focused
-        # strategy only when a prior packet for the same fingerprint has already
-        # been delivered to Coder and the exact failure recurs.
-        if task.last_repair_packet.get("failure_id") == packet.failure_id:
-            memory.record(RepairEvidencePacket.from_dict(task.last_repair_packet), "focused-coder", "failed")
-            self._mark(state, "REPAIR", "REPEAT_SUPPRESSED", "Repeated failure recorded; avoid replaying the same focused repair", task)
         task.last_repair_packet = packet.to_dict()
-        state.repair_memory = memory.records
         self._mark(state, "REPAIR", "EVIDENCE_PACKET", f"Prepared {packet.failure_class.value} evidence for {task.capability_id or task.id}", task)
+
+    def _try_focused_repair(
+        self,
+        state: ProjectState,
+        task: Task,
+        command: list[str],
+        failed: CommandResult,
+        validation: ValidationResult,
+    ) -> tuple[list[object], CommandResult, ValidationResult] | None:
+        """Make one evidence-backed repair, then rerun the exact validator.
+
+        This deliberately lives between validation and the legacy strategy
+        decision: evidence packets otherwise became durable dead letters.
+        """
+        repairable = {
+            ValidationOutcome.APPLICATION_FAILURE,
+            ValidationOutcome.APPLICATION_IMPORT_ERROR,
+            ValidationOutcome.DEPENDENCY_API_MISMATCH,
+            ValidationOutcome.TEST_IMPLEMENTATION_BUG,
+            ValidationOutcome.TEST_STATE_ISOLATION_FAILURE,
+        }
+        if validation.kind not in repairable or not task.last_repair_packet:
+            return None
+        packet = RepairEvidencePacket.from_dict(task.last_repair_packet)
+        memory = RepairMemory(state.repair_memory)
+        if memory.should_suppress(packet, "focused-coder"):
+            self._mark(state, "REPAIR", "REPEAT_SUPPRESSED", "Same failure/state/strategy was already tried", task)
+            return None
+        task.phase = TaskPhase.LOCAL_RECOVERY.value
+        self._mark(state, "REPAIR", "FOCUSED_REPAIR_ATTEMPT", f"Focused {packet.failure_class.value} repair", task)
+        evidence = json.dumps(packet.to_dict(), ensure_ascii=False)[:7000]
+        task.errors.append(f"Focused repair evidence: {evidence}")
+        try:
+            actions = self._request_coder_actions(state, task, "Focused evidence-backed Coder repair request", [evidence, *self._coder_file_context(task)])
+            if not actions:
+                raise ValueError("focused repair returned no actions")
+            task.phase = TaskPhase.CODING.value
+            executed = self._execute_coder_actions(state, task, actions)
+            if executed is None:
+                raise ValueError("focused repair superseded its task")
+            task.phase = TaskPhase.VALIDATING.value
+            self._mark(state, "TESTER", "EXACT_VALIDATOR_RERUN", f"Rerunning exact failed validator: {command}", task)
+            result = self._run_validator(state, task, command)
+            state.run_history.append(self._result_log(task, result))
+            rerun = classify_validation_result(result, command, self.workspace)
+            self._mark(state, "TESTER", rerun.kind.value, f"Exact validator outcome: {rerun.kind.value}", task)
+            if result.exit_code == 0:
+                self._mark(state, "TESTER", "EXACT_VALIDATOR_PASS", "Exact validator passed after focused repair", task)
+                memory.record(packet, "focused-coder", "succeeded")
+                state.repair_memory = memory.records
+                self._mark(state, "REPAIR", "FOCUSED_REPAIR_SUCCESS", "Focused repair passed exact validator", task)
+                return executed, result, rerun
+            memory.record(packet, "focused-coder", "failed")
+            state.repair_memory = memory.records
+            self._mark(state, "TESTER", "EXACT_VALIDATOR_FAIL", "Exact validator still failed after focused repair", task)
+            # Initial validation plus an evidence-backed repair are two real
+            # semantic failures; count both so bounded strategy escalation is
+            # based on outcomes, not on arbitrary loop invocations.
+            task.failures_in_strategy += 1
+            self._capture_repair_evidence(state, task, command, rerun.kind, result)
+            self._mark(state, "REPAIR", "FOCUSED_REPAIR_FAILED", "Focused repair did not clear exact validator", task)
+        except (ProviderError, ToolPolicyError, ValueError, KeyError, TypeError) as error:
+            memory.record(packet, "focused-coder", "failed")
+            state.repair_memory = memory.records
+            self._mark(state, "REPAIR", "FOCUSED_REPAIR_FAILED", str(error), task)
+        return None
 
     def _dependency_versions(self, state: ProjectState, detail: str) -> dict[str, str]:
         """Collect only installed public-package versions needed for API research."""
@@ -1212,6 +1288,18 @@ class AutonomousRunner:
         except json.JSONDecodeError:
             return {}
         return {str(key): str(version) for key, version in value.items()} if isinstance(value, dict) else {}
+
+    def _run_validator(self, state: ProjectState, task: Task, command: list[str]) -> CommandResult:
+        """Execute a validator with isolated mutable state when it is a test runner."""
+        if not any(part in {"pytest", "unittest"} for part in command):
+            return self.tools.run_tests(command)
+        manager = ValidationStateManager(self.workspace)
+        test_state = manager.for_validator(task.capability_id or task.id, command)
+        self._mark(state, "TESTER", "TEST_STATE_ISOLATED", f"Using owned test database: {test_state.path.name}", task)
+        try:
+            return self.tools.run_tests(command, test_state.environment)
+        finally:
+            manager.cleanup(test_state)
 
     def _sync_environment_snapshot(self, task: Task) -> None:
         """Keep verified dependency metadata outside application rollback."""
@@ -1306,7 +1394,7 @@ class AutonomousRunner:
                 continue
             executed.add(key)
             self._mark(state, "REGRESSION", "CHECK", f"Regression guard: {check.get('task', 'accepted capability')}", task)
-            result = self.tools.run_tests(command)
+            result = self._run_validator(state, task, command)
             if result.exit_code == 0:
                 continue
             self._mark(state, "REGRESSION", "FAIL", f"Previously accepted capability regressed: {check.get('task', 'unknown')}", task)

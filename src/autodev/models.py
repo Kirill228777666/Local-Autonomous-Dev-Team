@@ -153,6 +153,7 @@ class Task:
     acceptance_criteria: list[str] = field(default_factory=list)
     contract_version: int = 1
     last_repair_packet: dict[str, object] = field(default_factory=dict)
+    acceptance_validator: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None, root_task_id: str | None = None, parent_task_id: str | None = None, failure_fingerprint: str = "", strategy_generation: int = 0, capability_id: str = "", intent: str = "", acceptance_criteria: list[str] | None = None, contract_version: int = 1) -> Task:
@@ -188,6 +189,7 @@ class Task:
             acceptance_criteria=[str(item) for item in value.get("acceptance_criteria", [])],  # type: ignore[arg-type]
             contract_version=int(value.get("contract_version", 1)),
             last_repair_packet=dict(value.get("last_repair_packet", {})),  # type: ignore[arg-type]
+            acceptance_validator=dict(value.get("acceptance_validator", {})),  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:

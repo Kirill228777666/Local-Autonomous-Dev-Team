@@ -21,6 +21,7 @@ class ValidationOutcome(StrEnum):
     APPLICATION_IMPORT_ERROR = "VALIDATION_APPLICATION_IMPORT_ERROR"
     DEPENDENCY_API_MISMATCH = "VALIDATION_DEPENDENCY_API_MISMATCH"
     TEST_IMPLEMENTATION_BUG = "VALIDATION_TEST_IMPLEMENTATION_BUG"
+    TEST_STATE_ISOLATION_FAILURE = "VALIDATION_TEST_STATE_ISOLATION_FAILURE"
     TIMEOUT = "VALIDATION_TIMEOUT"
 
 
@@ -115,6 +116,15 @@ def classify_validation_result(result: CommandResult, command: list[str], worksp
         return ValidationResult(ValidationOutcome.DEPENDENCY_API_MISMATCH, detail)
     if "cannot import name" in lowered:
         return ValidationResult(ValidationOutcome.APPLICATION_IMPORT_ERROR, detail)
+    # Schema missing only while running tests, or unexpectedly accumulated
+    # rows in a test assertion, points to test fixture/database lifecycle.
+    # It is distinct from a product endpoint assertion and must be repaired in
+    # setup/configuration rather than by guessing at business logic.
+    if _is_test_runner(command) and (
+        "no such table" in lowered
+        or ("assertionerror" in lowered and re.search(r"\b\d+\s*!=\s*\d+\b", lowered) is not None and "ran " in lowered)
+    ):
+        return ValidationResult(ValidationOutcome.TEST_STATE_ISOLATION_FAILURE, detail)
     if "unittest.loader._failedtest" in lowered and ("tests" in lowered or "test_" in lowered):
         return ValidationResult(ValidationOutcome.TEST_IMPLEMENTATION_BUG, detail)
     if "importerror" in lowered or "modulenotfounderror" in lowered:
@@ -128,20 +138,45 @@ class ValidationPlanner:
     """Choose a test runner only when repository evidence identifies one."""
 
     @staticmethod
-    def command_for(workspace: Path, task: Task, environment: dict[str, object]) -> list[str] | None:
+    def command_for(workspace: Path, task: Task, environment: dict[str, object], *, acceptance_only: bool = False) -> list[str] | None:
         context = environment.get("execution_context")
         interpreter = context.get("python_interpreter") if isinstance(context, dict) else None
         if not isinstance(interpreter, str) or not interpreter:
             return None
 
         tests = discover_python_tests(workspace)
-        if tests:
-            if _pytest_evidence(workspace, tests):
-                return [interpreter, "-m", "pytest", "-q"]
-            relative_root = _test_root(workspace, tests).relative_to(workspace).as_posix()
-            prefixes = any(path.name.startswith("test_") for path in tests)
-            suffixes = any(path.name.endswith("_test.py") for path in tests)
+        # Generated test files often describe future capabilities.  They are
+        # authoritative only for the explicit test capability; a setup/model/UI
+        # capability must use its own deterministic acceptance instead of all
+        # unfinished tests merely because a tests directory exists.
+        task_text = f"{task.capability_id} {task.title} {task.description}".lower()
+        task_terms = set(re.findall(r"[a-z][a-z0-9_]{2,}", task_text)) - {"implement", "create", "write", "project", "backend", "generic"}
+        relevant_tests = [
+            path for path in tests
+            if set(re.findall(r"[a-z][a-z0-9_]{2,}", path.stem.lower().replace("_", " "))) & task_terms
+        ]
+        owns_tests = any(marker in task_text for marker in ("test", "pytest", "unittest", "тест"))
+        selected_tests = relevant_tests if acceptance_only and relevant_tests else tests
+        # Direct planner callers retain project-wide discovery.  Controller
+        # acceptance mode only takes all tests for the explicit test capability
+        # or test files whose names identify the current capability.
+        if acceptance_only and not owns_tests and not relevant_tests:
+            selected_tests = []
+        if selected_tests:
+            if _pytest_evidence(workspace, selected_tests):
+                command = [interpreter, "-m", "pytest", "-q"]
+                if acceptance_only and not owns_tests:
+                    # A current-capability acceptance probe must not accidentally
+                    # run generated tests for later capabilities.  Pytest accepts
+                    # concrete paths, keeping the validator identity stable.
+                    command.extend(path.relative_to(workspace).as_posix() for path in selected_tests)
+                return command
+            relative_root = _test_root(workspace, selected_tests).relative_to(workspace).as_posix()
+            prefixes = any(path.name.startswith("test_") for path in selected_tests)
+            suffixes = any(path.name.endswith("_test.py") for path in selected_tests)
             pattern = "*.py" if prefixes and suffixes else "*_test.py" if suffixes else "test*.py"
+            if acceptance_only and not owns_tests and len(selected_tests) == 1:
+                pattern = selected_tests[0].name
             return [interpreter, "-m", "unittest", "discover", "-s", relative_root, "-p", pattern]
 
         return ValidationPlanner.fallback_for_no_tests(workspace, task, environment)

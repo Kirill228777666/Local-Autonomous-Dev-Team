@@ -90,6 +90,29 @@ def test_research_failure_is_contained() -> None:
     assert result.error == "timeout"
 
 
+def test_controller_records_research_cache_hit_for_repeated_dependency_evidence(tmp_path) -> None:
+    from autodev.models import ProjectState, Task
+    from autodev.orchestrator import AutonomousRunner
+    from autodev.providers import ScriptedProvider
+    from autodev.state_store import StateStore
+    from autodev.tools import CommandResult, WorkspaceTools
+
+    fetches: list[str] = []
+    research = WebResearch(fetch=lambda url: fetches.append(url) or "<main>official API</main>")
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}), research=research)
+    state = ProjectState.create("Build database")
+    task = Task.create("Database", "Database", capability_id="database.persistence")
+    state.environment = {"execution_context": {"python_interpreter": "missing"}}
+    runner._dependency_versions = lambda *_args: {"SQLAlchemy": "2.0.43"}  # type: ignore[method-assign]
+    result = CommandResult(1, "", "AttributeError: 'Engine' object has no attribute 'has_table'")
+
+    runner._capture_repair_evidence(state, task, ["python", "-m", "pytest"], ValidationOutcome.DEPENDENCY_API_MISMATCH, result)
+    runner._capture_repair_evidence(state, task, ["python", "-m", "pytest"], ValidationOutcome.DEPENDENCY_API_MISMATCH, result)
+
+    assert len(fetches) == 1
+    assert any(event.agent == "RESEARCH" and event.phase == "CACHE_HIT" for event in state.events)
+
+
 def test_failure_router_keeps_application_http_500_with_expected_404_out_of_environment() -> None:
     outcome = route_failure(ValidationOutcome.APPLICATION_FAILURE, "AssertionError: 500 != 404")
 

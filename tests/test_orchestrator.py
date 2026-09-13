@@ -305,7 +305,9 @@ def test_runner_completes_multiple_tasks_and_repairs_a_failed_test(tmp_path: Pat
 
     assert state.status == "COMPLETE"
     assert [task.status for task in state.tasks] == [TaskStatus.DONE, TaskStatus.DONE]
-    assert state.tasks[0].attempts == 2
+    # A repairable validation failure is repaired locally with its exact
+    # evidence; it no longer consumes a second root-task attempt.
+    assert state.tasks[0].attempts == 1
     assert (tmp_path / "artifact.txt").read_text(encoding="utf-8") == "good"
     assert (tmp_path / "second.txt").read_text(encoding="utf-8") == "done"
     assert StateStore(tmp_path).load() is not None

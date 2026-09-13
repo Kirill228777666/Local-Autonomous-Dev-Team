@@ -61,7 +61,7 @@ def test_todo_spec_advances_multiple_autonomous_stages_and_persists_progress(tmp
 
     assert state.status == "COMPLETE"
     assert len(state.tasks) == 2
-    assert state.tasks[0].attempts == 2
+    assert state.tasks[0].attempts == 1
     assert StateStore(tmp_path).load().original_spec == TODO_SPEC.strip()  # type: ignore[union-attr]
-    assert len([entry for entry in state.run_history if "Coder completed" in entry]) == 3
+    assert len([entry for entry in state.run_history if "Coder completed" in entry]) == 2
     assert state.last_checkpoint is not None

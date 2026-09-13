@@ -142,7 +142,7 @@ class WorkspaceTools:
             raise ToolPolicyError("directory deletion is not permitted")
         path.unlink(missing_ok=True)
 
-    def run_command(self, command: list[str]) -> CommandResult:
+    def run_command(self, command: list[str], extra_env: dict[str, str] | None = None) -> CommandResult:
         if not command or not command[0].strip():
             raise ToolPolicyError("command must not be empty")
         if self._is_activation_command(command):
@@ -170,7 +170,7 @@ class WorkspaceTools:
                 text=True,
                 shell=False,
                 creationflags=flags,
-                env={**os.environ, "PYTHONNOUSERSITE": "1"} if self.project_python else None,
+                env={**os.environ, **(extra_env or {}), **({"PYTHONNOUSERSITE": "1"} if self.project_python else {})},
             )
             try:
                 stdout, stderr = process.communicate(timeout=self.command_timeout)
@@ -234,5 +234,5 @@ class WorkspaceTools:
             or first in {"vite", "next"}
         )
 
-    def run_tests(self, command: list[str]) -> CommandResult:
-        return self.run_command(command)
+    def run_tests(self, command: list[str], extra_env: dict[str, str] | None = None) -> CommandResult:
+        return self.run_command(command, extra_env)

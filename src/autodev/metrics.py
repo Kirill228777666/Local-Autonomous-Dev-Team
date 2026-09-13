@@ -101,10 +101,10 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "root_tasks_blocked": sum(task.status.value == "BLOCKED" and task.root_task_id == task.id for task in state.tasks),
         "repair_strategy_changes": sum(task.strategy_generation > 0 for task in state.tasks),
         "repair_failure_packets_created": count("REPAIR", "EVIDENCE_PACKET"),
-        "repair_fingerprints_seen": len({str(item.get("failure_id", "")) for item in state.repair_memory if item.get("failure_id")}),
+        "repair_fingerprints_seen": len({str(task.last_repair_packet.get("failure_id", "")) for task in state.tasks if task.last_repair_packet.get("failure_id")} | {str(item.get("failure_id", "")) for item in state.repair_memory if item.get("failure_id")}),
         "repeat_repairs_suppressed": count("REPAIR", "REPEAT_SUPPRESSED"),
-        "focused_repairs_attempted": sum(item.get("strategy") == "focused-coder" for item in state.repair_memory),
-        "focused_repairs_succeeded": sum(item.get("strategy") == "focused-coder" and item.get("outcome") == "succeeded" for item in state.repair_memory),
+        "focused_repairs_attempted": count("REPAIR", "FOCUSED_REPAIR_ATTEMPT"),
+        "focused_repairs_succeeded": count("REPAIR", "FOCUSED_REPAIR_SUCCESS"),
         "research_escalations": count("RESEARCH", "REQUEST"),
         "repair_attempts_with_research": sum(
             bool(task.last_repair_packet.get("research_evidence")) for task in state.tasks
@@ -171,12 +171,12 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "validation_application_import_errors": count("TESTER", "VALIDATION_APPLICATION_IMPORT_ERROR"),
         "validation_dependency_api_mismatches": count("TESTER", "VALIDATION_DEPENDENCY_API_MISMATCH"),
         "validation_test_implementation_bugs": count("TESTER", "VALIDATION_TEST_IMPLEMENTATION_BUG"),
+        "validation_test_state_isolation_failures": count("TESTER", "VALIDATION_TEST_STATE_ISOLATION_FAILURE"),
+        "isolated_test_validations": count("TESTER", "TEST_STATE_ISOLATED"),
         "validation_timeouts": count("TESTER", "VALIDATION_TIMEOUT"),
-        "exact_validator_reruns": sum(1 for event in events if event.agent == "TESTER" and event.phase == "DETERMINISTIC_VALIDATION" and bool(event.task_id)),
-        "exact_validator_passes": count("TESTER", "VALIDATION_PASS"),
-        "exact_validator_failures": sum(
-            count("TESTER", phase) for phase in ("VALIDATION_APPLICATION_FAIL", "VALIDATION_APPLICATION_IMPORT_ERROR", "VALIDATION_DEPENDENCY_API_MISMATCH", "VALIDATION_TEST_IMPLEMENTATION_BUG")
-        ),
+        "exact_validator_reruns": count("TESTER", "EXACT_VALIDATOR_RERUN"),
+        "exact_validator_passes": count("TESTER", "EXACT_VALIDATOR_PASS"),
+        "exact_validator_failures": count("TESTER", "EXACT_VALIDATOR_FAIL"),
         "exact_validator_repair_successes": sum(
             task.status.value == "DONE" and bool(task.last_repair_packet) for task in state.tasks
         ),

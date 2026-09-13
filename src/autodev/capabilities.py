@@ -175,12 +175,20 @@ def repair_generated_test_for_contract(contract: dict[str, object], content: str
     architecture = contract.get("architecture", {})
     if not isinstance(architecture, dict) or architecture.get("app_factory") is not False:
         return None
-    module = str(architecture.get("application_entry_point", "app.py")).removesuffix(".py").replace("/", ".")
     symbol = str(architecture.get("application_symbol", "app"))
-    expected_import = f"from {module} import create_app"
-    if expected_import not in content or "create_app()" not in content:
+    if "create_app" not in content:
         return None
-    return content.replace(expected_import, f"from {module} import {symbol}").replace("create_app()", symbol)
+    # Preserve the module selected by the generated artifact.  Run-14 used
+    # ``from backend.app import create_app, init_db``; forcing it to ``app.py``
+    # silently changed a lower-authority test into a different application.
+    # Replace only the forbidden imported symbol and its direct call.
+    repaired = re.sub(
+        r"(from\s+[A-Za-z_][\w.]*\s+import\s+[^\n]*?)\bcreate_app\b",
+        lambda match: match.group(1) + symbol,
+        content,
+    )
+    repaired = re.sub(r"\bcreate_app\s*\(\s*\)", symbol, repaired)
+    return repaired if repaired != content and "create_app" not in repaired else None
 
 
 def reviewer_scope_violations(title: str, description: str, contract: dict[str, object], reasons: object) -> list[str]:
