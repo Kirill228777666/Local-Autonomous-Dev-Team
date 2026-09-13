@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 .autodev/
 .e2e-runs/
+.model-eval/
 dist/
 build/
 *.egg-info/

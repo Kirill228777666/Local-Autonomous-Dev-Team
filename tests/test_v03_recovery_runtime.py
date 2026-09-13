@@ -64,7 +64,7 @@ def test_resume_blocks_corrupt_dependency_graph_without_starting_work(tmp_path: 
     assert "dependency" in recovered.run_history[-1].lower()
 
 
-def test_resume_converts_legacy_blocked_task_into_one_bounded_corrective_task(tmp_path: Path) -> None:
+def test_resume_preserves_legacy_blocked_root_without_creating_retry_task(tmp_path: Path) -> None:
     repository(tmp_path)
     task = Task.create("Backend", "Implement backend")
     task.status = TaskStatus.BLOCKED
@@ -76,9 +76,9 @@ def test_resume_converts_legacy_blocked_task_into_one_bounded_corrective_task(tm
 
     recovered = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({})).resume()
 
-    assert recovered.tasks[0].status is TaskStatus.FAILED
-    assert recovered.tasks[1].repair_of == task.id
-    assert recovered.tasks[1].status is TaskStatus.PENDING
+    assert len(recovered.tasks) == 1
+    assert recovered.tasks[0].id == task.id
+    assert recovered.tasks[0].status is TaskStatus.BLOCKED
 
 
 def test_new_process_recovers_state_written_before_controlled_crash(tmp_path: Path) -> None:
@@ -169,6 +169,7 @@ def test_application_screenshot_pipeline_uses_one_dynamic_port_and_stops_server(
 def test_visual_failure_returns_task_for_bounded_repair(tmp_path: Path) -> None:
     repository(tmp_path)
     (tmp_path / "index.html").write_text("<main>Notes</main>", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("main { max-width: 40rem; }", encoding="utf-8")
 
     def capture(_url: str, output: Path, _width: int, _height: int) -> None:
         output.write_bytes(b"fake-png")
@@ -238,10 +239,9 @@ def test_role_agents_repair_malformed_structured_reply_before_returning_it() -> 
     assert reply.data["actions"][0]["kind"] == "write_file"  # type: ignore[index]
 
 
-def test_exhausted_task_creates_one_architect_guided_corrective_task(tmp_path: Path) -> None:
+def test_repeated_task_failure_changes_strategy_on_root_without_corrective_child(tmp_path: Path) -> None:
     repository(tmp_path)
     task = Task.create("Backend", "Implement backend")
-    task.attempts = 3
     state = ProjectState.create("Build Notes")
     state.tasks = [task]
     runner = AutonomousRunner(
@@ -252,12 +252,12 @@ def test_exhausted_task_creates_one_architect_guided_corrective_task(tmp_path: P
     )
 
     runner._retry_or_block(task, state, "Coder error: unavailable dependency")
+    runner._retry_or_block(task, state, "Coder error: unavailable dependency")
 
-    assert task.status is TaskStatus.FAILED
-    corrective = state.tasks[-1]
-    assert corrective.repair_of == task.id
-    assert corrective.status is TaskStatus.PENDING
-    assert "stdlib SQLite" in corrective.description
+    assert state.tasks == [task]
+    assert task.status is TaskStatus.PENDING
+    assert task.strategy_generation == 1
+    assert "stdlib SQLite" in task.strategy_history[-1]
 
 
 def test_missing_tool_executable_is_retried_instead_of_crashing_orchestrator(tmp_path: Path) -> None:

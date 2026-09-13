@@ -176,11 +176,58 @@ class EnvironmentManager:
                     failures.append(fingerprint)
                 dependencies["interpreter"] = str(self.venv_python)
             return result.exit_code == 0
+        if failure.kind is FailureKind.PROJECT_DEPENDENCY_INCOMPATIBLE:
+            lowered = failure.detail.lower()
+            if "sqlalchemy" not in lowered and "typingonly" not in lowered:
+                self.last_diagnostic = "No deterministic package repair is known for this incompatibility."
+                return False
+            if not self.allow_project_dependency_install:
+                self.last_diagnostic = "Project dependency installation is disabled."
+                return False
+            if not self.ensure_python_environment():
+                return False
+            install = self.tools.run_command(
+                [str(self.venv_python), "-m", "pip", "install", "--upgrade", "SQLAlchemy"]
+            )
+            if install.exit_code:
+                self.last_diagnostic = install.stderr or install.stdout
+                return False
+            version = self.tools.run_command(
+                [
+                    str(self.venv_python), "-c",
+                    "import importlib.metadata as m; print(m.version('SQLAlchemy'))",
+                ]
+            )
+            resolved = version.stdout.strip()
+            if version.exit_code or not re.fullmatch(r"[0-9]+(?:\.[0-9A-Za-z]+)+", resolved):
+                self.last_diagnostic = version.stderr or version.stdout or "Could not determine resolved SQLAlchemy version."
+                return False
+            self._persist_requirement("SQLAlchemy", resolved)
+            self.last_diagnostic = f"Resolved SQLAlchemy=={resolved} for the project interpreter."
+            return True
         if failure.kind is FailureKind.MISSING_EXECUTABLE and failure.command and failure.command[0].lower() in {"npm", "node"}:
             if not self.allow_system_package_install:
                 self.last_diagnostic = "Node.js/npm required by chosen architecture but system installation is disabled."
                 return False
         return False
+
+    def _persist_requirement(self, package: str, version: str) -> None:
+        manifest = self.workspace / "requirements.txt"
+        lines = manifest.read_text(encoding="utf-8").splitlines() if manifest.exists() else []
+        matcher = re.compile(rf"^\s*{re.escape(package)}(?:\[[^]]+\])?\s*(?:[<>=!~].*)?$", re.IGNORECASE)
+        replacement = f"{package}=={version}"
+        updated: list[str] = []
+        replaced = False
+        for line in lines:
+            if matcher.match(line):
+                if not replaced:
+                    updated.append(replacement)
+                    replaced = True
+                continue
+            updated.append(line)
+        if not replaced:
+            updated.append(replacement)
+        manifest.write_text("\n".join(updated) + "\n", encoding="utf-8")
 
     def verify(self, failure: Failure) -> bool:
         """Verify the repaired condition without claiming success from an install exit code."""

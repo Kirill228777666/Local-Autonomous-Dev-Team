@@ -109,6 +109,39 @@ def test_llm_completed_metric_never_exceeds_dispatched_requests() -> None:
     assert metrics(state)["llm_responses_completed"] <= metrics(state)["llm_requests_attempted"]
 
 
+def test_provider_request_terminal_outcomes_balance_attempts() -> None:
+    state = ProjectState.create("Build Notes")
+    state.event_counters.update({
+        "PROVIDER_REQUEST:ATTEMPT": 3,
+        "PROVIDER_REQUEST:SUCCESS": 2,
+        "PROVIDER_REQUEST:TIMEOUT": 1,
+    })
+
+    data = metrics(state)
+
+    assert data["llm_requests_attempted"] == 3
+    assert data["llm_responses_completed"] == 2
+    assert data["provider_request_outcomes"] == {"SUCCESS": 2, "TIMEOUT": 1}
+    assert data["provider_request_outcome_gap"] == 0
+
+
+def test_attempt_rollback_metrics_distinguish_acceptance_from_regression() -> None:
+    state = ProjectState.create("Build Notes")
+    first = Task.create("First", "work")
+    first.rollback_count = 2
+    first.rollback_reasons = {"acceptance_failure": 2}
+    second = Task.create("Second", "work")
+    second.rollback_count = 1
+    second.rollback_reasons = {"regression_failure": 1}
+    state.tasks = [first, second]
+
+    data = metrics(state)
+
+    assert data["attempt_rollbacks_total"] == 3
+    assert data["attempt_rollbacks_by_reason"] == {"acceptance_failure": 2, "regression_failure": 1}
+    assert data["regression_rollbacks"] == 1
+
+
 def test_regression_rejection_restores_every_project_file_to_pre_attempt_state(tmp_path: Path) -> None:
     setup_repository(tmp_path)
     (tmp_path / "app.py").write_bytes(b"good app\r\n")

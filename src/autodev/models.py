@@ -142,6 +142,12 @@ class Task:
     parent_task_id: str | None = None
     failure_fingerprint: str = ""
     strategy_generation: int = 0
+    phase: str = "READY"
+    semantic_call_keys: list[str] = field(default_factory=list)
+    failures_in_strategy: int = 0
+    strategy_history: list[str] = field(default_factory=list)
+    rollback_count: int = 0
+    rollback_reasons: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None, root_task_id: str | None = None, parent_task_id: str | None = None, failure_fingerprint: str = "", strategy_generation: int = 0) -> Task:
@@ -166,6 +172,12 @@ class Task:
             parent_task_id=str(value["parent_task_id"]) if value.get("parent_task_id") else None,
             failure_fingerprint=str(value.get("failure_fingerprint", "")),
             strategy_generation=int(value.get("strategy_generation", 0)),
+            phase=str(value.get("phase", "READY")),
+            semantic_call_keys=[str(item) for item in value.get("semantic_call_keys", [])],  # type: ignore[arg-type]
+            failures_in_strategy=int(value.get("failures_in_strategy", 0)),
+            strategy_history=[str(item) for item in value.get("strategy_history", [])],  # type: ignore[arg-type]
+            rollback_count=int(value.get("rollback_count", 0)),
+            rollback_reasons={str(key): int(count) for key, count in dict(value.get("rollback_reasons", {})).items()},  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -202,6 +214,7 @@ class ProjectState:
     provider_state: dict[str, object] = field(default_factory=dict)
     managed_processes: list[dict[str, object]] = field(default_factory=list)
     accepted_regressions: list[dict[str, object]] = field(default_factory=list)
+    provider_request_stats: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def create(cls, original_spec: str) -> ProjectState:
@@ -242,6 +255,7 @@ class ProjectState:
             provider_state=dict(value.get("provider_state", {})),  # type: ignore[arg-type]
             managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
             accepted_regressions=[dict(item) for item in value.get("accepted_regressions", []) if isinstance(item, dict)],  # type: ignore[arg-type]
+            provider_request_stats=dict(value.get("provider_request_stats", {})),  # type: ignore[arg-type]
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -272,6 +286,7 @@ class ProjectState:
             "provider_state": self.provider_state,
             "managed_processes": self.managed_processes[-100:],
             "accepted_regressions": self.accepted_regressions[-20:],
+            "provider_request_stats": self.provider_request_stats,
         }
 
     def record_event(self, agent: str, phase: str, message: str, task_id: str | None = None) -> None:

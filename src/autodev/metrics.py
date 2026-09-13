@@ -8,7 +8,6 @@ from .models import ProjectState
 def metrics(state: ProjectState) -> dict[str, object]:
     events = state.events
     llm_events = [event for event in events if event.phase == "LLM_CALL"]
-    calls_by_role = {role: sum(event.agent == role for event in llm_events) for role in sorted({event.agent for event in llm_events})}
     tool_events = [event for event in events if event.phase == "TOOL_STARTED"]
     try:
         duration_seconds = max(0, int((datetime.fromisoformat(state.updated_at) - datetime.fromisoformat(state.created_at)).total_seconds()))
@@ -17,14 +16,36 @@ def metrics(state: ProjectState) -> dict[str, object]:
     history = state.run_history
     def count(agent: str, phase: str) -> int:
         return state.event_counters.get(f"{agent}:{phase}", sum(event.agent == agent and event.phase == phase for event in events))
+    calls_by_role = {
+        key.split(":", 1)[0]: value
+        for key, value in state.event_counters.items()
+        if key.endswith(":LLM_CALL") and value
+    }
+    if not calls_by_role:
+        calls_by_role = {role: sum(event.agent == role for event in llm_events) for role in sorted({event.agent for event in llm_events})}
+    provider_outcome_names = (
+        "SUCCESS", "CONNECTION_REFUSED", "HTTP_ERROR", "TIMEOUT", "EMPTY_RESPONSE",
+        "MALFORMED_STRUCTURED_OUTPUT", "CANCELLED", "CIRCUIT_INTERRUPTED", "OTHER_ERROR",
+    )
+    provider_outcomes = {name: count("PROVIDER_REQUEST", name) for name in provider_outcome_names if count("PROVIDER_REQUEST", name)}
+    provider_attempts = count("PROVIDER_REQUEST", "ATTEMPT")
+    terminal_provider_outcomes = sum(provider_outcomes.values())
+    legacy_requests = count("LLM", "REQUEST") or sum(calls_by_role.values())
+    legacy_responses = count("LLM", "RESPONSE") or sum(calls_by_role.values())
+    rollback_reasons: dict[str, int] = {}
+    for task in state.tasks:
+        for reason, amount in task.rollback_reasons.items():
+            rollback_reasons[reason] = rollback_reasons.get(reason, 0) + amount
     return {
         "run_start": state.created_at,
         "updated_at": state.updated_at,
         "run_duration_seconds": duration_seconds,
-        "total_llm_calls": len(llm_events),
-        "llm_requests_attempted": count("LLM", "REQUEST") or len(llm_events),
-        "llm_responses_completed": min(count("LLM", "RESPONSE"), count("LLM", "REQUEST") or len(llm_events)),
+        "total_llm_calls": sum(calls_by_role.values()),
+        "llm_requests_attempted": provider_attempts or legacy_requests,
+        "llm_responses_completed": provider_outcomes.get("SUCCESS", 0) if provider_attempts else min(legacy_responses, legacy_requests),
         "llm_calls_by_role": calls_by_role,
+        "provider_request_outcomes": provider_outcomes,
+        "provider_request_outcome_gap": max(0, provider_attempts - terminal_provider_outcomes),
         "total_tool_calls": len(tool_events),
         "tasks_created": len(state.tasks),
         "tasks_completed": sum(task.status.value == "DONE" for task in state.tasks),
@@ -67,7 +88,9 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "task_decompositions": sum("decomposed" in entry.lower() for entry in history),
         "regression_checks": count("REGRESSION", "CHECK"),
         "regression_failures": count("REGRESSION", "FAIL"),
-        "regression_rollbacks": count("REGRESSION", "ROLLBACK"),
+        "attempt_rollbacks_total": sum(task.rollback_count for task in state.tasks),
+        "attempt_rollbacks_by_reason": rollback_reasons,
+        "regression_rollbacks": rollback_reasons.get("regression_failure", count("REGRESSION", "ROLLBACK")),
         "regressive_changes_rejected": sum("REGRESSION:" in entry for entry in history),
         "coder_noop_responses": count("CODER", "NOOP"),
         "coder_noop_already_satisfied": count("CODER", "NOOP_ALREADY_SATISFIED"),

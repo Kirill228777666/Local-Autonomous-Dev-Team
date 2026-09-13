@@ -55,6 +55,20 @@ def test_ollama_provider_sends_low_temperature_and_parses_json_response() -> Non
     assert sent_payloads[0]["think"] is False
 
 
+def test_ollama_provider_can_explicitly_enable_model_thinking() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def transport(_url: str, payload: bytes, _timeout: float) -> bytes:
+        payloads.append(json.loads(payload))
+        return b'{"message":{"content":"{\\"actions\\":[]}"}}'
+
+    OllamaProvider(model="qwen3.6:27b", think=True, transport=transport).complete(
+        AgentRequest(role="CODER", prompt="x")
+    )
+
+    assert payloads[0]["think"] is True
+
+
 def test_ollama_provider_retries_transient_transport_error() -> None:
     attempts = 0
 
@@ -113,3 +127,46 @@ def test_retries_share_one_hard_wall_clock_budget(monkeypatch: pytest.MonkeyPatc
 
     assert reply.data == {"actions": []}
     assert observed_timeouts == [5.0, 1.0]
+
+
+def test_provider_reports_one_terminal_outcome_for_each_http_attempt() -> None:
+    outcomes: list[tuple[str, str]] = []
+    attempts = 0
+
+    def transport(_url: str, _payload: bytes, _timeout: float) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise URLError("connection refused")
+        return b'{"message":{"content":"{\\"actions\\":[]}"}}'
+
+    provider = OllamaProvider(model="qwen", retries=1, transport=transport)
+    provider.set_outcome_observer(lambda role, outcome, _latency: outcomes.append((role, outcome)))
+
+    provider.complete(AgentRequest(role="CODER", prompt="implement"))
+
+    assert outcomes == [
+        ("CODER", "ATTEMPT"),
+        ("CODER", "CONNECTION_REFUSED"),
+        ("CODER", "ATTEMPT"),
+        ("CODER", "SUCCESS"),
+    ]
+
+
+def test_provider_distinguishes_timeout_and_malformed_response_outcomes() -> None:
+    timeout_events: list[str] = []
+    timeout = OllamaProvider(model="qwen", retries=0, transport=lambda *_: (_ for _ in ()).throw(TimeoutError("late")))
+    timeout.set_outcome_observer(lambda _role, outcome, _latency: timeout_events.append(outcome))
+
+    with pytest.raises(ProviderUnavailableError):
+        timeout.complete(AgentRequest(role="CODER", prompt="x"))
+
+    malformed_events: list[str] = []
+    malformed = OllamaProvider(model="qwen", retries=0, transport=lambda *_: b'{"message":{"content":"not json"}}')
+    malformed.set_outcome_observer(lambda _role, outcome, _latency: malformed_events.append(outcome))
+
+    with pytest.raises(ProviderError):
+        malformed.complete(AgentRequest(role="TESTER", prompt="x"))
+
+    assert timeout_events == ["ATTEMPT", "TIMEOUT"]
+    assert malformed_events == ["ATTEMPT", "MALFORMED_STRUCTURED_OUTPUT"]

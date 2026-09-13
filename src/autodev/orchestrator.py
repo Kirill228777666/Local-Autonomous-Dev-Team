@@ -7,12 +7,14 @@ import json
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from .agents import RoleAgents
 from .architecture import default_contract, validate_architecture
+from .controller import FailureDecision, TaskController, TaskPhase
 from .designer import DesignerAgent, detect_ui_project
 from .environment import EnvironmentManager, FailureKind, classify_failure, validate_readme
 from .git import GitError, GitRepository
@@ -23,6 +25,7 @@ from .regression import RegressionRunner
 from .runtime import ManagedProcessManager, ScreenshotPipeline
 from .state_store import StateStore
 from .tools import CommandResult, ToolPolicyError, WorkspaceTools
+from .validation import ValidationPlanner
 
 
 class CommandExecutionError(ValueError):
@@ -30,6 +33,13 @@ class CommandExecutionError(ValueError):
         super().__init__(result.stderr or result.stdout or f"command exited {result.exit_code}")
         self.command = command
         self.result = result
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentRepairOutcome:
+    attempted: bool
+    succeeded: bool
+    result: CommandResult
 
 
 class AutonomousRunner:
@@ -62,6 +72,12 @@ class AutonomousRunner:
         self.designer = DesignerAgent(provider, structured_retries=1)
         self.environment_manager = EnvironmentManager(workspace, tools, allow_project_dependency_install, allow_system_package_install)
         self.process_manager = ManagedProcessManager(self.workspace)
+        self.controller = TaskController(local_failures_per_strategy=2, max_strategy_changes=1)
+        self.validation_planner = ValidationPlanner()
+        self._active_state: ProjectState | None = None
+        set_observer = getattr(provider, "set_outcome_observer", None)
+        if callable(set_observer):
+            set_observer(self._record_provider_outcome)
         self._attempt_snapshots: dict[str, Path] = {}
         # Scripted and third-party providers without a health endpoint return
         # immediately; a real Ollama-backed run can wait through a short restart.
@@ -84,6 +100,7 @@ class AutonomousRunner:
         state = self.store.load()
         if state is None:
             raise ValueError("project is not initialized")
+        self._active_state = state
         if state.status in {"PAUSED", "STOPPED", "COMPLETE", "BLOCKED_PROVIDER"}:
             return state
         if state.status == "WAITING_FOR_MODEL_PROVIDER":
@@ -244,6 +261,7 @@ class AutonomousRunner:
         )
         if interrupted is not None:
             interrupted.status = TaskStatus.PENDING
+            interrupted.phase = TaskPhase.READY.value
             state.current_task_id = None
             state.run_history.append(f"Recovered interrupted task: {interrupted.title}")
             state.record_event("SYSTEM", "RECOVERY", f"Recovered interrupted task: {interrupted.title}", interrupted.id)
@@ -257,22 +275,10 @@ class AutonomousRunner:
 
     @staticmethod
     def _recover_blocked_tasks(state: ProjectState) -> None:
-        """Migrate old terminal failures into one explicit, bounded corrective task."""
-        originals = {task.repair_of for task in state.tasks if task.repair_of}
-        for task in list(state.tasks):
-            if task.status is not TaskStatus.BLOCKED or task.id in originals:
-                continue
-            task.status = TaskStatus.FAILED
-            failure = task.errors[-1] if task.errors else "No persisted failure detail"
-            corrective = Task.create(
-                f"Repair: {task.title}",
-                f"Repair this previously blocked task without repeating the failed approach. Original task: {task.description}\nPersisted failure: {failure}",
-                dependencies=task.dependencies,
-                repair_of=task.id,
-            )
-            state.tasks.append(corrective)
-            state.run_history.append(f"Resume created bounded corrective task: {corrective.title}")
-            state.record_event("MANAGER", "CORRECTIVE", f"Resume created corrective task for {task.title}", corrective.id)
+        """Legacy hook retained without manufacturing retry tasks on resume."""
+        for task in state.tasks:
+            if task.status is TaskStatus.BLOCKED:
+                task.phase = TaskPhase.BLOCKED.value
 
     def add_requirement(self, requirement: str) -> ProjectState:
         if not requirement.strip():
@@ -336,125 +342,126 @@ class AutonomousRunner:
             self.store.save(state)
 
     def _select_next_task(self, state: ProjectState) -> Task | None:
-        done_ids = {task.id for task in state.tasks if task.status is TaskStatus.DONE}
-        pending = [
-            task
-            for task in state.tasks
-            if task.status is TaskStatus.PENDING and all(dependency in done_ids for dependency in task.dependencies)
-        ]
-        if not pending:
-            return None
+        return self.controller.next_ready(state)
+
+    def _request_coder_actions(self, state: ProjectState, task: Task, message: str) -> list[object]:
+        """Make one semantic Coder call with an explicit terminal outcome."""
+        self._mark(state, "CODER", "LLM_CALL", message, task)
         try:
-            self._mark(state, "MANAGER", "LLM_CALL", "Manager task-selection request")
-            requested_id = self.agents.select(state).data.get("next_task_id")
-            self._mark(state, "MANAGER", "LLM_RESPONSE", "Manager selection response received")
-            if isinstance(requested_id, str):
-                selected = next((task for task in pending if task.id == requested_id), None)
-                if selected is not None:
-                    return selected
-        except ProviderUnavailableError as error:
-            self._mark_provider_wait(state, None, str(error))
-            return None
+            actions = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
+        except ProviderUnavailableError:
+            self._mark(state, "CODER", "CODER_PROVIDER_FAILURE", "Coder request interrupted by provider", task)
+            raise
         except ProviderError as error:
-            state.run_history.append(f"Manager selection invalid; using deterministic plan order: {error}")
-        return pending[0]
+            self._mark(state, "CODER", "CODER_MALFORMED_RESPONSE", str(error), task)
+            raise
+        if not isinstance(actions, list):
+            self._mark(state, "CODER", "CODER_MALFORMED_RESPONSE", "Coder response needs an actions array", task)
+            raise ProviderError("Coder response needs an actions array")
+        self._mark(state, "CODER", "LLM_RESPONSE", "Coder response received", task)
+        if actions:
+            self._mark(state, "CODER", "CODER_ACTIONS", f"Coder returned {len(actions)} tool action(s)", task)
+        else:
+            self._mark(state, "CODER", "NOOP", "Coder returned no tool actions", task)
+        return actions
+
+    def _execute_coder_actions(self, state: ProjectState, task: Task, initial: list[object]) -> list[object] | None:
+        """Execute actions while keeping recoverable tool failures inside this attempt."""
+        actions = initial
+        tool_recoveries = 0
+        policy_recoveries = 0
+        policy_recovery_pending = False
+        position = 0
+        while position < len(actions):
+            action = actions[position]
+            try:
+                if isinstance(action, dict) and action.get("kind") == "run_command" and self._known_missing_npm(state, action.get("command")):
+                    self._pivot_to_static_frontend(state, task)
+                    return None
+                self._execute_action(state, task, action)
+                if policy_recovery_pending:
+                    policy_recovery_pending = False
+                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS", "Targeted recovery action executed", task)
+            except CommandExecutionError as error:
+                if error.result.exit_code == 125:
+                    self._reroute_server_command(state, task, error.command)
+                    state.tool_executions[-1].finish(ToolExecutionStatus.SUCCEEDED, "rerouted to managed process")
+                    position += 1
+                    continue
+                failure = classify_failure(error.result, error.command, self.workspace)
+                if failure.kind is FailureKind.MISSING_EXECUTABLE and error.command[0].lower() in {"npm", "node"}:
+                    self._pivot_to_static_frontend(state, task)
+                    return None
+                environment = self._repair_environment_failure(state, task, error.command, error.result)
+                if environment.attempted:
+                    if environment.succeeded and environment.result.exit_code == 0:
+                        position += 1
+                        continue
+                    raise CommandExecutionError(error.command, environment.result)
+                raise
+            except ValueError as error:
+                if "edit target was not found" not in str(error) or tool_recoveries >= 2:
+                    raise
+                path = action.get("path") if isinstance(action, dict) else None
+                if not isinstance(path, str):
+                    raise
+                _hash, current = self.tools.file_snapshot(path)
+                task.errors.append(f"Tool stale edit recovery for {path}; current content: {current[-4000:]}")
+                tool_recoveries += 1
+                self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing stale edit context for {path}", task)
+                actions = self._request_coder_actions(state, task, "Coder stale-edit recovery request")
+                position = 0
+                continue
+            except ToolPolicyError as error:
+                if "DESTRUCTIVE_WRITE_REQUIRES_TARGETED_EDIT_OR_CURRENT_FULL_FILE" not in str(error):
+                    raise
+                if policy_recoveries >= 2:
+                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Targeted recovery budget exhausted", task)
+                    raise
+                path = action.get("path") if isinstance(action, dict) else None
+                if not isinstance(path, str):
+                    raise
+                _hash, current = self.tools.file_snapshot(path)
+                task.errors.append(
+                    f"Whole-file replacement rejected for {path}. Use edit_file against current content; preserve unrelated functionality:\n{current[-4000:]}"
+                )
+                policy_recoveries += 1
+                policy_recovery_pending = True
+                self._mark(state, "CODER", "DESTRUCTIVE_WRITE_REJECTED", f"Whole-file write rejected for {path}", task)
+                self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing current file for targeted edit: {path}", task)
+                actions = self._request_coder_actions(state, task, "Coder targeted-edit recovery request")
+                position = 0
+                continue
+            position += 1
+        if policy_recovery_pending:
+            self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Recovery response contained no executable targeted action", task)
+            raise ToolPolicyError("DESTRUCTIVE_WRITE_RECOVERY_FAILED")
+        return actions
 
     def _run_task(self, state: ProjectState, task: Task) -> None:
-        task.status = TaskStatus.RUNNING
+        self._active_state = state
+        task.phase = TaskPhase.READY.value
+        self.controller.transition(task, TaskPhase.CODING)
         state.current_task_id = task.id
         task.attempts += 1
         self._mark(state, "CODER", "IMPLEMENTING", f"Coder started attempt {task.attempts}: {task.title}", task)
         before_files = self._source_fingerprints()
         self._begin_attempt_snapshot(task)
         try:
-            self._mark(state, "CODER", "LLM_CALL", "Coder implementation request", task)
-            actions = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
-            self._mark(state, "CODER", "LLM_RESPONSE", "Coder implementation response received", task)
-            if not isinstance(actions, list):
-                raise ProviderError("Coder response needs an actions array")
-            if not actions:
-                self._mark(state, "CODER", "NOOP", "Coder returned no tool actions", task)
+            if not self.controller.register_semantic_call(task, before_files):
+                self._mark(state, "CONTROLLER", "LOOP_SUPPRESSED", "Suppressed duplicate semantic Coder call", task)
+                self._retry_or_block(task, state, "Identical semantic Coder call suppressed by loop breaker", "loop_suppressed")
+                return
+            actions = self._request_coder_actions(state, task, "Coder implementation request")
             fingerprint = hashlib.sha256(json.dumps(actions, sort_keys=True).encode()).hexdigest()
             if fingerprint in task.action_fingerprints:
                 self._block(task, state, "repeated identical coder action without progress")
                 return
             task.action_fingerprints.append(fingerprint)
-            tool_recoveries = 0
-            policy_recoveries = 0
-            policy_recovery_pending = False
-            position = 0
-            while position < len(actions):
-                action = actions[position]
-                try:
-                    if isinstance(action, dict) and action.get("kind") == "run_command" and self._known_missing_npm(state, action.get("command")):
-                        self._pivot_to_static_frontend(state, task)
-                        return
-                    self._execute_action(state, task, action)
-                    if policy_recovery_pending:
-                        policy_recovery_pending = False
-                        self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_SUCCESS", "Targeted recovery action executed", task)
-                except CommandExecutionError as error:
-                    if error.result.exit_code == 125:
-                        self._reroute_server_command(state, task, error.command)
-                        # The execution was rejected only to move it to the managed path.
-                        state.tool_executions[-1].finish(ToolExecutionStatus.SUCCEEDED, "rerouted to managed process")
-                        position += 1
-                        continue
-                    failure = classify_failure(error.result, error.command, self.workspace)
-                    if failure.kind is FailureKind.MISSING_EXECUTABLE and error.command[0].lower() in {"npm", "node"}:
-                        self._pivot_to_static_frontend(state, task)
-                        return
-                    if self._repair_environment_failure(state, task, error.command, error.result):
-                        position += 1
-                        continue
-                    raise
-                except ValueError as error:
-                    if "edit target was not found" not in str(error) or tool_recoveries >= 2:
-                        raise
-                    path = action.get("path") if isinstance(action, dict) else None
-                    if not isinstance(path, str):
-                        raise
-                    _hash, current = self.tools.file_snapshot(path)
-                    task.errors.append(f"Tool stale edit recovery for {path}; current content: {current[-4000:]}")
-                    tool_recoveries += 1
-                    self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing stale edit context for {path}", task)
-                    self._mark(state, "CODER", "LLM_CALL", "Coder stale-edit recovery request", task)
-                    refreshed = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
-                    self._mark(state, "CODER", "LLM_RESPONSE", "Coder stale-edit recovery response received", task)
-                    if not isinstance(refreshed, list):
-                        raise ProviderError("Coder tool recovery response needs actions")
-                    actions = refreshed
-                    position = 0
-                    continue
-                except ToolPolicyError as error:
-                    if "DESTRUCTIVE_WRITE_REQUIRES_TARGETED_EDIT_OR_CURRENT_FULL_FILE" not in str(error):
-                        raise
-                    if policy_recoveries >= 2:
-                        self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Targeted recovery budget exhausted", task)
-                        raise
-                    path = action.get("path") if isinstance(action, dict) else None
-                    if not isinstance(path, str):
-                        raise
-                    _hash, current = self.tools.file_snapshot(path)
-                    task.errors.append(
-                        f"Whole-file replacement rejected for {path}. Use edit_file against current content; preserve unrelated functionality:\n{current[-4000:]}"
-                    )
-                    policy_recoveries += 1
-                    policy_recovery_pending = True
-                    self._mark(state, "CODER", "DESTRUCTIVE_WRITE_REJECTED", f"Whole-file write rejected for {path}", task)
-                    self._mark(state, "CODER", "TOOL_RECOVERY", f"Refreshing current file for targeted edit: {path}", task)
-                    self._mark(state, "CODER", "LLM_CALL", "Coder targeted-edit recovery request", task)
-                    refreshed = self.agents.code(state, task, self._coder_file_context(task)).data.get("actions")
-                    self._mark(state, "CODER", "LLM_RESPONSE", "Coder targeted-edit recovery response received", task)
-                    if not isinstance(refreshed, list):
-                        raise ProviderError("Coder policy recovery response needs actions")
-                    actions = refreshed
-                    position = 0
-                    continue
-                position += 1
-            if policy_recovery_pending:
-                self._mark(state, "CODER", "DESTRUCTIVE_WRITE_RECOVERY_FAILED", "Recovery response contained no executable targeted action", task)
-                raise ToolPolicyError("DESTRUCTIVE_WRITE_RECOVERY_FAILED")
+            executed = self._execute_coder_actions(state, task, actions)
+            if executed is None:
+                return
+            actions = executed
             if before_files == self._source_fingerprints() and any(isinstance(action, dict) and action.get("kind") in {"write_file", "edit_file", "append_file", "delete_file"} for action in actions):
                 self._mark(state, "CODER", "ZERO_DIFF", "Coder file actions produced no semantic file change", task)
             state.run_history.append(f"Coder completed attempt {task.attempts} for {task.title}")
@@ -463,13 +470,13 @@ class AutonomousRunner:
             self._mark_provider_wait(state, task, str(error))
             return
         except ProviderError as error:
-            self._retry_or_block(task, state, f"Coder response invalid: {error}")
+            self._retry_or_block(task, state, f"Coder response invalid: {error}", "malformed_model_action")
             return
         except (ToolPolicyError, ValueError, KeyError, TypeError) as error:
-            self._retry_or_block(task, state, f"Coder error: {error}")
+            self._retry_or_block(task, state, f"Coder error: {error}", "policy_failure")
             return
 
-        task.status = TaskStatus.TESTING
+        self.controller.transition(task, TaskPhase.VALIDATING)
         if "readme" in task.title.lower() or "documentation" in task.title.lower():
             documentation = validate_readme(self.workspace)
             command = ["README validator"]
@@ -478,12 +485,17 @@ class AutonomousRunner:
         else:
             try:
                 self._mark(state, "TESTER", "TESTING", f"Tester verifying: {task.title}", task)
-                self._mark(state, "TESTER", "LLM_CALL", "Tester verification request", task)
-                reply = self.agents.test(state, task).data
-                self._mark(state, "TESTER", "LLM_RESPONSE", "Tester verification response received", task)
-                command = reply.get("command")
-                if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-                    raise ProviderError("Tester response needs a string command array")
+                deterministic = self.validation_planner.command_for(self.workspace, task, state.environment)
+                if deterministic is not None:
+                    command = deterministic
+                    self._mark(state, "TESTER", "DETERMINISTIC_VALIDATION", f"Selected deterministic validator: {command}", task)
+                else:
+                    self._mark(state, "TESTER", "LLM_CALL", "Tester verification request", task)
+                    reply = self.agents.test(state, task).data
+                    self._mark(state, "TESTER", "LLM_RESPONSE", "Tester verification response received", task)
+                    command = reply.get("command")
+                    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+                        raise ProviderError("Tester response needs a string command array")
                 if self._known_missing_npm(state, command):
                     self._pivot_to_static_frontend(state, task)
                     return
@@ -534,20 +546,43 @@ class AutonomousRunner:
             if result.exit_code != 0:
                 if not actions:
                     self._mark(state, "CODER", "NOOP_FAILED_ACCEPTANCE", "No-op Coder response did not satisfy acceptance", task)
+                    task.errors.append(
+                        "Acceptance is proven failing after a no-action response. "
+                        f"Command: {command!r}; exit={result.exit_code}; "
+                        f"stdout={result.stdout[-2000:]}; stderr={result.stderr[-2000:]}. "
+                        "Make a concrete targeted change; another no-action answer is insufficient unless the validator is invalid."
+                    )
+                    task.phase = TaskPhase.LOCAL_RECOVERY.value
+                    self._mark(state, "CODER", "NOOP_EVIDENCE_REPROMPT", "Retrying no-op locally with exact acceptance evidence", task)
+                    recovered = self._request_coder_actions(state, task, "Coder no-op evidence recovery request")
+                    if recovered:
+                        task.phase = TaskPhase.CODING.value
+                        executed = self._execute_coder_actions(state, task, recovered)
+                        if executed is None:
+                            return
+                        actions = executed
+                        task.phase = TaskPhase.VALIDATING.value
+                        result = self.tools.run_tests(command)
+                        state.run_history.append(self._result_log(task, result))
+                    else:
+                        self._mark(state, "CODER", "REPEATED_NOOP", "Evidence recovery also returned no actions", task)
                 failure = classify_failure(result, command, self.workspace)
                 if failure.kind is FailureKind.MISSING_EXECUTABLE and command[0].lower() in {"npm", "node"}:
                     self._pivot_to_static_frontend(state, task)
                     return
-                if self._repair_environment_failure(state, task, command, result):
-                    result = self.tools.run_tests(command)
+                environment = self._repair_environment_failure(state, task, command, result)
+                if environment.attempted:
+                    result = environment.result
                 if result.exit_code == 0:
                     state.run_history.append(self._result_log(task, result))
                 else:
-                    self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}")
+                    rollback_reason = "noop_failed_acceptance" if not actions else "acceptance_failure"
+                    self._retry_or_block(task, state, f"Test failed (exit {result.exit_code}): {result.stderr or result.stdout}", rollback_reason)
                     return
         elif not actions:
             self._mark(state, "CODER", "NOOP_ALREADY_SATISFIED", "No-op Coder response passed acceptance", task)
 
+        task.phase = TaskPhase.REGRESSION_CHECK.value
         if not self._run_accepted_regressions(state, task, command):
             return
         if not self._visual_review(state, task):
@@ -559,6 +594,7 @@ class AutonomousRunner:
             self._retry_or_block(task, state, "; ".join(conflicts))
             return
 
+        task.phase = TaskPhase.REVIEW.value
         task.status = TaskStatus.REVIEW
         try:
             self._mark(state, "REVIEWER", "REVIEW", f"Reviewer evaluating: {task.title}", task)
@@ -579,11 +615,13 @@ class AutonomousRunner:
             return
 
         try:
+            task.phase = TaskPhase.CHECKPOINT.value
             state.last_checkpoint = GitRepository(self.workspace).checkpoint(f"autodev: {task.title}")
         except GitError as error:
             self._retry_or_block(task, state, f"Git checkpoint failed: {error}")
             return
         self._discard_attempt_snapshot(task)
+        task.phase = TaskPhase.DONE.value
         task.status = TaskStatus.DONE
         self._record_accepted_regression(state, task, command)
         if task.repair_of:
@@ -734,48 +772,34 @@ class AutonomousRunner:
             raise ValueError(f"action needs string '{key}'")
         return value
 
-    def _retry_or_block(self, task: Task, state: ProjectState, error: str) -> None:
+    def _retry_or_block(self, task: Task, state: ProjectState, error: str, rollback_reason: str = "other") -> None:
         self._stop_task_processes(state, task)
-        self._rollback_attempt_snapshot(task, state)
+        self._rollback_attempt_snapshot(task, state, rollback_reason)
         task.errors.append(error)
-        if task.attempts >= self.max_attempts:
-            if task.repair_of is not None:
-                self._block(task, state, error)
-                return
+        decision = self.controller.decide_failure(task, error)
+        if decision is FailureDecision.STRATEGY_CHANGE:
+            task.phase = TaskPhase.STRATEGY_CHANGE.value
             self._diagnose(state, task)
             if state.status in {"WAITING_FOR_MODEL_PROVIDER", "BLOCKED_PROVIDER"}:
                 return
-            task.status = TaskStatus.FAILED
-            state.current_task_id = None
             diagnosis = next(
                 (decision for decision in reversed(state.decisions) if f"Architect diagnosis for {task.title}:" in decision),
                 "No Architect diagnosis available",
             )
-            fingerprint = hashlib.sha256(error.encode("utf-8")).hexdigest()
-            root_id = task.root_task_id or task.id
-            if any(candidate.root_task_id == root_id and candidate.failure_fingerprint == fingerprint for candidate in state.tasks):
-                self._block(task, state, f"Duplicate corrective strategy suppressed: {error}")
-                self._mark(state, "MANAGER", "DUPLICATE_CORRECTIVE_SUPPRESSED", "Suppressed duplicate corrective task", task)
-                return
-            corrective = Task.create(
-                f"Repair: {task.title}",
-                f"Repair the failed task without repeating its broken approach. Original task: {task.description}\nFailure: {error}\n{diagnosis}",
-                dependencies=task.dependencies,
-                repair_of=task.id,
-                root_task_id=root_id,
-                parent_task_id=task.id,
-                failure_fingerprint=fingerprint,
-                strategy_generation=task.strategy_generation + 1,
-            )
-            state.tasks.append(corrective)
-            state.run_history.append(f"Created Architect-guided corrective task: {corrective.title}")
-            self._mark(state, "MANAGER", "CORRECTIVE", f"Created corrective task for failed work: {task.title}", corrective)
+            self.controller.apply_strategy(task, diagnosis)
+            state.current_task_id = None
+            state.run_history.append(f"Changed strategy for root task: {task.title}; {diagnosis}")
+            self._mark(state, "CONTROLLER", "STRATEGY_CHANGED", f"Changed strategy for root task: {task.title}", task)
             return
-        if len(task.errors) >= 2:
-            self._diagnose(state, task)
-            if state.status in {"WAITING_FOR_MODEL_PROVIDER", "BLOCKED_PROVIDER"}:
-                return
+        if decision is FailureDecision.BLOCK:
+            self.controller.block(task, error)
+            state.current_task_id = None
+            state.run_history.append(f"Task blocked: {task.title}; {error}")
+            self._mark(state, "CONTROLLER", "BLOCKED_ROOT_TASK", error, task)
+            return
+        task.phase = TaskPhase.READY.value
         task.status = TaskStatus.PENDING
+        state.current_task_id = None
         state.run_history.append(f"Returning task to Coder: {task.title}; {error}")
 
     def _decompose_broad_tasks(self, state: ProjectState) -> None:
@@ -857,13 +881,13 @@ class AutonomousRunner:
             state.run_history.append(f"Manager decomposed broad task: {task.title}")
             self._mark(state, "MANAGER", "DECOMPOSED", f"Decomposed broad task: {task.title}")
 
-    def _repair_environment_failure(self, state: ProjectState, task: Task, command: list[str], result: CommandResult) -> bool:
+    def _repair_environment_failure(self, state: ProjectState, task: Task, command: list[str], result: CommandResult) -> EnvironmentRepairOutcome:
         failure = classify_failure(result, command, self.workspace)
         state.run_history.append(f"Failure classified: {failure.kind.value}")
         self._mark(state, "ENVIRONMENT", failure.kind.value, f"Classified command failure: {failure.kind.value}", task)
         if failure.kind in {FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
             state.run_history.append("Test harness diagnostic: check cwd/package layout/PYTHONPATH before code repair")
-            return False
+            return EnvironmentRepairOutcome(False, False, result)
         repairable = {
             FailureKind.MISSING_PYTHON_DEPENDENCY,
             FailureKind.MISSING_EXECUTABLE,
@@ -872,19 +896,51 @@ class AutonomousRunner:
         }
         if failure.kind not in repairable:
             self._mark(state, "ENVIRONMENT", "REPAIR_SKIPPED", f"No deterministic environment repair for: {failure.kind.value}", task)
-            return False
+            return EnvironmentRepairOutcome(False, False, result)
+        previous_phase = task.phase
+        task.phase = TaskPhase.ENVIRONMENT_REPAIR.value
         self._mark(state, "ENVIRONMENT", "REPAIR_ATTEMPT", f"Environment repair attempt: {failure.kind.value}", task)
         repaired = self.environment_manager.repair(failure, state.environment)
-        if repaired and self.environment_manager.verify(failure):
+        if not repaired:
+            task.phase = previous_phase
+            self._mark(state, "ENVIRONMENT", "REPAIR_FAILED", f"Environment repair could not be applied: {failure.kind.value}", task)
+            if self.environment_manager.last_diagnostic:
+                state.run_history.append(f"Environment limitation: {self.environment_manager.last_diagnostic}")
+            return EnvironmentRepairOutcome(True, False, result)
+        retried = self.tools.run_command(command)
+        original_fingerprint = self.controller.failure_fingerprint(f"{failure.kind.value}\n{failure.detail}")
+        if retried.exit_code:
+            repeated = classify_failure(retried, command, self.workspace)
+            repeated_fingerprint = self.controller.failure_fingerprint(f"{repeated.kind.value}\n{repeated.detail}")
+        else:
+            repeated_fingerprint = ""
+        cleared = retried.exit_code == 0 or repeated_fingerprint != original_fingerprint
+        task.phase = previous_phase
+        if cleared:
             state.environment["execution_context"] = self.environment_manager.execution_context()
             state.run_history.append(f"Environment repair completed: {failure.kind.value}")
             self._mark(state, "ENVIRONMENT", "REPAIRED", f"Environment repair completed: {failure.kind.value}", task)
-            return True
-        if repaired:
-            self._mark(state, "ENVIRONMENT", "REPAIR_FAILED", f"Environment repair did not clear: {failure.kind.value}", task)
+            self._mark(state, "ENVIRONMENT", "REPAIR_SUCCEEDED", f"Original failure cleared: {failure.kind.value}", task)
+            self._sync_environment_snapshot(task)
+            return EnvironmentRepairOutcome(True, True, retried)
+        self._mark(state, "ENVIRONMENT", "REPAIR_FAILED", f"Environment repair did not clear: {failure.kind.value}", task)
         if self.environment_manager.last_diagnostic:
             state.run_history.append(f"Environment limitation: {self.environment_manager.last_diagnostic}")
-        return False
+        return EnvironmentRepairOutcome(True, False, retried)
+
+    def _sync_environment_snapshot(self, task: Task) -> None:
+        """Keep verified dependency metadata outside application rollback."""
+        directory = self._attempt_snapshots.get(task.id)
+        if directory is None:
+            return
+        for name in ("requirements.txt", "pyproject.toml", "poetry.lock", "package.json", "package-lock.json"):
+            source = self.workspace / name
+            target = directory / name
+            if source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+            elif target.exists():
+                target.unlink()
 
     def _is_python_project(self, state: ProjectState) -> bool:
         contract = state.architecture
@@ -949,7 +1005,7 @@ class AutonomousRunner:
             if result.exit_code == 0:
                 continue
             self._mark(state, "REGRESSION", "FAIL", f"Previously accepted capability regressed: {check.get('task', 'unknown')}", task)
-            self._retry_or_block(task, state, f"REGRESSION: accepted capability {check.get('task')} failed: {result.stderr or result.stdout}")
+            self._retry_or_block(task, state, f"REGRESSION: accepted capability {check.get('task')} failed: {result.stderr or result.stdout}", "regression_failure")
             return False
         return True
 
@@ -1034,7 +1090,10 @@ class AutonomousRunner:
         """A model outage must never consume a coding attempt or create a repair."""
         if task.attempts > 0:
             task.attempts -= 1
+        if task.semantic_call_keys:
+            task.semantic_call_keys.pop()
         task.status = TaskStatus.PENDING
+        task.phase = TaskPhase.READY.value
         state.current_task_id = None
         state.event_counters["PROVIDER:TASK_ATTEMPT_PRESERVED"] = state.event_counters.get("PROVIDER:TASK_ATTEMPT_PRESERVED", 0) + 1
 
@@ -1109,9 +1168,8 @@ class AutonomousRunner:
             self._mark(state, "PROVIDER", "INCIDENT_DEDUPLICATED", "Provider incident already open", task)
 
     def _block(self, task: Task, state: ProjectState, reason: str) -> None:
-        self._rollback_attempt_snapshot(task, state)
-        task.status = TaskStatus.BLOCKED
-        task.errors.append(reason)
+        self._rollback_attempt_snapshot(task, state, "other")
+        self.controller.block(task, reason)
         state.current_task_id = None
         state.run_history.append(f"Task blocked: {task.title}; {reason}")
 
@@ -1133,7 +1191,7 @@ class AutonomousRunner:
             shutil.copyfile(source, target)
         self._attempt_snapshots[task.id] = directory
 
-    def _rollback_attempt_snapshot(self, task: Task, state: ProjectState) -> None:
+    def _rollback_attempt_snapshot(self, task: Task, state: ProjectState, reason: str = "other") -> None:
         directory = self._attempt_snapshots.pop(task.id, None)
         if directory is None or not directory.is_dir():
             return
@@ -1151,7 +1209,11 @@ class AutonomousRunner:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
         state.run_history.append(f"Attempt rolled back to pre-attempt workspace: {task.title}")
-        self._mark(state, "REGRESSION", "ROLLBACK", f"Rolled back rejected attempt: {task.title}", task)
+        task.rollback_count += 1
+        task.rollback_reasons[reason] = task.rollback_reasons.get(reason, 0) + 1
+        self._mark(state, "CONTROLLER", "ATTEMPT_ROLLBACK", f"Rolled back rejected attempt ({reason}): {task.title}", task)
+        if reason == "regression_failure":
+            self._mark(state, "REGRESSION", "ROLLBACK", f"Rolled back regressive attempt: {task.title}", task)
 
     def _discard_attempt_snapshot(self, task: Task) -> None:
         directory = self._attempt_snapshots.pop(task.id, None)
@@ -1178,8 +1240,17 @@ class AutonomousRunner:
             attempt=task.attempts if task is not None else 0,
         )
         state.record_event(agent, phase, message, task.id if task is not None else state.current_task_id)
-        if phase == "LLM_CALL":
-            state.event_counters["LLM:REQUEST"] = state.event_counters.get("LLM:REQUEST", 0) + 1
-        elif phase == "LLM_RESPONSE":
-            state.event_counters["LLM:RESPONSE"] = state.event_counters.get("LLM:RESPONSE", 0) + 1
         self.store.save(state)
+
+    def _record_provider_outcome(self, role: str, outcome: str, latency: float) -> None:
+        state = self._active_state
+        if state is None:
+            return
+        key = f"PROVIDER_REQUEST:{outcome}"
+        state.event_counters[key] = state.event_counters.get(key, 0) + 1
+        totals = state.provider_request_stats.setdefault("latency_ms_total_by_role", {})
+        maxima = state.provider_request_stats.setdefault("max_latency_ms_by_role", {})
+        if isinstance(totals, dict) and isinstance(maxima, dict) and outcome != "ATTEMPT":
+            milliseconds = latency * 1000.0
+            totals[role] = float(totals.get(role, 0.0)) + milliseconds
+            maxima[role] = max(float(maxima.get(role, 0.0)), milliseconds)

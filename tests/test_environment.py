@@ -26,6 +26,23 @@ class RecordingTools:
         return self.replies.pop(0) if self.replies else CommandResult(0, "ok", "")
 
 
+class IncompatibilityRepairTools(RecordingTools):
+    def run_command(self, command: list[str]) -> CommandResult:
+        self.commands.append(command)
+        if "venv" in command and "-m" in command:
+            executable = self.workspace / ".venv" / "Scripts" / "python.exe"  # type: ignore[operator]
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_text("", encoding="utf-8")
+            return CommandResult(0, "", "")
+        if command[-3:-1] == ["-m", "pip"] or "install" in command:
+            return CommandResult(0, "installed SQLAlchemy-2.0.52", "")
+        if "importlib.metadata" in " ".join(command):
+            return CommandResult(0, "2.0.52\n", "")
+        if command[-2:] == ["-m", "unittest"]:
+            return CommandResult(0, "14 tests passed", "")
+        return CommandResult(0, "ok", "")
+
+
 def test_classifier_identifies_environment_failures_before_llm_repair() -> None:
     assert classify_failure(CommandResult(1, "", "ModuleNotFoundError: No module named 'flask'"), ["py", "-3", "app.py"]).kind is FailureKind.MISSING_PYTHON_DEPENDENCY
     assert classify_failure(CommandResult(127, "", "command not found: npm"), ["npm", "install"]).kind is FailureKind.MISSING_EXECUTABLE
@@ -84,6 +101,59 @@ def test_missing_npm_is_policy_aware_and_never_attempts_npm_install(tmp_path: Pa
     assert manager.repair(failure) is False
     assert manager.last_diagnostic == "Node.js/npm required by chosen architecture but system installation is disabled."
     assert not any(command[0] == "npm" for command in tools.commands)
+
+
+def test_python314_sqlalchemy_incompatibility_upgrades_and_persists_resolved_version(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_text(
+        "Flask==2.3.3\nFlask-SQLAlchemy==3.1.1\nSQLAlchemy==2.0.23\n", encoding="utf-8"
+    )
+    tools = IncompatibilityRepairTools(workspace=tmp_path)
+    manager = EnvironmentManager(tmp_path, tools)
+    failure = classify_failure(
+        CommandResult(1, "", "AssertionError: SQLCoreOperations inherits TypingOnly with __static_attributes__"),
+        ["python", "-m", "unittest"],
+        tmp_path,
+    )
+
+    assert manager.repair(failure) is True
+    assert "SQLAlchemy==2.0.52" in (tmp_path / "requirements.txt").read_text(encoding="utf-8")
+    assert "SQLAlchemy==2.0.23" not in (tmp_path / "requirements.txt").read_text(encoding="utf-8")
+    assert any("--upgrade" in command and "SQLAlchemy" in command for command in tools.commands)
+
+
+def test_environment_repair_reruns_original_command_and_survives_application_rollback(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_text("SQLAlchemy==2.0.23\n", encoding="utf-8")
+    tools = IncompatibilityRepairTools(workspace=tmp_path)
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), tools, ScriptedProvider({}))
+    task = Task.create("Backend", "Validate imports")
+    state = ProjectState.create("Build backend")
+    state.tasks = [task]
+    runner._begin_attempt_snapshot(task)
+    original = CommandResult(1, "", "AssertionError: SQLCoreOperations inherits TypingOnly with __static_attributes__")
+
+    outcome = runner._repair_environment_failure(state, task, ["python", "-m", "unittest"], original)
+    runner._rollback_attempt_snapshot(task, state, "acceptance_failure")
+
+    assert outcome.succeeded is True
+    assert outcome.result.exit_code == 0
+    assert any(command[-2:] == ["-m", "unittest"] for command in tools.commands)
+    assert "SQLAlchemy==2.0.52" in (tmp_path / "requirements.txt").read_text(encoding="utf-8")
+    assert state.event_counters["ENVIRONMENT:REPAIR_SUCCEEDED"] == 1
+
+
+def test_environment_repair_that_does_not_clear_original_failure_is_terminal_failure(tmp_path: Path) -> None:
+    tools = IncompatibilityRepairTools(workspace=tmp_path)
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), tools, ScriptedProvider({}))
+    task = Task.create("Backend", "Validate imports")
+    state = ProjectState.create("Build backend")
+    original = CommandResult(1, "", "AssertionError: SQLCoreOperations inherits TypingOnly with __static_attributes__")
+    tools.run_command = lambda command: original  # type: ignore[method-assign]
+
+    outcome = runner._repair_environment_failure(state, task, ["python", "-m", "unittest"], original)
+
+    assert outcome.attempted is True
+    assert outcome.succeeded is False
+    assert state.event_counters["ENVIRONMENT:REPAIR_FAILED"] == 1
 
 
 def test_readme_validator_checks_instructions_without_running_them(tmp_path: Path) -> None:
