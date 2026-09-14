@@ -81,6 +81,15 @@ def _is_test_runner(command: list[str]) -> bool:
     return "unittest" in command or "pytest" in command
 
 
+def requires_behavioral_validation(task: Task) -> bool:
+    """Whether syntax-only validation would be insufficient for this task."""
+    text = " ".join((task.capability_id, task.title, task.description, *task.acceptance_criteria)).lower()
+    return task.capability_id.startswith("api.") or any(
+        marker in text
+        for marker in (" get /", " post /", " put /", " delete /", "search", "filter", "favorite", "endpoint", "crud")
+    )
+
+
 def _test_start_directory(command: list[str]) -> str | None:
     try:
         index = command.index("-s")
@@ -89,7 +98,13 @@ def _test_start_directory(command: list[str]) -> str | None:
     return command[index + 1] if index + 1 < len(command) else None
 
 
-def classify_validation_result(result: CommandResult, command: list[str], workspace: Path) -> ValidationResult:
+def classify_validation_result(
+    result: CommandResult,
+    command: list[str],
+    workspace: Path,
+    *,
+    state_evidence: dict[str, object] | None = None,
+) -> ValidationResult:
     """Classify validator evidence without confusing test results with bad CLI syntax."""
     detail = f"{result.stdout}\n{result.stderr}".strip()
     lowered = detail.lower()
@@ -116,14 +131,12 @@ def classify_validation_result(result: CommandResult, command: list[str], worksp
         return ValidationResult(ValidationOutcome.DEPENDENCY_API_MISMATCH, detail)
     if "cannot import name" in lowered:
         return ValidationResult(ValidationOutcome.APPLICATION_IMPORT_ERROR, detail)
-    # Schema missing only while running tests, or unexpectedly accumulated
-    # rows in a test assertion, points to test fixture/database lifecycle.
-    # It is distinct from a product endpoint assertion and must be repaired in
-    # setup/configuration rather than by guessing at business logic.
-    if _is_test_runner(command) and (
-        "no such table" in lowered
-        or ("assertionerror" in lowered and re.search(r"\b\d+\s*!=\s*\d+\b", lowered) is not None and "ran " in lowered)
-    ):
+    # A missing table while a test runner is active is concrete setup/schema
+    # evidence. A business assertion such as ``0 != 1`` is not: it can be a
+    # filter, serialization or endpoint defect and remains application logic.
+    state_evidence = state_evidence or {}
+    proven_state_leak = bool(state_evidence.get("shared_database") or state_evidence.get("test_database_consumed") is False)
+    if _is_test_runner(command) and ("no such table" in lowered or proven_state_leak):
         return ValidationResult(ValidationOutcome.TEST_STATE_ISOLATION_FAILURE, detail)
     if "unittest.loader._failedtest" in lowered and ("tests" in lowered or "test_" in lowered):
         return ValidationResult(ValidationOutcome.TEST_IMPLEMENTATION_BUG, detail)
@@ -151,10 +164,14 @@ class ValidationPlanner:
         # unfinished tests merely because a tests directory exists.
         task_text = f"{task.capability_id} {task.title} {task.description}".lower()
         task_terms = set(re.findall(r"[a-z][a-z0-9_]{2,}", task_text)) - {"implement", "create", "write", "project", "backend", "generic"}
-        relevant_tests = [
-            path for path in tests
-            if set(re.findall(r"[a-z][a-z0-9_]{2,}", path.stem.lower().replace("_", " "))) & task_terms
-        ]
+        acceptance_text = " ".join(task.acceptance_criteria).lower()
+        acceptance_terms = set(re.findall(r"[a-z][a-z0-9_]{2,}", acceptance_text)) - {"the", "and", "with", "only", "gets", "get", "post", "put", "delete", "true", "from"}
+        relevant_tests = []
+        for path in tests:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            content_terms = set(re.findall(r"[a-z][a-z0-9_]{2,}", (path.stem + " " + content).lower().replace("_", " ")))
+            if content_terms & (task_terms | acceptance_terms):
+                relevant_tests.append(path)
         owns_tests = any(marker in task_text for marker in ("test", "pytest", "unittest", "тест"))
         selected_tests = relevant_tests if acceptance_only and relevant_tests else tests
         # Direct planner callers retain project-wide discovery.  Controller
@@ -179,6 +196,10 @@ class ValidationPlanner:
                 pattern = selected_tests[0].name
             return [interpreter, "-m", "unittest", "discover", "-s", relative_root, "-p", pattern]
 
+        # Contract-derived API behavior must have executable behavior evidence.
+        # Compilation remains useful as a precheck but cannot approve the task.
+        if acceptance_only and requires_behavioral_validation(task):
+            return None
         return ValidationPlanner.fallback_for_no_tests(workspace, task, environment)
 
     @staticmethod

@@ -153,7 +153,11 @@ class WorkspaceTools:
         executable = Path(command[0]).name.lower()
         if executable in self._BLOCKED_COMMANDS:
             raise ToolPolicyError(f"command '{command[0]}' is not permitted")
-        app_server = any(
+        # A source filename is not enough: ``python -m compileall app.py`` is
+        # finite even when app.py defines Flask. Server protection applies only
+        # to direct interpreter execution of that source.
+        runs_python_script = len(command) >= 2 and Path(command[0]).name.lower() in {"python", "python.exe", "py", "py.exe"} and command[1] not in {"-m", "-c"}
+        app_server = runs_python_script and any(
             part.endswith("app.py") and (self.workspace / part).is_file()
             and any(marker in (self.workspace / part).read_text(encoding="utf-8", errors="ignore") for marker in ("Flask(", "app.run(", "uvicorn.run("))
             for part in command

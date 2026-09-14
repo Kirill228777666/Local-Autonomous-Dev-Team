@@ -123,7 +123,9 @@ def test_test_state_evidence_is_classified_separately_from_application_logic(tmp
     leaked_rows = classify_validation_result(CommandResult(1, "", "AssertionError: 8 != 1\nRan 11 tests"), [sys.executable, "-m", "unittest"], tmp_path)
 
     assert missing_schema.kind is ValidationOutcome.TEST_STATE_ISOLATION_FAILURE
-    assert leaked_rows.kind is ValidationOutcome.TEST_STATE_ISOLATION_FAILURE
+    # A count mismatch alone is ordinary product behavior evidence; isolation
+    # requires concrete lifecycle/schema evidence, not a guess from a number.
+    assert leaked_rows.kind is ValidationOutcome.APPLICATION_FAILURE
     assert route_failure(missing_schema.kind) is FailureClass.TEST_STATE_ISOLATION_FAILURE
 
 
@@ -152,11 +154,12 @@ def test_capability_validator_identity_is_persisted_and_reused_after_repair(tmp_
 
 def test_real_controller_dependency_api_failure_researches_then_repairs(tmp_path: Path) -> None:
     _repository(tmp_path)
-    command = [sys.executable, "-c", "from pathlib import Path; exec(\"raise AttributeError(\\\"Engine has no attribute has_table\\\")\") if not Path('fixed.txt').exists() else None"]
+    command = [sys.executable, "-c", "from pathlib import Path; exec(\"raise AttributeError(\\\"Engine has no attribute has_table\\\")\") if not Path('fixed.json').exists() else None"]
     provider = ScriptedProvider({
         "CODER": [
-            AgentReply({"actions": [{"kind": "write_file", "path": "seed.txt", "content": "seed"}]}),
-            AgentReply({"actions": [{"kind": "write_file", "path": "fixed.txt", "content": "fixed"}]}),
+            AgentReply({"actions": [{"kind": "write_file", "path": "seed.json", "content": "{}\n"}]}),
+            AgentReply({"actions": [{"kind": "run_command", "command": [sys.executable, "-c", "print('diagnosis only')"]}]}),
+            AgentReply({"actions": [{"kind": "write_file", "path": "fixed.json", "content": "{}\n"}]}),
         ],
         "TESTER": [AgentReply({"command": command})],
         "REVIEWER": [AgentReply({"approved": True, "reasons": []})],
@@ -176,3 +179,6 @@ def test_real_controller_dependency_api_failure_researches_then_repairs(tmp_path
     assert observed["research_escalations"] == 1
     assert observed["repair_attempts_with_research"] == 1
     assert observed["research_backed_repair_successes"] == 1
+    assert observed["focused_repairs_succeeded"] == 1
+    assert observed["exact_validator_passes"] == 1
+    assert any(event.phase == "DIAGNOSIS_ONLY" for event in state.events)

@@ -51,6 +51,7 @@ class RepairEvidencePacket:
     failed_command: list[str]
     validator_type: str
     failure_class: FailureClass
+    source_validator_run_id: str = ""
     exception_type: str = ""
     exception_message: str = ""
     relevant_stdout: str = ""
@@ -63,7 +64,7 @@ class RepairEvidencePacket:
     research_evidence: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
-    def from_validation(cls, *, capability_id: str, contract_version: int, attempt_number: int, command: list[str], outcome: ValidationOutcome, result: CommandResult, contract: dict[str, object], dependency_versions: dict[str, str] | None = None, acceptance_intent: list[str] | None = None, protected_capabilities: list[str] | None = None, previous_repair_strategies: list[str] | None = None) -> "RepairEvidencePacket":
+    def from_validation(cls, *, capability_id: str, contract_version: int, attempt_number: int, command: list[str], outcome: ValidationOutcome, result: CommandResult, contract: dict[str, object], dependency_versions: dict[str, str] | None = None, acceptance_intent: list[str] | None = None, protected_capabilities: list[str] | None = None, previous_repair_strategies: list[str] | None = None, source_validator_run_id: str = "") -> "RepairEvidencePacket":
         detail = f"{result.stderr}\n{result.stdout}".strip()
         exception = re.search(r"([A-Za-z_][\w.]*Error|AttributeError|KeyError):\s*([^\n]+)", detail)
         message = exception.group(2).strip() if exception else detail[-1200:]
@@ -72,7 +73,7 @@ class RepairEvidencePacket:
         return cls(
             hashlib.sha256(fingerprint_data.encode("utf-8")).hexdigest(), capability_id, contract_version, attempt_number,
             list(command), "test" if any(item in {"pytest", "unittest"} for item in command) else "command",
-            route_failure(outcome, detail), exception_type, message, result.stdout[-2000:], result.stderr[-2000:],
+            route_failure(outcome, detail), source_validator_run_id, exception_type, message, result.stdout[-2000:], result.stderr[-2000:],
             dependency_versions or {}, acceptance_intent or [], contract, protected_capabilities or [], previous_repair_strategies or [],
         )
 
@@ -100,6 +101,7 @@ class RepairEvidencePacket:
             failed_command=[str(item) for item in value.get("failed_command", []) if isinstance(item, str)],
             validator_type=str(value.get("validator_type", "command")),
             failure_class=failure_class,
+            source_validator_run_id=str(value.get("source_validator_run_id", "")),
             exception_type=str(value.get("exception_type", "")),
             exception_message=str(value.get("exception_message", "")),
             relevant_stdout=str(value.get("relevant_stdout", "")),

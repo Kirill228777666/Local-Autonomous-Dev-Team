@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -154,6 +155,7 @@ class Task:
     contract_version: int = 1
     last_repair_packet: dict[str, object] = field(default_factory=dict)
     acceptance_validator: dict[str, object] = field(default_factory=dict)
+    last_validator_run_id: str = ""
 
     @classmethod
     def create(cls, title: str, description: str, dependencies: list[str] | None = None, repair_of: str | None = None, root_task_id: str | None = None, parent_task_id: str | None = None, failure_fingerprint: str = "", strategy_generation: int = 0, capability_id: str = "", intent: str = "", acceptance_criteria: list[str] | None = None, contract_version: int = 1) -> Task:
@@ -190,6 +192,7 @@ class Task:
             contract_version=int(value.get("contract_version", 1)),
             last_repair_packet=dict(value.get("last_repair_packet", {})),  # type: ignore[arg-type]
             acceptance_validator=dict(value.get("acceptance_validator", {})),  # type: ignore[arg-type]
+            last_validator_run_id=str(value.get("last_validator_run_id", "")),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -231,6 +234,9 @@ class ProjectState:
     provider_state: dict[str, object] = field(default_factory=dict)
     managed_processes: list[dict[str, object]] = field(default_factory=list)
     accepted_regressions: list[dict[str, object]] = field(default_factory=list)
+    # Immutable acceptance evidence. Coder tool outcomes deliberately do not
+    # live here: only a designated validator may decide task acceptance.
+    validator_runs: list[dict[str, object]] = field(default_factory=list)
     provider_request_stats: dict[str, object] = field(default_factory=dict)
     terminal_status: str = ""
     terminal_reason: str = ""
@@ -279,6 +285,7 @@ class ProjectState:
             provider_state=dict(value.get("provider_state", {})),  # type: ignore[arg-type]
             managed_processes=[dict(item) for item in value.get("managed_processes", []) if isinstance(item, dict)],  # type: ignore[arg-type]
             accepted_regressions=[dict(item) for item in value.get("accepted_regressions", []) if isinstance(item, dict)],  # type: ignore[arg-type]
+            validator_runs=[dict(item) for item in value.get("validator_runs", []) if isinstance(item, dict)],  # type: ignore[arg-type]
             provider_request_stats=dict(value.get("provider_request_stats", {})),  # type: ignore[arg-type]
             terminal_status=str(value.get("terminal_status", "")),
             terminal_reason=str(value.get("terminal_reason", "")),
@@ -317,6 +324,7 @@ class ProjectState:
             "provider_state": self.provider_state,
             "managed_processes": self.managed_processes[-100:],
             "accepted_regressions": self.accepted_regressions[-20:],
+            "validator_runs": self.validator_runs[-300:],
             "provider_request_stats": self.provider_request_stats,
             "terminal_status": self.terminal_status,
             "terminal_reason": self.terminal_reason,
@@ -327,3 +335,44 @@ class ProjectState:
         key = f"{agent}:{phase}"
         self.event_counters[key] = self.event_counters.get(key, 0) + 1
         self.events = self.events[-500:]
+
+    def record_validator_result(
+        self,
+        *,
+        task: Task,
+        validator_id: str,
+        command: list[str],
+        result: object,
+        failure_class: str,
+        previous_validator_run_id: str | None,
+        execution_backend: str = "workspace-tools",
+        related_tool_call_id: str | None = None,
+    ) -> dict[str, object]:
+        """Persist one immutable, capability-owned validator outcome."""
+        run_id = str(uuid4())
+        stdout = str(getattr(result, "stdout", ""))
+        stderr = str(getattr(result, "stderr", ""))
+        exit_code = int(getattr(result, "exit_code", 1))
+        fingerprint_source = "\n".join((task.capability_id or task.id, failure_class, stdout[-1200:], stderr[-1200:]))
+        record: dict[str, object] = {
+            "validator_run_id": run_id,
+            "capability_id": task.capability_id or task.id,
+            "validator_id": validator_id,
+            "validator_kind": "test" if any(part in {"pytest", "unittest"} for part in command) else "command",
+            "exact_command": list(command),
+            "cwd": "workspace",
+            "start_time": utc_now(),
+            "end_time": utc_now(),
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "failure_class": failure_class,
+            "failure_fingerprint": hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest(),
+            "execution_backend": execution_backend,
+            "related_tool_call_id": related_tool_call_id,
+            "previous_validator_run_id": previous_validator_run_id,
+        }
+        self.validator_runs.append(record)
+        self.validator_runs = self.validator_runs[-300:]
+        task.last_validator_run_id = run_id
+        return record
