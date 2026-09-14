@@ -47,6 +47,14 @@ class DestructiveWriteRecoveryError(TaskFailureError):
     """A bounded safe-edit recovery could not produce a valid mutation."""
 
 
+class ProtocolRecoveryExhaustedError(TaskFailureError):
+    """Structured transport could not yield a bounded action batch.
+
+    This is deliberately not a semantic Coder failure.  It is handled by a
+    protocol-only terminal path and must never reach ``_retry_or_block``.
+    """
+
+
 class CoderActionBatch(list[object]):
     """One bounded Coder response plus its non-semantic continuation state."""
 
@@ -104,6 +112,7 @@ class AutonomousRunner:
         if callable(set_observer):
             set_observer(self._record_provider_outcome)
         self._attempt_snapshots: dict[str, Path] = {}
+        self.protocol_recovery_budget = 2
         # Scripted and third-party providers without a health endpoint return
         # immediately; a real Ollama-backed run can wait through a short restart.
         self.provider_wait_seconds = (
@@ -485,7 +494,7 @@ class AutonomousRunner:
         message: str,
         relevant_files: list[str] | None = None,
         *,
-        protocol_recovery_used: bool = False,
+        protocol_recovery_count: int = 0,
     ) -> CoderActionBatch:
         """Make one semantic Coder call with an explicit terminal outcome."""
         self._mark(state, "CODER", "LLM_CALL", message, task)
@@ -497,14 +506,20 @@ class AutonomousRunner:
             self._mark(state, "CODER", "CODER_PROVIDER_FAILURE", "Coder request interrupted by provider", task)
             raise
         except ProviderError as error:
-            if not protocol_recovery_used and self._is_coder_protocol_failure(str(error)):
-                self._mark(state, "CODER", "CODER_PROTOCOL_RECOVERY", "Malformed/truncated Coder output; requesting only the next bounded action batch", task)
+            if self._is_coder_protocol_failure(str(error)):
+                if "payload" in str(error).lower() or "batch" in str(error).lower():
+                    self._mark(state, "CODER", "CODER_OVERSIZED_BATCH", "Coder batch exceeded the protocol payload limit", task)
+                if protocol_recovery_count >= self.protocol_recovery_budget:
+                    self._mark(state, "CODER", "CODER_PROTOCOL_RECOVERY_EXHAUSTED", "Bounded Coder protocol recovery budget exhausted", task)
+                    raise ProtocolRecoveryExhaustedError("CODER_PROTOCOL_RECOVERY_EXHAUSTED") from error
+                next_count = protocol_recovery_count + 1
+                self._mark(state, "CODER", "CODER_PROTOCOL_RECOVERY", f"Protocol recovery {next_count}/{self.protocol_recovery_budget}: request only the next small action batch", task)
                 return self._request_coder_actions(
                     state,
                     task,
-                    "Coder bounded protocol recovery request",
+                    "Coder bounded protocol recovery request: return ONLY the next small action batch; do not repeat prior implementation; maximum 4 actions and 12000 text characters; use task_status.",
                     relevant_files,
-                    protocol_recovery_used=True,
+                    protocol_recovery_count=next_count,
                 )
             invalid_count = self.agents.last_structured_invalid_count if self.agents.last_structured_role == "CODER" else 0
             for _ in range(invalid_count):
@@ -525,6 +540,8 @@ class AutonomousRunner:
         if task_status not in {"continue", "ready_for_validation"}:
             raise ProviderError("Coder response has invalid task_status")
         self._mark(state, "CODER", "LLM_RESPONSE", "Coder response received", task)
+        if protocol_recovery_count:
+            self._mark(state, "CODER", "CODER_PROTOCOL_RECOVERY_SUCCESS", f"Protocol recovery succeeded after {protocol_recovery_count} sub-attempt(s)", task)
         if actions:
             self._mark(state, "CODER", "CODER_ACTIONS", f"Coder returned {len(actions)} tool action(s)", task)
         else:
@@ -736,6 +753,9 @@ class AutonomousRunner:
         except ProviderUnavailableError as error:
             self._preserve_task_for_provider_wait(task, state)
             self._mark_provider_wait(state, task, str(error))
+            return
+        except ProtocolRecoveryExhaustedError as error:
+            self._terminate_protocol_only_attempt(task, state, str(error))
             return
         except ProviderError as error:
             self._retry_or_block(task, state, f"Coder response invalid: {error}", "malformed_model_action")
@@ -1882,6 +1902,38 @@ class AutonomousRunner:
         self.controller.block(task, reason)
         state.current_task_id = None
         state.run_history.append(f"Task blocked: {task.title}; {reason}")
+
+    def _terminate_protocol_only_attempt(self, task: Task, state: ProjectState, reason: str) -> None:
+        """End a no-tool transport failure without consuming semantic budget."""
+        if self._attempt_workspace_changed(task):
+            # Earlier continuation batches can have mutated the workspace. Keep
+            # attempt atomic, but label this separately from application or
+            # acceptance rollback accounting.
+            self._rollback_attempt_snapshot(task, state, "protocol_failure")
+        else:
+            self._discard_attempt_snapshot(task)
+        task.errors.append(reason)
+        self.controller.block(task, reason)
+        state.current_task_id = None
+        state.run_history.append(f"Protocol-only task termination: {task.title}; {reason}")
+        self._mark(state, "CODER", "CODER_PROTOCOL_FAILURE", reason, task)
+
+    def _attempt_workspace_changed(self, task: Task) -> bool:
+        directory = self._attempt_snapshots.get(task.id)
+        if directory is None or not directory.is_dir():
+            return False
+        baseline = {
+            path.relative_to(directory): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in directory.rglob("*")
+            if path.is_file()
+        }
+        current: dict[Path, str] = {}
+        for path in self.workspace.rglob("*"):
+            relative = path.relative_to(self.workspace)
+            if self._snapshot_excluded(relative) or not path.is_file():
+                continue
+            current[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return current != baseline
 
     def _validation_unavailable(self, state: ProjectState, task: Task, command: list[str], detail: str) -> None:
         """Stop safely when the selected validator supplied no usable evidence.

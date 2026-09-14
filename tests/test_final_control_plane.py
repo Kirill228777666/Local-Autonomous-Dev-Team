@@ -48,6 +48,27 @@ class TruncatedThenValidProvider(ScriptedProvider):
         return super().complete(request)
 
 
+class ProtocolSequenceProvider:
+    """A provider sequence matching the live truncation/oversize chain."""
+
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = list(responses)
+        self.calls: list[str] = []
+
+    def set_outcome_observer(self, _observer: object) -> None:
+        return None
+
+    def complete(self, request: AgentRequest) -> AgentReply:
+        self.calls.append(request.role)
+        if request.role != "CODER":
+            raise AssertionError(f"unexpected role: {request.role}")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        assert isinstance(response, AgentReply)
+        return response
+
+
 def test_stdlib_only_contract_rejects_generated_external_import() -> None:
     contract = build_project_contract(
         "Build a Python service using the Python standard library ONLY. No external Python dependencies.",
@@ -284,3 +305,56 @@ def test_truncated_coder_protocol_recovers_with_small_next_batch(tmp_path: Path)
     assert actions == []
     assert provider.calls == 2
     assert any(event.phase == "CODER_PROTOCOL_RECOVERY" for event in state.events)
+
+
+def test_protocol_exhaustion_is_not_a_semantic_retry_or_architect_escalation(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    oversized = AgentReply({"actions": [{"kind": "write_file", "path": "app.py", "content": "x" * 12_001}]})
+    provider = ProtocolSequenceProvider([
+        ProviderError("Unterminated string starting at character 46000"),
+        oversized, oversized,  # RoleAgent schema repair #1
+        oversized, oversized,  # protocol recovery #2 exhausts
+    ])
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)  # type: ignore[arg-type]
+    parent = Task.create("Setup", "Create project setup")
+    child = Task.create("Dependent", "Must wait", dependencies=[parent.id])
+    state = ProjectState.create("Build a static application")
+    state.tasks = [parent, child]
+    runner.store.save(state)
+
+    result = runner.run(max_cycles=3)
+
+    blocked_parent, waiting_child = result.tasks
+    assert blocked_parent.attempts == 1
+    assert blocked_parent.status is TaskStatus.BLOCKED
+    assert waiting_child.attempts == 0
+    assert result.status == "BLOCKED"
+    assert result.terminal_status == "BLOCKED"
+    assert not result.tool_executions
+    assert not any(event.agent == "ARCHITECT" for event in result.events)
+    assert not any(event.phase == "ATTEMPT_ROLLBACK" for event in result.events)
+    assert any(event.phase == "CODER_PROTOCOL_RECOVERY_EXHAUSTED" for event in result.events)
+    observed = metrics(result)
+    assert observed["coder_semantic_attempts"] == 1
+    assert observed["semantic_retry_count"] == 0
+    assert observed["coder_protocol_recovery_exhaustions"] == 1
+    assert observed["protocol_only_attempt_terminations"] == 1
+
+
+def test_protocol_recovery_success_keeps_same_semantic_attempt(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    provider = ProtocolSequenceProvider([
+        ProviderError("Unterminated string starting at character 46000"),
+        AgentReply({"actions": [{"kind": "write_file", "path": "value.txt", "content": "ok"}], "task_status": "ready_for_validation"}),
+    ])
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)  # type: ignore[arg-type]
+    state = ProjectState.create("Build a static application")
+    task = Task.create("Write value", "Write a value")
+    state.tasks = [task]
+
+    actions = runner._request_coder_actions(state, task, "Coder implementation request")
+    runner._execute_coder_actions(state, task, actions)
+
+    assert task.attempts == 0
+    assert (tmp_path / "value.txt").read_text(encoding="utf-8") == "ok"
+    assert sum(event.phase == "CODER_PROTOCOL_RECOVERY_SUCCESS" for event in state.events) == 1

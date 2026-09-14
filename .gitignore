@@ -9,6 +9,7 @@ __pycache__/
 .pytest-final-smokes/
 .pytest-first-failure-*/
 .pytest-stale-*/
+.pytest-protocol-*/
 .pytest-debug/
 .benchmark/
 .venv/

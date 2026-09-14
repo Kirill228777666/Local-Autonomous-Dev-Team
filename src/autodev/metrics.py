@@ -152,10 +152,17 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "controller_fatal_errors": count("SYSTEM", "CRASHED"),
         "system_crashes": count("SYSTEM", "CRASHED"),
         "coder_action_batches": count("CODER", "CODER_ACTIONS"),
+        "coder_semantic_attempts": sum(task.attempts for task in state.tasks),
+        "semantic_retry_count": sum(max(0, task.attempts - 1) for task in state.tasks),
         "coder_continuation_batches": count("CODER", "BATCH_CONTINUATION"),
-        "coder_protocol_recoveries": count("CODER", "CODER_STRUCTURED_OUTPUT_REPAIR"),
+        "coder_protocol_recovery_attempts": count("CODER", "CODER_PROTOCOL_RECOVERY"),
+        "coder_protocol_recovery_successes": count("CODER", "CODER_PROTOCOL_RECOVERY_SUCCESS"),
+        "coder_protocol_recovery_exhaustions": count("CODER", "CODER_PROTOCOL_RECOVERY_EXHAUSTED"),
+        "coder_protocol_recoveries": count("CODER", "CODER_PROTOCOL_RECOVERY") + count("CODER", "CODER_STRUCTURED_OUTPUT_REPAIR"),
         "coder_protocol_recovery_failures": count("CODER", "CODER_STRUCTURED_OUTPUT_BLOCKED"),
         "coder_malformed_responses": count("CODER", "CODER_MALFORMED_RESPONSE"),
+        "coder_oversized_batches": count("CODER", "CODER_OVERSIZED_BATCH"),
+        "protocol_only_attempt_terminations": count("CODER", "CODER_PROTOCOL_FAILURE"),
         "mixed_validation_failure_groups": sum(
             len(record.get("secondary_failure_classes", []))
             for record in state.validator_runs
