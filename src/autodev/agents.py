@@ -47,19 +47,43 @@ class RoleAgents:
     def code(self, state: ProjectState, task: Task, relevant_files: list[str] | None = None) -> AgentReply:
         schema = (
             "Return {\"actions\":[...],\"task_status\":\"continue\"|\"ready_for_validation\"}. Each action must be exactly one of: "
-            "{\"kind\":\"write_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
-            "{\"kind\":\"edit_file\",\"path\":\"relative/path\",\"old\":\"exact text\",\"new\":\"replacement\"}; "
+            "{\"kind\":\"mutate_file\",\"path\":\"relative/path\",\"intent\":\"small concrete mutation goal\"}; "
             "{\"kind\":\"delete_file\",\"path\":\"relative/path\"}; "
             "{\"kind\":\"read_file\",\"path\":\"relative/path\"}; "
-            "{\"kind\":\"append_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
             "{\"kind\":\"run_command\",\"command\":[\"program\",\"arg\"]}; "
             "{\"kind\":\"start_process\",\"command\":[\"program\",\"arg\"]}. "
-            "Return at most 4 actions and at most 12000 total text characters in one batch. "
+            "For every source change use mutate_file: NEVER place source text, a full file, a patch, old text, or new text in this decision response. "
+            "The controller will request one bounded patch for each mutation. Return at most 4 actions. "
             "Use task_status=continue after a bounded batch; the controller will persist it and request the next batch in the same attempt. "
             "For a valid no-op return exactly {\"actions\":[],\"task_status\":\"ready_for_validation\"}; never emit an action with empty content. "
-            "Prefer read_file then targeted edit for existing files. Paths must be relative to the workspace; do not use shell wrappers.\n\n"
+            "Paths must be relative to the workspace; do not use shell wrappers.\n\n"
         )
         return self._ask("CODER", schema + self.context.for_task(state, task, relevant_files or []), self._valid_actions)
+
+    def patch(
+        self,
+        state: ProjectState,
+        task: Task,
+        *,
+        path: str,
+        intent: str,
+        current: str,
+        existing: bool,
+        continuation: int,
+    ) -> AgentReply:
+        """Ask for one independently bounded mutation, never a task-sized body."""
+        mode = "existing" if existing else "new"
+        prompt = (
+            "Return exactly one JSON patch object for this one file. No prose. "
+            "Schema: {\"operation\":\"create\"|\"append\"|\"replace\",\"content\":str,\"old\":str optional for replace,\"done\":bool}. "
+            "content and old together must contain at most 6000 characters. "
+            "For an existing file use replace with exact old text from the supplied context, or append. "
+            "For a new file use create first; if more content is needed, set done=false and return only the next section. "
+            "Never return a full unrelated file or repeat earlier sections.\n\n"
+            f"Path: {path}\nFile state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
+            f"CURRENT RELEVANT CONTENT:\n{current}"
+        )
+        return self._ask("CODER", prompt, self._valid_patch)
 
     def test(self, state: ProjectState, task: Task) -> AgentReply:
         instruction = (
@@ -135,7 +159,7 @@ class RoleAgents:
             raise ValueError("task_status must be continue or ready_for_validation")
         if len(actions) > 4:
             raise ValueError("action batch exceeds maximum action count")
-        required = {"write_file": ("path", "content"), "append_file": ("path", "content"), "edit_file": ("path", "old", "new"), "delete_file": ("path",), "read_file": ("path",), "run_command": ("command",), "start_process": ("command",)}
+        required = {"mutate_file": ("path", "intent"), "write_file": ("path", "content"), "append_file": ("path", "content"), "edit_file": ("path", "old", "new"), "delete_file": ("path",), "read_file": ("path",), "run_command": ("command",), "start_process": ("command",)}
         textual_payload = 0
         for action in actions:
             # Some local models label the discriminator ``action``.  This is
@@ -155,6 +179,24 @@ class RoleAgents:
                     textual_payload += len(value)
         if textual_payload > 12_000:
             raise ValueError("action batch textual payload exceeds maximum")
+
+    @staticmethod
+    def _valid_patch(data: dict[str, object]) -> None:
+        operation = data.get("operation")
+        if operation not in {"create", "append", "replace"}:
+            raise ValueError("patch operation is invalid")
+        content = data.get("content")
+        if not isinstance(content, str) or not content:
+            raise ValueError("patch content must be non-empty text")
+        old = data.get("old", "")
+        if operation == "replace" and (not isinstance(old, str) or not old):
+            raise ValueError("replace patch requires non-empty old text")
+        if operation != "replace" and old not in {"", None}:
+            raise ValueError("only replace patch may supply old text")
+        if not isinstance(data.get("done"), bool):
+            raise ValueError("patch done must be boolean")
+        if len(content) + (len(old) if isinstance(old, str) else 0) > 6_000:
+            raise ValueError("patch textual payload exceeds maximum")
 
     @staticmethod
     def _valid_command(data: dict[str, object]) -> None:

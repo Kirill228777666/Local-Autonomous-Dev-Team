@@ -14,7 +14,7 @@ class RecordingProvider:
         return AgentReply({"actions": []})
 
 
-def test_coder_prompt_documents_the_only_supported_action_schema() -> None:
+def test_coder_prompt_uses_small_mutation_decisions_instead_of_source_bodies() -> None:
     provider = RecordingProvider()
     state = ProjectState.create("Create a text file")
     task = Task.create("Write file", "Create hello.txt")
@@ -22,8 +22,8 @@ def test_coder_prompt_documents_the_only_supported_action_schema() -> None:
     RoleAgents(provider).code(state, task)
 
     prompt = provider.requests[0].prompt
-    assert "write_file" in prompt
-    assert "edit_file" in prompt
+    assert "mutate_file" in prompt
+    assert "NEVER place source text" in prompt
     assert "run_command" in prompt
     assert "start_process" in prompt
 

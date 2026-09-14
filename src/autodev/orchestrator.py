@@ -55,6 +55,10 @@ class ProtocolRecoveryExhaustedError(TaskFailureError):
     """
 
 
+class MutationProtocolExhaustedError(ProtocolRecoveryExhaustedError):
+    """A bounded per-file patch exchange could not yield an applicable patch."""
+
+
 class CoderActionBatch(list[object]):
     """One bounded Coder response plus its non-semantic continuation state."""
 
@@ -113,6 +117,8 @@ class AutonomousRunner:
             set_observer(self._record_provider_outcome)
         self._attempt_snapshots: dict[str, Path] = {}
         self.protocol_recovery_budget = 2
+        self.mutation_patch_budget = 24
+        self.mutation_context_characters = 6_000
         # Scripted and third-party providers without a health endpoint return
         # immediately; a real Ollama-backed run can wait through a short restart.
         self.provider_wait_seconds = (
@@ -565,6 +571,10 @@ class AutonomousRunner:
         while position < len(actions):
             action = actions[position]
             try:
+                if isinstance(action, dict) and action.get("kind") == "mutate_file":
+                    self._execute_mutation_decision(state, task, action)
+                    position += 1
+                    continue
                 if isinstance(action, dict) and action.get("kind") == "start_process":
                     command = action.get("command")
                     if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
@@ -680,6 +690,88 @@ class AutonomousRunner:
                 continue
             position += 1
         return actions
+
+    def _execute_mutation_decision(self, state: ProjectState, task: Task, decision: dict[str, object]) -> None:
+        """Materialize one small Coder decision through bounded per-file patches.
+
+        The decision envelope has no source body.  Each generated patch is
+        independently bounded and can be refreshed locally without consuming a
+        semantic task retry.  A failed patch protocol raises the typed protocol
+        outcome so the attempt is handled atomically by the existing controller.
+        """
+        path = decision.get("path")
+        intent = decision.get("intent")
+        if not isinstance(path, str) or not path or not isinstance(intent, str) or not intent:
+            raise ValueError("mutate_file requires non-empty path and intent")
+        target = self.tools._path(path)
+        exists = target.is_file()
+        continuation = 0
+        failures = 0
+        while continuation < self.mutation_patch_budget:
+            current = self.tools.read_file(path) if exists else ""
+            context = self._mutation_context(current)
+            self._mark(state, "CODER", "MUTATION_PATCH_REQUEST", f"Requesting bounded patch {continuation + 1}/{self.mutation_patch_budget}: {path}", task)
+            self._mark(state, "CODER", "LLM_CALL", f"Coder bounded mutation patch: {path}", task)
+            try:
+                patch = self.agents.patch(
+                    state,
+                    task,
+                    path=path,
+                    intent=intent,
+                    current=context,
+                    existing=exists,
+                    continuation=continuation,
+                ).data
+                self._mark(state, "CODER", "LLM_RESPONSE", f"Coder mutation patch received: {path}", task)
+                operation = patch.get("operation")
+                content = patch.get("content")
+                done = patch.get("done")
+                old = patch.get("old", "")
+                if operation not in {"create", "append", "replace"} or not isinstance(content, str) or not isinstance(done, bool):
+                    raise ValueError("mutation patch is invalid")
+                if operation == "replace":
+                    if not exists or not isinstance(old, str) or not old:
+                        raise ValueError("replace patch does not match file state")
+                    self._validate_mutation_content(state, task, path, content)
+                    self._execute_action(state, task, {"kind": "edit_file", "path": path, "old": old, "new": content})
+                elif operation == "create":
+                    if exists:
+                        raise ValueError("create patch targets an existing file")
+                    self._validate_mutation_content(state, task, path, content)
+                    self._execute_action(state, task, {"kind": "write_file", "path": path, "content": content})
+                    exists = True
+                else:
+                    self._validate_mutation_content(state, task, path, content)
+                    self._execute_action(state, task, {"kind": "append_file", "path": path, "content": content})
+                    exists = True
+                self._mark(state, "CODER", "MUTATION_PATCH_APPLIED", f"Applied bounded {operation} patch: {path}", task)
+                failures = 0
+                continuation += 1
+                if done:
+                    return
+            except ProviderUnavailableError:
+                raise
+            except (ProviderError, ValueError) as error:
+                failures += 1
+                if failures >= 2 or continuation + 1 >= self.mutation_patch_budget:
+                    self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch protocol exhausted for {path}: {error}", task)
+                    raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
+                continuation += 1
+                self._mark(state, "CODER", "MUTATION_CONTEXT_REFRESH", f"Refreshing patch context for {path}: {error}", task)
+                continue
+        self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch continuation budget exhausted for {path}", task)
+        raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED")
+
+    def _mutation_context(self, current: str) -> str:
+        if len(current) <= self.mutation_context_characters:
+            return current
+        return "[earlier content omitted]\n" + current[-self.mutation_context_characters :]
+
+    def _validate_mutation_content(self, state: ProjectState, task: Task, path: str, content: str) -> None:
+        violation = contract_policy_violation(state.project_contract, path, content, self.workspace)
+        if violation is not None:
+            self._mark(state, "CODER", violation.code, violation.message, task)
+            raise ToolPolicyError(violation.message)
 
     def _execute_targeted_edit_recovery(
         self,
