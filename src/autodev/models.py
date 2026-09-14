@@ -347,6 +347,10 @@ class ProjectState:
         previous_validator_run_id: str | None,
         execution_backend: str = "workspace-tools",
         related_tool_call_id: str | None = None,
+        validator_kind: str | None = None,
+        handler: str | None = None,
+        secondary_failure_classes: list[str] | None = None,
+        validation_strength: str = "STRUCTURAL",
     ) -> dict[str, object]:
         """Persist one immutable, capability-owned validator outcome."""
         run_id = str(uuid4())
@@ -358,7 +362,7 @@ class ProjectState:
             "validator_run_id": run_id,
             "capability_id": task.capability_id or task.id,
             "validator_id": validator_id,
-            "validator_kind": "test" if any(part in {"pytest", "unittest"} for part in command) else "command",
+            "validator_kind": validator_kind or ("test" if any(part in {"pytest", "unittest"} for part in command) else "command"),
             "exact_command": list(command),
             "cwd": "workspace",
             "start_time": utc_now(),
@@ -367,9 +371,12 @@ class ProjectState:
             "stdout": stdout,
             "stderr": stderr,
             "failure_class": failure_class,
+            "secondary_failure_classes": list(secondary_failure_classes or []),
+            "validation_strength": validation_strength,
             "failure_fingerprint": hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest(),
             "execution_backend": execution_backend,
             "related_tool_call_id": related_tool_call_id,
+            "handler": handler,
             "previous_validator_run_id": previous_validator_run_id,
         }
         self.validator_runs.append(record)

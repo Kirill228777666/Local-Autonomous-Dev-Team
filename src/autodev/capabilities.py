@@ -8,6 +8,8 @@ as durable identity across language changes, resume, or corrective work.
 from __future__ import annotations
 
 import re
+import sys
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .models import TaskStatus
@@ -18,14 +20,30 @@ if TYPE_CHECKING:
 CapabilityGraph = dict[str, dict[str, object]]
 
 
+@dataclass(frozen=True, slots=True)
+class ContractPolicyViolation:
+    """A deterministic rejection of lower-authority generated code.
+
+    The project contract is chosen before implementation.  A later model
+    action must not be able to silently replace that decision by importing a
+    framework or asking the environment layer to install one.
+    """
+
+    code: str
+    message: str
+    subject: str
+
+
 def build_project_contract(specification: str, environment: dict[str, object]) -> dict[str, object]:
     """Create the compact, versioned contract selected before implementation."""
     text = specification.lower()
     npm = bool((environment.get("npm") if isinstance(environment.get("npm"), dict) else {}).get("available"))
     python_project = any(token in text for token in ("python", "flask", "sqlite", "backend", "бэкенд"))
     frontend = "npm-build" if npm else "static-html-css-js"
+    stdlib_only = _requests_stdlib_only(text)
+    forbidden_dependencies = _explicit_forbidden_dependencies(text)
     architecture: dict[str, object] = {
-        "backend_framework": "Flask" if python_project else "unspecified",
+        "backend_framework": "stdlib-http" if python_project and stdlib_only else "Flask" if python_project else "unspecified",
         "database": "SQLite" if "sqlite" in text else "unspecified",
         "frontend_strategy": frontend,
         "app_factory": False,
@@ -40,9 +58,103 @@ def build_project_contract(specification: str, environment: dict[str, object]) -
         "api": {},
         "data": {},
         "capabilities": {},
+        "technology_constraints": {
+            "stdlib_only_python": stdlib_only,
+            "forbidden_dependencies": forbidden_dependencies,
+            "allowed_dependencies": [] if stdlib_only else (["Flask"] if python_project else []),
+        },
         "forbidden_requirements": forbidden,
         "original_spec_hash": _signature(specification),
     }
+
+
+def contract_policy_violation(contract: dict[str, object], path: str, content: str, workspace: object | None = None) -> ContractPolicyViolation | None:
+    """Detect source text that violates an explicit technology constraint.
+
+    This deliberately works on imports rather than a Notes-specific framework
+    list.  Project-local modules and Python's standard library remain valid;
+    third-party imports are forbidden only when the frozen contract says so.
+    """
+    constraints = contract.get("technology_constraints")
+    if not isinstance(constraints, dict):
+        return None
+    stdlib_only = constraints.get("stdlib_only_python") is True
+    forbidden = {
+        str(name).strip().lower().replace("-", "_")
+        for name in constraints.get("forbidden_dependencies", [])
+        if isinstance(name, str)
+    }
+    if not stdlib_only and not forbidden:
+        return None
+    for module in _imported_roots(content):
+        normalized = module.lower().replace("-", "_")
+        if _is_stdlib_module(normalized) or _is_workspace_module(workspace, normalized):
+            continue
+        if stdlib_only or normalized in forbidden:
+            return ContractPolicyViolation(
+                "CONTRACT_POLICY_VIOLATION",
+                f"Frozen project contract forbids external dependency '{module}' in {path}",
+                module,
+            )
+    return None
+
+
+def contract_allows_dependency(contract: dict[str, object] | None, dependency: str) -> bool:
+    """Return whether the owned project environment may install *dependency*."""
+    if not isinstance(contract, dict):
+        return True
+    constraints = contract.get("technology_constraints")
+    if not isinstance(constraints, dict):
+        return True
+    normalized = dependency.strip().lower().replace("-", "_")
+    if constraints.get("stdlib_only_python") is True:
+        return False
+    forbidden = {
+        str(name).strip().lower().replace("-", "_")
+        for name in constraints.get("forbidden_dependencies", [])
+        if isinstance(name, str)
+    }
+    return normalized not in forbidden
+
+
+def contract_declares_dependency(contract: dict[str, object] | None, dependency: str) -> bool:
+    """Whether the frozen contract explicitly models a non-manifest package."""
+    if not isinstance(contract, dict):
+        return True
+    constraints = contract.get("technology_constraints")
+    if not isinstance(constraints, dict):
+        return True
+    allowed = constraints.get("allowed_dependencies", [])
+    if not isinstance(allowed, list):
+        return False
+    normalized = dependency.strip().lower().replace("-", "_")
+    return any(isinstance(item, str) and item.strip().lower().replace("-", "_") == normalized for item in allowed)
+
+
+def find_contract_policy_violations(contract: dict[str, object], workspace: object) -> list[tuple[str, ContractPolicyViolation]]:
+    """Scan owned source files before environment repair can install anything.
+
+    This is intentionally a small import-policy scan, not a linter.  Its only
+    job is to prevent a generated forbidden framework from acquiring authority
+    merely because its import fails during validation.
+    """
+    try:
+        root = __import__("pathlib").Path(workspace)
+    except TypeError:
+        return []
+    findings: list[tuple[str, ContractPolicyViolation]] = []
+    for path in root.rglob("*.py"):
+        if any(part in {".git", ".venv", ".autodev", "__pycache__"} for part in path.parts):
+            continue
+        try:
+            relative = path.relative_to(root).as_posix()
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        violation = contract_policy_violation(contract, relative, content, root)
+        if violation is not None:
+            findings.append((relative, violation))
+    return findings
 
 
 def capability_id_for(task: "Task") -> str:
@@ -231,3 +343,52 @@ def reviewer_scope_violations(title: str, description: str, contract: dict[str, 
 def _signature(value: str) -> str:
     import hashlib
     return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()
+
+
+def _requests_stdlib_only(text: str) -> bool:
+    markers = (
+        "standard library only",
+        "python standard library only",
+        "stdlib only",
+        "no external python dependenc",
+        "только стандартная библиотека",
+        "без внешних python",
+        "без внешних зависимостей python",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _explicit_forbidden_dependencies(text: str) -> list[str]:
+    """Extract named, user-forbidden packages without inventing a framework list."""
+    values: set[str] = set()
+    for match in re.finditer(r"\b(?:no|without|exclude)\s+([a-z][a-z0-9_-]*(?:\s*,\s*[a-z][a-z0-9_-]*)*)", text):
+        values.update(item.strip().replace("-", "_") for item in match.group(1).split(","))
+    return sorted(values)
+
+
+def _imported_roots(content: str) -> list[str]:
+    roots: list[str] = []
+    for line in content.splitlines():
+        match = re.match(r"\s*import\s+([A-Za-z_]\w*)", line)
+        if match:
+            roots.append(match.group(1))
+            continue
+        match = re.match(r"\s*from\s+([A-Za-z_]\w*)", line)
+        if match:
+            roots.append(match.group(1))
+    return roots
+
+
+def _is_stdlib_module(module: str) -> bool:
+    return module in getattr(sys, "stdlib_module_names", set()) or module in sys.builtin_module_names
+
+
+def _is_workspace_module(workspace: object | None, module: str) -> bool:
+    if workspace is None:
+        return False
+    try:
+        root = __import__("pathlib").Path(workspace)
+    except TypeError:
+        return False
+    candidate = root / module
+    return candidate.is_dir() or candidate.with_suffix(".py").is_file()

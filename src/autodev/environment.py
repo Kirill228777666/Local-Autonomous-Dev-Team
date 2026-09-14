@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .tools import CommandResult
+from .capabilities import contract_allows_dependency, contract_declares_dependency
 
 
 class FailureKind(StrEnum):
@@ -201,14 +202,28 @@ class EnvironmentManager:
                 return DependencyProvisioning(True, False, missing)
         return DependencyProvisioning(True, True, missing)
 
-    def repair(self, failure: Failure, state: dict[str, object] | None = None) -> bool:
+    def repair(
+        self,
+        failure: Failure,
+        state: dict[str, object] | None = None,
+        contract: dict[str, object] | None = None,
+    ) -> bool:
         if failure.kind in {FailureKind.MISSING_PROJECT_DEPENDENCY, FailureKind.MISSING_PYTHON_DEPENDENCY} and failure.module:
+            if not contract_allows_dependency(contract, failure.module):
+                self.last_diagnostic = f"Frozen project contract marks dependency installation as forbidden: {failure.module}"
+                return False
             if not self.allow_project_dependency_install:
                 self.last_diagnostic = "Project dependency installation is disabled."
                 return False
             package = {"flask": "Flask", "flask_sqlalchemy": "Flask-SQLAlchemy", "sqlalchemy": "SQLAlchemy"}.get(failure.module, failure.module)
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", package):
                 self.last_diagnostic = f"Unsafe or ambiguous Python package name: {failure.module}"
+                return False
+            declared, _has_requirements_file = self._declared_requirements()
+            declared_names = {_requirement_name(item).replace("-", "_") for item in declared}
+            normalized_package = package.lower().replace("-", "_")
+            if contract is not None and normalized_package not in declared_names and not contract_declares_dependency(contract, package):
+                self.last_diagnostic = f"Frozen project contract does not declare missing dependency: {package}"
                 return False
             if not self.ensure_python_environment():
                 return False
@@ -350,7 +365,7 @@ def _requirement_is_satisfied(requirement: str, installed: str) -> bool:
         return False
 
 
-def validate_readme(workspace: Path) -> ReadmeResult:
+def validate_readme(workspace: Path, contract: dict[str, object] | None = None) -> ReadmeResult:
     path = workspace / "README.md"
     if not path.is_file():
         return ReadmeResult(False, ["README.md is missing"])
@@ -360,6 +375,15 @@ def validate_readme(workspace: Path) -> ReadmeResult:
         findings.append("missing installation instructions")
     if not any(term in text for term in ("run", "start", "запуск")):
         findings.append("missing run instructions")
-    if not any(term in text for term in ("test", "pytest", "тест")):
+    has_executable_tests = any(
+        path.name.startswith("test_") or path.name.endswith("_test.py")
+        for path in workspace.rglob("*.py")
+        if not any(part in {".venv", ".git", ".autodev", "__pycache__"} for part in path.parts)
+    )
+    # Legacy direct callers retain the conservative test-instructions rule.
+    # A contract-aware controller does not document a fictional test command
+    # when the project has no executable tests to run.
+    require_test_instructions = contract is None or has_executable_tests
+    if require_test_instructions and not any(term in text for term in ("test", "pytest", "тест")):
         findings.append("missing test instructions")
     return ReadmeResult(not findings, findings)

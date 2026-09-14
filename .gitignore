@@ -3,6 +3,11 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp/
 .pytest-full-*/
+.pytest-control-*/
+.pytest-final-control-*/
+.pytest-final-full-*/
+.pytest-first-failure-*/
+.pytest-stale-*/
 .pytest-debug/
 .benchmark/
 .venv/

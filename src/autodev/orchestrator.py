@@ -14,7 +14,7 @@ from typing import Callable
 
 from .agents import RoleAgents
 from .architecture import default_contract, validate_architecture
-from .capabilities import build_project_contract, contract_conflicting_review_reasons, contract_conflicting_test_action, repair_generated_test_for_contract, reviewer_scope_violations, normalize_plan
+from .capabilities import build_project_contract, contract_conflicting_review_reasons, contract_conflicting_test_action, contract_policy_violation, find_contract_policy_violations, repair_generated_test_for_contract, reviewer_scope_violations, normalize_plan
 from .controller import FailureDecision, TaskController, TaskPhase
 from .designer import DesignerAgent, detect_ui_project
 from .environment import EnvironmentManager, FailureKind, classify_failure, validate_readme
@@ -45,6 +45,14 @@ class TaskFailureError(ValueError):
 
 class DestructiveWriteRecoveryError(TaskFailureError):
     """A bounded safe-edit recovery could not produce a valid mutation."""
+
+
+class CoderActionBatch(list[object]):
+    """One bounded Coder response plus its non-semantic continuation state."""
+
+    def __init__(self, actions: list[object], task_status: str = "ready_for_validation") -> None:
+        super().__init__(actions)
+        self.task_status = task_status
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +399,7 @@ class AutonomousRunner:
             raw_tasks = reply.get("tasks")
             if not isinstance(raw_tasks, list) or not raw_tasks:
                 raise ProviderError("Manager returned no initial tasks")
+            planned: list[tuple[dict[str, object], Task]] = []
             for raw_task in raw_tasks:
                 if not isinstance(raw_task, dict):
                     raise ProviderError("Manager task must be an object")
@@ -401,13 +410,36 @@ class AutonomousRunner:
                 capability_id = raw_task.get("capability_id")
                 intent = raw_task.get("intent")
                 acceptance = raw_task.get("acceptance_criteria")
-                state.tasks.append(Task.create(
+                task = Task.create(
                     title, description,
                     capability_id=capability_id if isinstance(capability_id, str) else "",
                     intent=intent if isinstance(intent, str) else description,
                     acceptance_criteria=[item for item in acceptance if isinstance(item, str)] if isinstance(acceptance, list) else [],
                     contract_version=int(state.project_contract.get("version", 1)),
-                ))
+                )
+                state.tasks.append(task)
+                planned.append((raw_task, task))
+            identifiers: dict[str, str] = {}
+            for raw_task, task in planned:
+                identifiers[task.id] = task.id
+                identifiers[task.title.strip().lower()] = task.id
+                capability = raw_task.get("capability_id")
+                if isinstance(capability, str) and capability.strip():
+                    identifiers[capability.strip().lower()] = task.id
+            for raw_task, task in planned:
+                declared = raw_task.get("depends_on", [])
+                if not isinstance(declared, list):
+                    raise ProviderError("Manager task depends_on must be a string array")
+                resolved: list[str] = []
+                for reference in declared:
+                    if not isinstance(reference, str) or not reference.strip():
+                        raise ProviderError("Manager task dependency is invalid")
+                    dependency = identifiers.get(reference.strip().lower())
+                    if dependency is None or dependency == task.id:
+                        raise ProviderError(f"Manager task dependency is unknown: {reference}")
+                    if dependency not in resolved:
+                        resolved.append(dependency)
+                task.dependencies = resolved
             self._ensure_project_contract(state)
             normalize_plan(state)
             state.decisions.append(f"Manager planned {len(state.tasks)} tasks")
@@ -452,11 +484,13 @@ class AutonomousRunner:
         task: Task,
         message: str,
         relevant_files: list[str] | None = None,
-    ) -> list[object]:
+    ) -> CoderActionBatch:
         """Make one semantic Coder call with an explicit terminal outcome."""
         self._mark(state, "CODER", "LLM_CALL", message, task)
         try:
-            actions = self.agents.code(state, task, relevant_files if relevant_files is not None else self._coder_file_context(task)).data.get("actions")
+            reply_data = self.agents.code(state, task, relevant_files if relevant_files is not None else self._coder_file_context(task)).data
+            actions = reply_data.get("actions")
+            task_status = reply_data.get("task_status", "ready_for_validation")
         except ProviderUnavailableError:
             self._mark(state, "CODER", "CODER_PROVIDER_FAILURE", "Coder request interrupted by provider", task)
             raise
@@ -477,12 +511,14 @@ class AutonomousRunner:
         if not isinstance(actions, list):
             self._mark(state, "CODER", "CODER_MALFORMED_RESPONSE", "Coder response needs an actions array", task)
             raise ProviderError("Coder response needs an actions array")
+        if task_status not in {"continue", "ready_for_validation"}:
+            raise ProviderError("Coder response has invalid task_status")
         self._mark(state, "CODER", "LLM_RESPONSE", "Coder response received", task)
         if actions:
             self._mark(state, "CODER", "CODER_ACTIONS", f"Coder returned {len(actions)} tool action(s)", task)
         else:
             self._mark(state, "CODER", "NOOP", "Coder returned no tool actions", task)
-        return actions
+        return CoderActionBatch(actions, str(task_status))
 
     def _execute_coder_actions(self, state: ProjectState, task: Task, initial: list[object]) -> list[object] | None:
         """Execute actions while keeping recoverable tool failures inside this attempt."""
@@ -517,6 +553,15 @@ class AutonomousRunner:
                     action = dict(action)
                     action[content_key] = repaired
                     self._mark(state, "TESTER", "CONTRACT_CONFLICT_RESOLVED", "Repaired lower-authority generated test to match frozen contract", task)
+                if isinstance(action, dict) and action.get("kind") in {"write_file", "append_file", "edit_file"}:
+                    content_key = "new" if action.get("kind") == "edit_file" else "content"
+                    candidate = action.get(content_key)
+                    path = action.get("path")
+                    if isinstance(path, str) and isinstance(candidate, str):
+                        violation = contract_policy_violation(state.project_contract, path, candidate, self.workspace)
+                        if violation is not None:
+                            self._mark(state, "CODER", violation.code, violation.message, task)
+                            raise ToolPolicyError(violation.message)
                 if isinstance(action, dict) and action.get("kind") == "run_command" and self._known_missing_npm(state, action.get("command")):
                     self._pivot_to_static_frontend(state, task)
                     return None
@@ -617,6 +662,17 @@ class AutonomousRunner:
 
     def _run_task(self, state: ProjectState, task: Task) -> None:
         self._active_state = state
+        accepted = {candidate.id for candidate in state.tasks if candidate.status is TaskStatus.DONE}
+        unmet = [dependency for dependency in task.dependencies if dependency not in accepted]
+        if unmet:
+            # This is a second, dispatch-time guard in addition to scheduler
+            # selection.  Rollback and blocking can change the graph between
+            # selection and execution; a child must never assume rolled-back
+            # artifacts exist.
+            task.phase = TaskPhase.READY.value
+            task.status = TaskStatus.PENDING
+            self._mark(state, "CONTROLLER", "WAITING_ON_DEPENDENCY", f"Task is not dispatchable; unaccepted dependencies: {', '.join(unmet)}", task)
+            return
         task.phase = TaskPhase.READY.value
         self.controller.transition(task, TaskPhase.CODING)
         state.current_task_id = task.id
@@ -630,15 +686,31 @@ class AutonomousRunner:
                 self._retry_or_block(task, state, "Identical semantic Coder call suppressed by loop breaker", "loop_suppressed")
                 return
             actions = self._request_coder_actions(state, task, "Coder implementation request")
-            fingerprint = hashlib.sha256(json.dumps(actions, sort_keys=True).encode()).hexdigest()
-            if fingerprint in task.action_fingerprints:
-                self._block(task, state, "repeated identical coder action without progress", "repeated_coder_action")
-                return
-            task.action_fingerprints.append(fingerprint)
-            executed = self._execute_coder_actions(state, task, actions)
-            if executed is None:
-                return
-            actions = executed
+            continuation_batches = 0
+            completed_actions: list[object] = []
+            while True:
+                fingerprint = hashlib.sha256(json.dumps(actions, sort_keys=True).encode()).hexdigest()
+                if fingerprint in task.action_fingerprints:
+                    self._block(task, state, "repeated identical coder action without progress", "repeated_coder_action")
+                    return
+                task.action_fingerprints.append(fingerprint)
+                batch_status = actions.task_status if isinstance(actions, CoderActionBatch) else "ready_for_validation"
+                executed = self._execute_coder_actions(state, task, actions)
+                if executed is None:
+                    return
+                completed_actions.extend(executed)
+                if batch_status != "continue":
+                    break
+                continuation_batches += 1
+                if continuation_batches > 8:
+                    raise ToolPolicyError("Coder continuation batch budget exhausted")
+                # Persist after each valid batch. A continuation is not a
+                # retry: it retains the same task attempt and gets fresh file
+                # context rather than replaying a large stale response.
+                self.store.save(state)
+                self._mark(state, "CODER", "BATCH_CONTINUATION", f"Requesting bounded continuation batch {continuation_batches}", task)
+                actions = self._request_coder_actions(state, task, "Coder continuation batch request")
+            actions = completed_actions
             if before_files == self._source_fingerprints() and any(isinstance(action, dict) and action.get("kind") in {"write_file", "edit_file", "append_file", "delete_file"} for action in actions):
                 self._mark(state, "CODER", "ZERO_DIFF", "Coder file actions produced no semantic file change", task)
             state.run_history.append(f"Coder completed attempt {task.attempts} for {task.title}")
@@ -658,8 +730,17 @@ class AutonomousRunner:
 
         self.controller.transition(task, TaskPhase.VALIDATING)
         if "readme" in task.title.lower() or "documentation" in task.title.lower():
-            documentation = validate_readme(self.workspace)
+            documentation = validate_readme(self.workspace, state.project_contract)
             command = ["README validator"]
+            task.acceptance_validator = {
+                "validator_id": "readme",
+                "capability_id": task.capability_id or task.id,
+                "scope": "acceptance",
+                "contract_version": task.contract_version,
+                "command": list(command),
+                "validator_type": "internal",
+                "handler": "readme",
+            }
             result = CommandResult(0 if documentation.passed else 1, "", "; ".join(documentation.findings))
             self._mark(state, "TESTER", "DOCUMENTATION", "Validated README instructions without executing them", task)
         else:
@@ -991,10 +1072,28 @@ class AutonomousRunner:
         self._mark(state, "CODER", "TOOL_STARTED", f"Started tool: {kind}", task)
         try:
             self._execute_action_once(action)
+        except CommandExecutionError:
+            # The caller needs the command result to classify deterministic
+            # environment failures.  It is still a task-local failure.
+            execution.finish(ToolExecutionStatus.FAILED, "command failed")
+            self._mark(state, "CODER", "TOOL_FAILED", f"Tool failed: {kind}: command failed", task)
+            raise
+        except ValueError as error:
+            execution.finish(ToolExecutionStatus.FAILED, str(error))
+            self._mark(state, "CODER", "TOOL_FAILED", f"Tool failed: {kind}: {error}", task)
+            # Stale exact-text edits already have a bounded local recovery
+            # path that refreshes current content. Preserve that typed signal
+            # while containing every other ordinary tool exception below.
+            if kind == "edit_file" and "edit target was not found" in str(error):
+                raise
+            raise ToolPolicyError(f"TOOL_FAILED {kind}: {error}") from error
         except Exception as error:
             execution.finish(ToolExecutionStatus.FAILED, str(error))
             self._mark(state, "CODER", "TOOL_FAILED", f"Tool failed: {kind}: {error}", task)
-            raise
+            # File, encoding, and path errors are ordinary agent-tool
+            # failures.  Never let one escape the task state machine and turn
+            # a recoverable project fault into a process crash.
+            raise ToolPolicyError(f"TOOL_FAILED {kind}: {error}") from error
         execution.finish(ToolExecutionStatus.SUCCEEDED)
         self._mark(state, "CODER", "TOOL_SUCCEEDED", f"Completed tool: {kind}", task)
 
@@ -1192,6 +1291,17 @@ class AutonomousRunner:
         failure = classify_failure(result, command, self.workspace)
         state.run_history.append(f"Failure classified: {failure.kind.value}")
         self._mark(state, "ENVIRONMENT", failure.kind.value, f"Classified command failure: {failure.kind.value}", task)
+        if failure.kind in {FailureKind.MISSING_PROJECT_DEPENDENCY, FailureKind.MISSING_PYTHON_DEPENDENCY}:
+            violations = find_contract_policy_violations(state.project_contract, self.workspace)
+            if violations:
+                path, violation = violations[0]
+                detail = f"{violation.message}; affected_file={path}; validator={task.last_validator_run_id or 'pending'}"
+                task.errors.append(detail)
+                self._mark(state, "CODER", violation.code, detail, task)
+                # A forbidden implementation is Coder-owned.  In particular,
+                # its missing import is never an instruction to mutate the
+                # environment or to consume an environment-repair budget.
+                return EnvironmentRepairOutcome(False, False, result)
         if failure.kind in {FailureKind.IMPORT_PATH, FailureKind.LOCAL_IMPORT_PATH_ERROR}:
             state.run_history.append("Test harness diagnostic: check cwd/package layout/PYTHONPATH before code repair")
             return EnvironmentRepairOutcome(False, False, result)
@@ -1208,7 +1318,7 @@ class AutonomousRunner:
         previous_phase = task.phase
         task.phase = TaskPhase.ENVIRONMENT_REPAIR.value
         self._mark(state, "ENVIRONMENT", "REPAIR_ATTEMPT", f"Environment repair attempt: {failure.kind.value}", task)
-        repaired = self.environment_manager.repair(failure, state.environment)
+        repaired = self.environment_manager.repair(failure, state.environment, contract=state.project_contract)
         if not repaired:
             task.phase = previous_phase
             self._mark(state, "ENVIRONMENT", "REPAIR_FAILED", f"Environment repair could not be applied: {failure.kind.value}", task)
@@ -1394,6 +1504,13 @@ class AutonomousRunner:
 
     def _run_validator(self, state: ProjectState, task: Task, command: list[str]) -> CommandResult:
         """Execute a validator with isolated mutable state when it is a test runner."""
+        metadata = task.acceptance_validator if isinstance(task.acceptance_validator, dict) else {}
+        if metadata.get("validator_type") == "internal":
+            handler = metadata.get("handler")
+            if handler == "readme":
+                documentation = validate_readme(self.workspace, state.project_contract)
+                return CommandResult(0 if documentation.passed else 1, "", "; ".join(documentation.findings))
+            raise ToolPolicyError(f"Unknown internal validator handler: {handler}")
         if not any(part in {"pytest", "unittest"} for part in command):
             return self.tools.run_tests(command)
         manager = ValidationStateManager(self.workspace)
@@ -1432,6 +1549,8 @@ class AutonomousRunner:
         validation = classify_validation_result(result, command, self.workspace)
         configured = task.acceptance_validator.get("validator_id") if task.acceptance_validator else None
         validator_id = str(configured or hashlib.sha256(json.dumps(command, ensure_ascii=False).encode("utf-8")).hexdigest()[:16])
+        metadata = task.acceptance_validator if isinstance(task.acceptance_validator, dict) else {}
+        internal = metadata.get("validator_type") == "internal"
         record = state.record_validator_result(
             task=task,
             validator_id=validator_id,
@@ -1439,12 +1558,28 @@ class AutonomousRunner:
             result=result,
             failure_class=validation.kind.value,
             previous_validator_run_id=previous_validator_run_id,
+            execution_backend=f"internal:{metadata.get('handler')}" if internal else "workspace-tools",
+            validator_kind="internal" if internal else None,
+            handler=str(metadata.get("handler")) if internal else None,
+            secondary_failure_classes=[kind.value for kind in validation.secondary_kinds],
+            validation_strength=self._validation_strength(command, metadata),
         )
         run_id = str(record["validator_run_id"])
         self._mark(state, "TESTER", "DETERMINISTIC_VALIDATION", f"Validator result bound to capability; validator_run_id={run_id}; validator_id={validator_id}", task)
         state.run_history.append(self._result_log(task, result) + f"; validator_run_id={run_id}")
         self._mark(state, "TESTER", validation.kind.value, f"Validation outcome: {validation.kind.value}; validator_run_id={run_id}", task)
+        for secondary in validation.secondary_kinds:
+            self._mark(state, "TESTER", f"SECONDARY_{secondary.value}", f"Preserved secondary validator evidence: {secondary.value}; validator_run_id={run_id}", task)
         return validation, record
+
+    @staticmethod
+    def _validation_strength(command: list[str], metadata: dict[str, object]) -> str:
+        if metadata.get("validator_type") == "internal":
+            return "STRUCTURAL"
+        lowered = " ".join(command).lower()
+        if any(part in {"pytest", "unittest"} for part in command) or "http" in lowered:
+            return "BEHAVIORAL"
+        return "STRUCTURAL"
 
     def _sync_environment_snapshot(self, task: Task) -> None:
         """Keep verified dependency metadata outside application rollback."""

@@ -29,6 +29,7 @@ class ValidationOutcome(StrEnum):
 class ValidationResult:
     kind: ValidationOutcome
     detail: str
+    secondary_kinds: tuple[ValidationOutcome, ...] = ()
 
 
 _IGNORED_DIRECTORIES = {".git", ".autodev", ".venv", "__pycache__", "node_modules"}
@@ -133,16 +134,17 @@ def classify_validation_result(
     # Conversely, a workspace module must never be proposed for pip install:
     # its caller determines whether the broken import is generated test code
     # or the application's own package/layout.
+    secondary = _secondary_failure_kinds(lowered)
     missing = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)", detail)
     if missing:
         module = missing.group(1)
         if _is_local_module(workspace, module):
             if _is_test_runner(command) and ("unittest.loader._failedtest" in lowered or "test_" in lowered):
-                return ValidationResult(ValidationOutcome.TEST_IMPLEMENTATION_BUG, detail)
-            return ValidationResult(ValidationOutcome.APPLICATION_IMPORT_ERROR, detail)
-        return ValidationResult(ValidationOutcome.IMPORT_OR_ENVIRONMENT_ERROR, detail)
+                return ValidationResult(ValidationOutcome.TEST_IMPLEMENTATION_BUG, detail, secondary)
+            return ValidationResult(ValidationOutcome.APPLICATION_IMPORT_ERROR, detail, secondary)
+        return ValidationResult(ValidationOutcome.IMPORT_OR_ENVIRONMENT_ERROR, detail, secondary)
     if any(token in lowered for token in ("before_first_request", "detachedinstanceerror", "has no attribute")):
-        return ValidationResult(ValidationOutcome.DEPENDENCY_API_MISMATCH, detail)
+        return ValidationResult(ValidationOutcome.DEPENDENCY_API_MISMATCH, detail, secondary)
     if "cannot import name" in lowered:
         return ValidationResult(ValidationOutcome.APPLICATION_IMPORT_ERROR, detail)
     # A missing table while a test runner is active is concrete setup/schema
@@ -158,7 +160,22 @@ def classify_validation_result(
         return ValidationResult(ValidationOutcome.APPLICATION_IMPORT_ERROR, detail)
     if "unittest.loader._failedtest" in lowered:
         return ValidationResult(ValidationOutcome.IMPORT_OR_ENVIRONMENT_ERROR, detail)
-    return ValidationResult(ValidationOutcome.APPLICATION_FAILURE, detail)
+    return ValidationResult(ValidationOutcome.APPLICATION_FAILURE, detail, secondary)
+
+
+def _secondary_failure_kinds(lowered: str) -> tuple[ValidationOutcome, ...]:
+    """Keep independent suite failures durable when collection also fails.
+
+    The primary outcome remains the first repair dependency.  These are
+    evidence for the next exact rerun, not a request to repair every issue at
+    once.
+    """
+    kinds: list[ValidationOutcome] = []
+    if "assertionerror" in lowered or re.search(r"\b\d+\s*!=\s*\d+\b", lowered):
+        kinds.append(ValidationOutcome.APPLICATION_FAILURE)
+    if any(token in lowered for token in ("has no attribute", "before_first_request", "detachedinstanceerror")):
+        kinds.append(ValidationOutcome.DEPENDENCY_API_MISMATCH)
+    return tuple(kinds)
 
 
 def _is_local_module(workspace: Path, module: str) -> bool:

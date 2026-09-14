@@ -30,7 +30,7 @@ class RoleAgents:
         return self._ask(
             "MANAGER",
             "Create the minimal major task list for this project. Return "
-            "{\"tasks\":[{\"title\":str,\"description\":str,\"capability_id\":str,\"intent\":str,\"acceptance_criteria\":[str]}]}. "
+            "{\"tasks\":[{\"title\":str,\"description\":str,\"capability_id\":str,\"intent\":str,\"acceptance_criteria\":[str],\"depends_on\":[capability_id]}]}. "
             "capability_id is stable lowercase dotted identity; never duplicate an existing capability. "
             f"Authoritative project contract: {state.project_contract or state.architecture}\n\n{state.original_spec}",
             self._valid_plan,
@@ -46,7 +46,7 @@ class RoleAgents:
 
     def code(self, state: ProjectState, task: Task, relevant_files: list[str] | None = None) -> AgentReply:
         schema = (
-            "Return {\"actions\":[...]}. Each action must be exactly one of: "
+            "Return {\"actions\":[...],\"task_status\":\"continue\"|\"ready_for_validation\"}. Each action must be exactly one of: "
             "{\"kind\":\"write_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
             "{\"kind\":\"edit_file\",\"path\":\"relative/path\",\"old\":\"exact text\",\"new\":\"replacement\"}; "
             "{\"kind\":\"delete_file\",\"path\":\"relative/path\"}; "
@@ -54,8 +54,10 @@ class RoleAgents:
             "{\"kind\":\"append_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
             "{\"kind\":\"run_command\",\"command\":[\"program\",\"arg\"]}; "
             "{\"kind\":\"start_process\",\"command\":[\"program\",\"arg\"]}. "
-            "For a valid no-op return exactly {\"actions\":[]}; never emit an action with empty content. "
-            "Paths must be relative to the workspace; do not use shell wrappers.\n\n"
+            "Return at most 4 actions and at most 12000 total text characters in one batch. "
+            "Use task_status=continue after a bounded batch; the controller will persist it and request the next batch in the same attempt. "
+            "For a valid no-op return exactly {\"actions\":[],\"task_status\":\"ready_for_validation\"}; never emit an action with empty content. "
+            "Prefer read_file then targeted edit for existing files. Paths must be relative to the workspace; do not use shell wrappers.\n\n"
         )
         return self._ask("CODER", schema + self.context.for_task(state, task, relevant_files or []), self._valid_actions)
 
@@ -113,6 +115,9 @@ class RoleAgents:
         for task in tasks:
             if not isinstance(task, dict) or not isinstance(task.get("title"), str) or not task["title"].strip() or not isinstance(task.get("description"), str) or not task["description"].strip():
                 raise ValueError("every task needs non-empty title and description")
+            dependencies = task.get("depends_on", [])
+            if not isinstance(dependencies, list) or not all(isinstance(item, str) and item.strip() for item in dependencies):
+                raise ValueError("task depends_on must be a string array")
 
     @staticmethod
     def _valid_selection(data: dict[str, object]) -> None:
@@ -125,7 +130,13 @@ class RoleAgents:
         actions = data.get("actions")
         if not isinstance(actions, list):
             raise ValueError("actions must be an array")
+        status = data.get("task_status", "ready_for_validation")
+        if status not in {"continue", "ready_for_validation"}:
+            raise ValueError("task_status must be continue or ready_for_validation")
+        if len(actions) > 4:
+            raise ValueError("action batch exceeds maximum action count")
         required = {"write_file": ("path", "content"), "append_file": ("path", "content"), "edit_file": ("path", "old", "new"), "delete_file": ("path",), "read_file": ("path",), "run_command": ("command",), "start_process": ("command",)}
+        textual_payload = 0
         for action in actions:
             # Some local models label the discriminator ``action``.  This is
             # a lossless representation change, not an inferred tool call.
@@ -140,6 +151,10 @@ class RoleAgents:
                         raise ValueError("command must be a non-empty string array")
                 elif not isinstance(value, str) or not value:
                     raise ValueError(f"action field {field} must be non-empty text")
+                if isinstance(value, str) and field in {"content", "old", "new"}:
+                    textual_payload += len(value)
+        if textual_payload > 12_000:
+            raise ValueError("action batch textual payload exceeds maximum")
 
     @staticmethod
     def _valid_command(data: dict[str, object]) -> None:
