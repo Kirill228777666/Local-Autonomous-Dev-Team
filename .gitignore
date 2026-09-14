@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-tmp/
+.pytest-full-*/
+.pytest-debug/
+.benchmark/
 .venv/
 .autodev/
 .e2e-runs/
@@ -9,3 +12,5 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+notes-run*.out.log
+notes-run*.err.log
