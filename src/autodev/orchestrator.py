@@ -162,6 +162,19 @@ class AutonomousRunner:
             self._mark(state, "ENVIRONMENT", "NOT_INITIALIZED", self.environment_manager.last_diagnostic, None)
             self.store.save(state)
             return state
+        if self._is_python_project(state):
+            provision = self.environment_manager.ensure_declared_dependencies()
+            if provision.attempted:
+                if provision.succeeded:
+                    state.environment["execution_context"] = self.environment_manager.execution_context()
+                    state.run_history.append("Declared project dependencies provisioned: " + ", ".join(provision.packages))
+                    self._mark(state, "ENVIRONMENT", "DEPENDENCY_PROVISIONED", f"Project-local dependencies provisioned: {', '.join(provision.packages)}", None)
+                else:
+                    state.status = "BLOCKED"
+                    state.run_history.append("Declared project dependency provisioning failed: " + self.environment_manager.last_diagnostic)
+                    self._mark(state, "ENVIRONMENT", "DEPENDENCY_PROVISION_FAILED", self.environment_manager.last_diagnostic, None)
+                    self.store.save(state)
+                    return state
         self._mark(state, "MANAGER", "PLANNING", "Autonomous run started")
         if not state.tasks:
             self._plan(state)
@@ -698,6 +711,26 @@ class AutonomousRunner:
                 self._retry_or_block(task, state, f"Tester error: {error}", "validation_command_invalid")
                 return
         validation, validator_record = self._record_validator_result(state, task, command, result)
+        # Dependency and owned-runtime failures are deterministic recovery
+        # work.  Repair and rerun the immutable acceptance command before any
+        # evidence-backed Coder strategy is considered.
+        if result.exit_code != 0:
+            environment = self._repair_environment_failure(
+                state,
+                task,
+                command,
+                result,
+                retry_command=lambda exact: self._run_validator(state, task, exact),
+            )
+            if environment.attempted:
+                result = environment.result
+                validation, validator_record = self._record_validator_result(
+                    state,
+                    task,
+                    command,
+                    result,
+                    previous_validator_run_id=task.last_validator_run_id or None,
+                )
         self._capture_repair_evidence(state, task, validator_record, validation.kind, result)
         if validation.kind is ValidationOutcome.NO_TESTS:
             fallback = self.validation_planner.fallback_for_no_tests(self.workspace, task, state.environment)
@@ -975,6 +1008,8 @@ class AutonomousRunner:
             self.tools.append_file(self._string(action, "path"), self._string(action, "content"))
         elif kind == "delete_file":
             self.tools.delete_file(self._string(action, "path"))
+        elif kind == "read_file":
+            self.tools.read_file(self._string(action, "path"))
         elif kind == "run_command":
             command = action.get("command")
             if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
@@ -1145,7 +1180,15 @@ class AutonomousRunner:
             state.run_history.append(f"Manager decomposed broad task: {task.title}")
             self._mark(state, "MANAGER", "DECOMPOSED", f"Decomposed broad task: {task.title}")
 
-    def _repair_environment_failure(self, state: ProjectState, task: Task, command: list[str], result: CommandResult) -> EnvironmentRepairOutcome:
+    def _repair_environment_failure(
+        self,
+        state: ProjectState,
+        task: Task,
+        command: list[str],
+        result: CommandResult,
+        *,
+        retry_command: Callable[[list[str]], CommandResult] | None = None,
+    ) -> EnvironmentRepairOutcome:
         failure = classify_failure(result, command, self.workspace)
         state.run_history.append(f"Failure classified: {failure.kind.value}")
         self._mark(state, "ENVIRONMENT", failure.kind.value, f"Classified command failure: {failure.kind.value}", task)
@@ -1153,6 +1196,7 @@ class AutonomousRunner:
             state.run_history.append("Test harness diagnostic: check cwd/package layout/PYTHONPATH before code repair")
             return EnvironmentRepairOutcome(False, False, result)
         repairable = {
+            FailureKind.MISSING_PROJECT_DEPENDENCY,
             FailureKind.MISSING_PYTHON_DEPENDENCY,
             FailureKind.MISSING_EXECUTABLE,
             FailureKind.GLOBAL_ENVIRONMENT_LEAK,
@@ -1171,7 +1215,7 @@ class AutonomousRunner:
             if self.environment_manager.last_diagnostic:
                 state.run_history.append(f"Environment limitation: {self.environment_manager.last_diagnostic}")
             return EnvironmentRepairOutcome(True, False, result)
-        retried = self.tools.run_command(command)
+        retried = retry_command(command) if retry_command is not None else self.tools.run_command(command)
         original_fingerprint = self.controller.failure_fingerprint(f"{failure.kind.value}\n{failure.detail}")
         if retried.exit_code:
             repeated = classify_failure(retried, command, self.workspace)
@@ -1214,7 +1258,7 @@ class AutonomousRunner:
             source_validator_run_id=validator_run_id,
         )
         if packet.failure_class is FailureClass.DEPENDENCY_API_MISMATCH:
-            package, version = next(iter(dependency_versions.items()), ("", ""))
+            package, version = next(iter(dependency_versions.items()), self._contract_dependency_candidate(state))
             if package:
                 research = self.research.official_docs_search(package, packet.research_query(), version, packet.exception_type)
                 packet.research_evidence.append({"url": research.url, "text": research.text[:2000], "official": str(research.official), "error": research.error})
@@ -1225,6 +1269,15 @@ class AutonomousRunner:
                 self._mark(state, "RESEARCH", "SUCCESS" if research.ok else "FAILURE", research.url if research.ok else research.error, task)
         task.last_repair_packet = packet.to_dict()
         self._mark(state, "REPAIR", "EVIDENCE_PACKET", f"Prepared {packet.failure_class.value} evidence for {task.capability_id or task.id}; source_validator_run_id={validator_run_id or 'legacy'}", task)
+
+    @staticmethod
+    def _contract_dependency_candidate(state: ProjectState) -> tuple[str, str]:
+        """Return a bounded public framework hint when stderr names only app symbols."""
+        architecture = state.project_contract.get("architecture")
+        if not isinstance(architecture, dict):
+            return "", ""
+        framework = str(architecture.get("backend_framework", "")).strip().lower()
+        return {"flask": ("Flask", ""), "django": ("Django", ""), "fastapi": ("FastAPI", "")}.get(framework, ("", ""))
 
     def _try_focused_repair(
         self,

@@ -1,0 +1,33 @@
+Exception in thread Thread-31 (_readerthread):
+Traceback (most recent call last):
+  File "C:\Users\Kirill\AppData\Local\Python\pythoncore-3.14-64\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\Kirill\AppData\Local\Python\pythoncore-3.14-64\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Kirill\AppData\Local\Python\pythoncore-3.14-64\Lib\subprocess.py", line 1614, in _readerthread
+    buffer.append(fh.read())
+                  ~~~~~~~^^
+  File "C:\Users\Kirill\AppData\Local\Python\pythoncore-3.14-64\Lib\encodings\cp1251.py", line 23, in decode
+    return codecs.charmap_decode(input,self.errors,decoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeDecodeError: 'charmap' codec can't decode byte 0x98 in position 261: character maps to <undefined>
+Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\Kirill\Local-Autonomous-Dev-Team\src\autodev\__main__.py", line 4, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "C:\Users\Kirill\Local-Autonomous-Dev-Team\src\autodev\cli.py", line 238, in main
+    workspace, summary = run_notes_live(config, args.config, args.artifacts, args.max_cycles)
+                         ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Kirill\Local-Autonomous-Dev-Team\src\autodev\endurance.py", line 222, in run_notes_live
+    state = runner.run(max_cycles=max_cycles)
+  File "C:\Users\Kirill\Local-Autonomous-Dev-Team\src\autodev\orchestrator.py", line 130, in run
+    self._run_task(state, task)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\Kirill\Local-Autonomous-Dev-Team\src\autodev\orchestrator.py", line 522, in _run_task
+    evidence = self._result_log(task, result) + "\nGit diff (bounded):\n" + self._git_diff()[-6000:]
+                                                                            ~~~~~~~~~~~~~~~~^^^^^^^^
+TypeError: 'NoneType' object is not subscriptable

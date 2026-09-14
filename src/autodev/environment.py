@@ -12,6 +12,7 @@ from .tools import CommandResult
 
 class FailureKind(StrEnum):
     MISSING_EXECUTABLE = "MISSING_EXECUTABLE"
+    MISSING_PROJECT_DEPENDENCY = "MISSING_PROJECT_DEPENDENCY"
     MISSING_PYTHON_DEPENDENCY = "MISSING_PYTHON_DEPENDENCY"
     MISSING_NODE_DEPENDENCY = "MISSING_NODE_DEPENDENCY"
     IMPORT_PATH = "IMPORT_PATH"
@@ -44,6 +45,14 @@ class ReadmeResult:
     findings: list[str]
 
 
+@dataclass(frozen=True, slots=True)
+class DependencyProvisioning:
+    """Result of a deterministic project-local manifest provisioning pass."""
+    attempted: bool
+    succeeded: bool
+    packages: list[str]
+
+
 def classify_failure(result: CommandResult, command: list[str], workspace: Path | None = None) -> Failure:
     text = f"{result.stdout}\n{result.stderr}"
     lowered = text.lower()
@@ -51,11 +60,6 @@ def classify_failure(result: CommandResult, command: list[str], workspace: Path 
         return Failure(FailureKind.ENVIRONMENT_NOT_INITIALIZED, command, text)
     if "syntaxerror" in lowered and "-c" in command:
         return Failure(FailureKind.TEST_HARNESS_FAILURE, command, text)
-    # _FailedTest is a runner wrapper around an import/application error, not
-    # malformed unittest syntax.  The underlying traceback belongs to Coder or
-    # dependency compatibility routing below.
-    if "unittest.loader._failedtest" in lowered and "syntaxerror" not in lowered:
-        return Failure(FailureKind.APPLICATION, command, text)
     if ("connection refused" in lowered or "failed to connect" in lowered) and any("localhost" in item or "127.0.0.1" in item for item in command):
         return Failure(FailureKind.SERVICE_NOT_RUNNING, command, text)
     if any(token in lowered for token in ("resolutionimpossible", "conflicting dependencies", "cannot import name 'url_quote'", "typingonly")):
@@ -67,7 +71,11 @@ def classify_failure(result: CommandResult, command: list[str], workspace: Path 
         name = module.group(1)
         if workspace is not None and _is_local_module(workspace, name):
             return Failure(FailureKind.LOCAL_IMPORT_PATH_ERROR, command, text, name)
-        kind = FailureKind.IMPORT_PATH if name in {"app", "src", "tests"} else FailureKind.MISSING_PYTHON_DEPENDENCY
+        # Runner wrappers such as unittest.loader._FailedTest are not the
+        # cause.  The nested missing module is authoritative.  Keep local
+        # application roots on the import/path route; known or declared third
+        # party imports are owned project dependencies.
+        kind = FailureKind.IMPORT_PATH if name in {"app", "src", "tests"} else FailureKind.MISSING_PROJECT_DEPENDENCY
         return Failure(kind, command, text, name)
     if result.exit_code == 127 or "command not found:" in text.lower() or "[winerror 2]" in text.lower():
         return Failure(FailureKind.MISSING_EXECUTABLE, command, text)
@@ -122,6 +130,7 @@ class EnvironmentManager:
             "cwd": str(self.workspace),
             "python_interpreter": str(self.venv_python) if self.venv_python.exists() else "",
             "pip": f"{self.venv_python} -m pip" if self.venv_python.exists() else "",
+            "system_site_packages": str(self._system_site_packages()).lower(),
         }
 
     def ensure_python_environment(self) -> bool:
@@ -142,14 +151,58 @@ class EnvironmentManager:
     def ensure_venv(self) -> bool:
         if self.venv_python.exists():
             return True
-        result = self.tools.run_command(["py", "-3", "-m", "venv", str(self.workspace / ".venv")])
+        # The environment remains project-owned while safely reusing packages
+        # already present in the selected host Python.  New project packages
+        # are still installed only through this venv interpreter.
+        result = self.tools.run_command(["py", "-3", "-m", "venv", "--system-site-packages", str(self.workspace / ".venv")])
         if result.exit_code:
             self.last_diagnostic = result.stderr or result.stdout
             return False
         return True
 
+    def ensure_declared_dependencies(self) -> DependencyProvisioning:
+        """Materialize missing declared packages in the owned interpreter only.
+
+        A system-site-enabled venv can satisfy the probe without an install;
+        an absent or incompatible declaration is installed into the project
+        environment.  No command here ever targets the host interpreter.
+        """
+        if not self.ensure_python_environment():
+            return DependencyProvisioning(False, False, [])
+        requirements, has_requirements_file = self._declared_requirements()
+        if not requirements:
+            return DependencyProvisioning(False, True, [])
+        missing: list[str] = []
+        for requirement in requirements:
+            package = _requirement_name(requirement)
+            if not package:
+                continue
+            probe = self.tools.run_command([
+                str(self.venv_python), "-c",
+                f"import importlib.metadata as m; print(m.version({package!r}))",
+            ])
+            if probe.exit_code or not _requirement_is_satisfied(requirement, probe.stdout.strip()):
+                missing.append(package)
+        if not missing:
+            return DependencyProvisioning(False, True, [])
+        install = [str(self.venv_python), "-m", "pip", "install"]
+        install.extend(["-r", "requirements.txt"] if has_requirements_file else missing)
+        result = self.tools.run_command(install)
+        self.last_diagnostic = result.stderr or result.stdout
+        if result.exit_code:
+            return DependencyProvisioning(True, False, missing)
+        for package in missing:
+            probe = self.tools.run_command([
+                str(self.venv_python), "-c",
+                f"import importlib.metadata as m; print(m.version({package!r}))",
+            ])
+            if probe.exit_code:
+                self.last_diagnostic = probe.stderr or probe.stdout
+                return DependencyProvisioning(True, False, missing)
+        return DependencyProvisioning(True, True, missing)
+
     def repair(self, failure: Failure, state: dict[str, object] | None = None) -> bool:
-        if failure.kind is FailureKind.MISSING_PYTHON_DEPENDENCY and failure.module:
+        if failure.kind in {FailureKind.MISSING_PROJECT_DEPENDENCY, FailureKind.MISSING_PYTHON_DEPENDENCY} and failure.module:
             if not self.allow_project_dependency_install:
                 self.last_diagnostic = "Project dependency installation is disabled."
                 return False
@@ -167,9 +220,15 @@ class EnvironmentManager:
                 return False
             manifest = self.workspace / "requirements.txt"
             existing = manifest.read_text(encoding="utf-8").splitlines() if manifest.exists() else []
-            if not any(line.lower().split("==")[0] == package.lower() for line in existing):
+            if not any(_requirement_name(line) == package.lower() for line in existing):
                 manifest.write_text("\n".join([*existing, package]) + "\n", encoding="utf-8")
-            result = self.tools.run_command([str(self.venv_python), "-m", "pip", "install", package])
+            # Prefer the declared project manifest when it already owns the
+            # missing package.  Otherwise persist the safe mapping before the
+            # package-specific installation so the repair is reproducible.
+            install_command = [str(self.venv_python), "-m", "pip", "install", package]
+            if any(_requirement_name(line) == package.lower() for line in existing):
+                install_command = [str(self.venv_python), "-m", "pip", "install", "-r", "requirements.txt"]
+            result = self.tools.run_command(install_command)
             self.last_diagnostic = result.stderr or result.stdout
             if isinstance(dependencies, dict):
                 installed = dependencies.setdefault("installed", [])
@@ -178,7 +237,7 @@ class EnvironmentManager:
                 if result.exit_code and isinstance(failures, list) and fingerprint not in failures:
                     failures.append(fingerprint)
                 dependencies["interpreter"] = str(self.venv_python)
-            return result.exit_code == 0
+            return result.exit_code == 0 and self.verify(failure)
         if failure.kind is FailureKind.PROJECT_DEPENDENCY_INCOMPATIBLE:
             lowered = failure.detail.lower()
             if "sqlalchemy" not in lowered and "typingonly" not in lowered:
@@ -234,10 +293,60 @@ class EnvironmentManager:
 
     def verify(self, failure: Failure) -> bool:
         """Verify the repaired condition without claiming success from an install exit code."""
-        if failure.kind is FailureKind.MISSING_PYTHON_DEPENDENCY and failure.module:
+        if failure.kind in {FailureKind.MISSING_PROJECT_DEPENDENCY, FailureKind.MISSING_PYTHON_DEPENDENCY} and failure.module:
             probe = self.tools.run_command([str(self.venv_python), "-c", f"import {failure.module}"])
             self.last_diagnostic = probe.stderr or probe.stdout
             return probe.exit_code == 0
+        return False
+
+    def _system_site_packages(self) -> bool:
+        config = self.workspace / ".venv" / "pyvenv.cfg"
+        if not config.is_file():
+            return False
+        return "include-system-site-packages = true" in config.read_text(encoding="utf-8", errors="ignore").lower()
+
+    def _declared_requirements(self) -> tuple[list[str], bool]:
+        """Read conventional Python dependency declarations without executing them."""
+        requirements_file = self.workspace / "requirements.txt"
+        if requirements_file.is_file():
+            lines = requirements_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+            return _clean_requirements(lines), True
+        pyproject = self.workspace / "pyproject.toml"
+        if pyproject.is_file():
+            text = pyproject.read_text(encoding="utf-8", errors="ignore")
+            block = re.search(r"dependencies\s*=\s*\[(.*?)\]", text, flags=re.DOTALL)
+            if block:
+                return _clean_requirements(re.findall(r"['\"]([^'\"]+)['\"]", block.group(1))), False
+        setup_cfg = self.workspace / "setup.cfg"
+        if setup_cfg.is_file():
+            text = setup_cfg.read_text(encoding="utf-8", errors="ignore")
+            block = re.search(r"install_requires\s*=\s*(.*?)(?:\n\[|\Z)", text, flags=re.DOTALL)
+            if block:
+                return _clean_requirements(block.group(1).splitlines()), False
+        return [], False
+
+
+def _requirement_name(line: str) -> str:
+    return re.split(r"[<>=!~\[\s]", line.strip(), maxsplit=1)[0].lower()
+
+
+def _clean_requirements(lines: list[str]) -> list[str]:
+    return [line.strip() for line in lines if line.strip() and not line.lstrip().startswith(("#", "-"))]
+
+
+def _requirement_is_satisfied(requirement: str, installed: str) -> bool:
+    """Conservatively compare a declared public requirement with one version."""
+    match = re.match(r"\s*[A-Za-z0-9_.-]+(?:\[[^]]+\])?\s*(.*)$", requirement)
+    specifier = match.group(1).strip() if match else ""
+    if not specifier:
+        return bool(installed)
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+        return Version(installed) in SpecifierSet(specifier)
+    except Exception:
+        # A nonstandard declaration must not silently reuse an unknown host
+        # version.  Let the project-local installer resolve it instead.
         return False
 
 

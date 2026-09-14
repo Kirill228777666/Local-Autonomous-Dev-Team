@@ -50,6 +50,7 @@ class RoleAgents:
             "{\"kind\":\"write_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
             "{\"kind\":\"edit_file\",\"path\":\"relative/path\",\"old\":\"exact text\",\"new\":\"replacement\"}; "
             "{\"kind\":\"delete_file\",\"path\":\"relative/path\"}; "
+            "{\"kind\":\"read_file\",\"path\":\"relative/path\"}; "
             "{\"kind\":\"append_file\",\"path\":\"relative/path\",\"content\":\"text\"}; "
             "{\"kind\":\"run_command\",\"command\":[\"program\",\"arg\"]}; "
             "{\"kind\":\"start_process\",\"command\":[\"program\",\"arg\"]}. "
@@ -124,8 +125,12 @@ class RoleAgents:
         actions = data.get("actions")
         if not isinstance(actions, list):
             raise ValueError("actions must be an array")
-        required = {"write_file": ("path", "content"), "append_file": ("path", "content"), "edit_file": ("path", "old", "new"), "delete_file": ("path",), "run_command": ("command",), "start_process": ("command",)}
+        required = {"write_file": ("path", "content"), "append_file": ("path", "content"), "edit_file": ("path", "old", "new"), "delete_file": ("path",), "read_file": ("path",), "run_command": ("command",), "start_process": ("command",)}
         for action in actions:
+            # Some local models label the discriminator ``action``.  This is
+            # a lossless representation change, not an inferred tool call.
+            if isinstance(action, dict) and "kind" not in action and isinstance(action.get("action"), str):
+                action["kind"] = action["action"]
             if not isinstance(action, dict) or action.get("kind") not in required:
                 raise ValueError("action kind is invalid")
             for field in required[action["kind"]]:  # type: ignore[index]

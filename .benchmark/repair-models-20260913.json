@@ -1,0 +1,273 @@
+{
+  "settings": {
+    "temperature": 0.05,
+    "context_limit": 16384,
+    "think": false
+  },
+  "models": {
+    "qwen3-coder:30b": {
+      "cases": [
+        {
+          "case": "sqlalchemy_engine_has_table",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": false,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "db.py",
+                "old": "def table_exists(engine, name):\n    return engine.has_table(name)",
+                "new": "from sqlalchemy import inspect\n\ndef table_exists(engine, name):\n    inspector = inspect(engine)\n    return name in inspector.get_table_names()"
+              }
+            ]
+          },
+          "latency_seconds": 16.004
+        },
+        {
+          "case": "module_level_flask_contract",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "tests/test_app.py",
+                "old": "from app import create_app\nclient = create_app().test_client()",
+                "new": "from app import app\nclient = app.test_client()"
+              }
+            ]
+          },
+          "latency_seconds": 1.594
+        },
+        {
+          "case": "category_response_requires_id",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "api.py",
+                "old": "def create_category(name):\n    category = {'name': name}\n    return category, 201",
+                "new": "def create_category(name):\n    category = {'name': name, 'id': 1}\n    return category, 201"
+              }
+            ]
+          },
+          "latency_seconds": 2.131
+        },
+        {
+          "case": "http_error_contract",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": false,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "api.py",
+                "old": "def delete_note(store, note_id):\n    note = store[note_id]\n    del store[note_id]\n    return '', 204",
+                "new": "def delete_note(store, note_id):\n    try:\n        note = store[note_id]\n        del store[note_id]\n        return '', 204\n    except KeyError:\n        return '', 404"
+              }
+            ]
+          },
+          "latency_seconds": 2.83
+        },
+        {
+          "case": "managed_flask_runtime",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "start_process",
+                "command": [
+                  "python",
+                  "app.py"
+                ]
+              }
+            ]
+          },
+          "latency_seconds": 0.922
+        },
+        {
+          "case": "preserve_accepted_regression",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "service.py",
+                "old": "def feature():\n    raise NotImplementedError",
+                "new": "def feature():\n    return 'ready'"
+              }
+            ]
+          },
+          "latency_seconds": 1.336
+        }
+      ],
+      "valid_structured_response_rate": 1.0,
+      "valid_tool_action_rate": 1.0,
+      "noop_rate": 0.0,
+      "successful_task_fix_rate": 0.6666666666666666,
+      "average_latency_seconds": 4.136166666666667,
+      "tool_actions": 6,
+      "unnecessary_full_file_rewrites": 0
+    },
+    "qwen3.6:35b-coding": {
+      "cases": [
+        {
+          "case": "sqlalchemy_engine_has_table",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "db.py",
+                "old": "def table_exists(engine, name):\n    return engine.has_table(name)",
+                "new": "def table_exists(engine, name):\n    from sqlalchemy import inspect\n    return inspect(engine).has_table(name)"
+              }
+            ]
+          },
+          "latency_seconds": 24.832
+        },
+        {
+          "case": "module_level_flask_contract",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "tests/test_app.py",
+                "old": "from app import create_app\nclient = create_app().test_client()",
+                "new": "from app import app\nclient = app.test_client()"
+              }
+            ]
+          },
+          "latency_seconds": 1.388
+        },
+        {
+          "case": "category_response_requires_id",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "api.py",
+                "old": "def create_category(name):\n    category = {'name': name}\n    return category, 201",
+                "new": "import uuid\n\ndef create_category(name):\n    category = {'id': str(uuid.uuid4()), 'name': name}\n    return category, 201"
+              }
+            ]
+          },
+          "latency_seconds": 1.903
+        },
+        {
+          "case": "http_error_contract",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": false,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "api.py",
+                "old": "def delete_note(store, note_id):\n    note = store[note_id]\n    del store[note_id]\n    return '', 204",
+                "new": "def delete_note(store, note_id):\n    if note_id not in store:\n        return 'Not Found', 404\n    note = store[note_id]\n    del store[note_id]\n    return '', 204"
+              }
+            ]
+          },
+          "latency_seconds": 2.359
+        },
+        {
+          "case": "managed_flask_runtime",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "start_process",
+                "command": [
+                  "python",
+                  "app.py"
+                ]
+              }
+            ]
+          },
+          "latency_seconds": 1.002
+        },
+        {
+          "case": "preserve_accepted_regression",
+          "valid_structured_response": true,
+          "valid_tool_actions": true,
+          "noop": false,
+          "tool_actions": 1,
+          "full_file_rewrites": 0,
+          "successful_task_fix": true,
+          "raw_reply": {
+            "actions": [
+              {
+                "kind": "edit_file",
+                "path": "service.py",
+                "old": "def feature():\n    raise NotImplementedError",
+                "new": "def feature():\n    return 'ready'"
+              }
+            ]
+          },
+          "latency_seconds": 1.389
+        }
+      ],
+      "valid_structured_response_rate": 1.0,
+      "valid_tool_action_rate": 1.0,
+      "noop_rate": 0.0,
+      "successful_task_fix_rate": 0.8333333333333334,
+      "average_latency_seconds": 5.478833333333333,
+      "tool_actions": 6,
+      "unnecessary_full_file_rewrites": 0
+    }
+  }
+}

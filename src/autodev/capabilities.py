@@ -181,11 +181,22 @@ def repair_generated_test_for_contract(contract: dict[str, object], content: str
     # Preserve the module selected by the generated artifact.  Run-14 used
     # ``from backend.app import create_app, init_db``; forcing it to ``app.py``
     # silently changed a lower-authority test into a different application.
+    # An alias has a different call site, so normalize that representation
+    # before the generic direct-import repair below.
+    repaired = content
+    aliases = list(re.finditer(
+        r"from\s+([A-Za-z_][\w.]*)\s+import\s+create_app\s+as\s+([A-Za-z_]\w*)",
+        repaired,
+    ))
+    for match in aliases:
+        module, alias = match.group(1), match.group(2)
+        repaired = repaired.replace(match.group(0), f"from {module} import {symbol}", 1)
+        repaired = re.sub(rf"\b{re.escape(alias)}\s*\(\s*\)", symbol, repaired)
     # Replace only the forbidden imported symbol and its direct call.
     repaired = re.sub(
         r"(from\s+[A-Za-z_][\w.]*\s+import\s+[^\n]*?)\bcreate_app\b",
         lambda match: match.group(1) + symbol,
-        content,
+        repaired,
     )
     repaired = re.sub(r"\bcreate_app\s*\(\s*\)", symbol, repaired)
     return repaired if repaired != content and "create_app" not in repaired else None

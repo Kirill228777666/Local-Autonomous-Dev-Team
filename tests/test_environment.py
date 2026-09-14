@@ -44,7 +44,7 @@ class IncompatibilityRepairTools(RecordingTools):
 
 
 def test_classifier_identifies_environment_failures_before_llm_repair() -> None:
-    assert classify_failure(CommandResult(1, "", "ModuleNotFoundError: No module named 'flask'"), ["py", "-3", "app.py"]).kind is FailureKind.MISSING_PYTHON_DEPENDENCY
+    assert classify_failure(CommandResult(1, "", "ModuleNotFoundError: No module named 'flask'"), ["py", "-3", "app.py"]).kind is FailureKind.MISSING_PROJECT_DEPENDENCY
     assert classify_failure(CommandResult(127, "", "command not found: npm"), ["npm", "install"]).kind is FailureKind.MISSING_EXECUTABLE
     assert classify_failure(CommandResult(1, "", "ModuleNotFoundError: No module named 'app'"), ["py", "-3", "-m", "pytest"]).kind is FailureKind.IMPORT_PATH
     assert classify_failure(CommandResult(1, "", "SyntaxError: invalid syntax"), ["py", "-3", "-c", "import re; with open('x'): pass"]).kind is FailureKind.TEST_HARNESS_FAILURE
