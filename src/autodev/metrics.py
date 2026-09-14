@@ -121,6 +121,12 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "contract_conflicts_detected": count("TESTER", "CONTRACT_CONFLICT_DETECTED"),
         "contract_conflicts_resolved": count("TESTER", "CONTRACT_CONFLICT_RESOLVED"),
         "contract_conflicts_unresolved": count("TESTER", "CONTRACT_CONFLICT_UNRESOLVED"),
+        "contract_policy_violations_detected": count("CODER", "CONTRACT_POLICY_VIOLATION"),
+        "contract_policy_violations_resolved": count("CODER", "CONTRACT_POLICY_RESOLVED"),
+        "contract_policy_violations_unresolved": max(
+            0,
+            count("CODER", "CONTRACT_POLICY_VIOLATION") - count("CODER", "CONTRACT_POLICY_RESOLVED"),
+        ),
         "generated_tests_repaired_for_contract": count("TESTER", "CONTRACT_CONFLICT_RESOLVED"),
         "reviewer_scope_violations_prevented": count("REVIEWER", "SCOPE_VIOLATION"),
         "reviewer_invalid_rejections": count("REVIEWER", "SCOPE_VIOLATION") + count("REVIEWER", "CONTRACT_CONFLICT"),
@@ -141,6 +147,26 @@ def metrics(state: ProjectState) -> dict[str, object]:
         "targeted_edit_reprompts": count("CODER", "DESTRUCTIVE_WRITE_REJECTED"),
         "environment_capability_cache_hits": sum("known unavailable" in entry.lower() for entry in history),
         "task_decompositions": sum("decomposed" in entry.lower() for entry in history),
+        "tasks_waiting_on_blocked_dependencies": count("CONTROLLER", "WAITING_ON_DEPENDENCY"),
+        "tool_failures_contained": count("CODER", "TOOL_FAILED"),
+        "controller_fatal_errors": count("SYSTEM", "CRASHED"),
+        "system_crashes": count("SYSTEM", "CRASHED"),
+        "coder_action_batches": count("CODER", "CODER_ACTIONS"),
+        "coder_continuation_batches": count("CODER", "BATCH_CONTINUATION"),
+        "coder_protocol_recoveries": count("CODER", "CODER_STRUCTURED_OUTPUT_REPAIR"),
+        "coder_protocol_recovery_failures": count("CODER", "CODER_STRUCTURED_OUTPUT_BLOCKED"),
+        "coder_malformed_responses": count("CODER", "CODER_MALFORMED_RESPONSE"),
+        "mixed_validation_failure_groups": sum(
+            len(record.get("secondary_failure_classes", []))
+            for record in state.validator_runs
+            if isinstance(record.get("secondary_failure_classes"), list)
+        ),
+        "internal_validator_reruns": sum(
+            record.get("validator_kind") == "internal" and bool(record.get("previous_validator_run_id"))
+            for record in state.validator_runs
+        ),
+        "environment_repair_action_successes": count("ENVIRONMENT", "REPAIRED"),
+        "environment_original_failure_cleared": count("ENVIRONMENT", "REPAIR_SUCCEEDED"),
         "regression_checks": count("REGRESSION", "CHECK"),
         "regression_failures": count("REGRESSION", "FAIL"),
         "attempt_rollbacks_total": sum(task.rollback_count for task in state.tasks),

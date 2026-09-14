@@ -8,8 +8,9 @@ from autodev.capabilities import build_project_contract, contract_policy_violati
 from autodev.environment import EnvironmentManager, Failure, FailureKind
 from autodev.environment import validate_readme
 from autodev.models import ProjectState, Task, TaskStatus
+from autodev.metrics import metrics
 from autodev.orchestrator import AutonomousRunner
-from autodev.providers import AgentReply, ScriptedProvider
+from autodev.providers import AgentReply, AgentRequest, ProviderError, ScriptedProvider
 from autodev.state_store import StateStore
 from autodev.tools import CommandResult, WorkspaceTools
 from autodev.validation import ValidationOutcome
@@ -32,6 +33,19 @@ class RecordingTools:
     def run_command(self, command: list[str]) -> CommandResult:
         self.commands.append(command)
         return CommandResult(0, "installed", "")
+
+
+class TruncatedThenValidProvider(ScriptedProvider):
+    def __init__(self) -> None:
+        super().__init__({"CODER": [AgentReply({"actions": [], "task_status": "ready_for_validation"})]})
+        self.calls = 0
+
+    def complete(self, request: AgentRequest) -> AgentReply:
+        if request.role == "CODER" and self.calls == 0:
+            self.calls += 1
+            raise ProviderError("Unterminated string starting at character 46000")
+        self.calls += 1
+        return super().complete(request)
 
 
 def test_stdlib_only_contract_rejects_generated_external_import() -> None:
@@ -69,6 +83,24 @@ def test_existing_forbidden_import_is_detected_before_environment_repair(tmp_pat
     assert findings[0][1].subject == "imaginary_framework"
 
 
+def test_forbidden_import_routes_to_coder_not_environment_repair(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    (tmp_path / "application.py").write_text("import imaginary_framework\n", encoding="utf-8")
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))
+    state = ProjectState.create("Python standard library only; no external Python dependencies")
+    state.project_contract = build_project_contract(state.original_spec, {})
+    task = Task.create("Implementation", "Implement the service")
+    state.tasks = [task]
+
+    outcome = runner._repair_environment_failure(
+        state, task, ["python", "application.py"], CommandResult(1, "", "ModuleNotFoundError: No module named 'imaginary_framework'")
+    )
+
+    assert outcome.attempted is False
+    assert any(event.phase == "CONTRACT_POLICY_VIOLATION" for event in state.events)
+    assert not any(event.phase == "REPAIR_ATTEMPT" for event in state.events)
+
+
 def test_mixed_validator_failure_keeps_application_failure_evidence(tmp_path: Path) -> None:
     result = CommandResult(
         1,
@@ -95,6 +127,21 @@ def test_validator_record_has_explicit_validation_strength(tmp_path: Path) -> No
     )
 
     assert record["validation_strength"] == "STRUCTURAL"
+
+
+def test_control_plane_metrics_are_derived_from_durable_events() -> None:
+    state = ProjectState.create("Build service")
+    state.record_event("CODER", "CONTRACT_POLICY_VIOLATION", "forbidden import")
+    state.record_event("CONTROLLER", "WAITING_ON_DEPENDENCY", "blocked parent")
+    state.record_event("CODER", "BATCH_CONTINUATION", "next batch")
+    state.validator_runs.append({"secondary_failure_classes": ["VALIDATION_APPLICATION_FAIL"]})
+
+    observed = metrics(state)
+
+    assert observed["contract_policy_violations_detected"] == 1
+    assert observed["tasks_waiting_on_blocked_dependencies"] == 1
+    assert observed["coder_continuation_batches"] == 1
+    assert observed["mixed_validation_failure_groups"] == 1
 
 
 def test_blocked_hard_dependency_never_becomes_ready() -> None:
@@ -200,3 +247,40 @@ def test_coder_action_batches_are_bounded_and_continue_same_attempt() -> None:
         assert "payload" in str(error)
     else:
         raise AssertionError("oversized action batch must be rejected before tool execution")
+
+
+def test_continuation_batches_execute_within_one_task_attempt(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    provider = ScriptedProvider({
+        "CODER": [
+            AgentReply({"actions": [{"kind": "write_file", "path": "page.txt", "content": "first"}], "task_status": "continue"}),
+            AgentReply({"actions": [{"kind": "append_file", "path": "page.txt", "content": " second"}], "task_status": "ready_for_validation"}),
+        ],
+        "TESTER": [AgentReply({"command": ["py", "-3", "-c", "assert open('page.txt').read() == 'first second'"]})],
+        "REVIEWER": [AgentReply({"approved": True, "reasons": []})],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = ProjectState.create("Build a static page")
+    task = Task.create("Create page", "Create a static page")
+    state.tasks = [task]
+
+    runner._run_task(state, task)
+
+    assert task.attempts == 1
+    assert task.status is TaskStatus.DONE
+    assert (tmp_path / "page.txt").read_text(encoding="utf-8") == "first second"
+    assert sum(event.phase == "BATCH_CONTINUATION" for event in state.events) == 1
+
+
+def test_truncated_coder_protocol_recovers_with_small_next_batch(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    provider = TruncatedThenValidProvider()
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = ProjectState.create("Build a page")
+    task = Task.create("Page", "Create a page")
+
+    actions = runner._request_coder_actions(state, task, "Coder implementation request")
+
+    assert actions == []
+    assert provider.calls == 2
+    assert any(event.phase == "CODER_PROTOCOL_RECOVERY" for event in state.events)

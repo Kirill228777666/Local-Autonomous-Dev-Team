@@ -484,6 +484,8 @@ class AutonomousRunner:
         task: Task,
         message: str,
         relevant_files: list[str] | None = None,
+        *,
+        protocol_recovery_used: bool = False,
     ) -> CoderActionBatch:
         """Make one semantic Coder call with an explicit terminal outcome."""
         self._mark(state, "CODER", "LLM_CALL", message, task)
@@ -495,6 +497,15 @@ class AutonomousRunner:
             self._mark(state, "CODER", "CODER_PROVIDER_FAILURE", "Coder request interrupted by provider", task)
             raise
         except ProviderError as error:
+            if not protocol_recovery_used and self._is_coder_protocol_failure(str(error)):
+                self._mark(state, "CODER", "CODER_PROTOCOL_RECOVERY", "Malformed/truncated Coder output; requesting only the next bounded action batch", task)
+                return self._request_coder_actions(
+                    state,
+                    task,
+                    "Coder bounded protocol recovery request",
+                    relevant_files,
+                    protocol_recovery_used=True,
+                )
             invalid_count = self.agents.last_structured_invalid_count if self.agents.last_structured_role == "CODER" else 0
             for _ in range(invalid_count):
                 self._mark(state, "CODER", "CODER_STRUCTURED_OUTPUT_INVALID", str(error), task)
@@ -519,6 +530,14 @@ class AutonomousRunner:
         else:
             self._mark(state, "CODER", "NOOP", "Coder returned no tool actions", task)
         return CoderActionBatch(actions, str(task_status))
+
+    @staticmethod
+    def _is_coder_protocol_failure(message: str) -> bool:
+        lowered = message.lower()
+        return any(marker in lowered for marker in (
+            "unterminated string", "invalid structured output", "jsondecodeerror",
+            "expecting ',' delimiter", "malformed json", "extra data",
+        ))
 
     def _execute_coder_actions(self, state: ProjectState, task: Task, initial: list[object]) -> list[object] | None:
         """Execute actions while keeping recoverable tool failures inside this attempt."""
