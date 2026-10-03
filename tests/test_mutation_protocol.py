@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import re
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -59,9 +60,12 @@ class RecordingProvider(ScriptedProvider):
         elif not request.raw_response and reply.data.get("request_id") == "AUTO":
             token = re.search(r"Mutation request id: ([0-9a-f]+)", request.prompt)
             path = re.search(r"^Path: (.+)$", request.prompt, re.MULTILINE)
+            file_hash = re.search(r"^Expected file SHA-256: ([0-9a-f]+)$", request.prompt, re.MULTILINE)
             assert token is not None and path is not None
             reply.data["request_id"] = token.group(1)
             reply.data["path"] = path.group(1)
+            if file_hash is not None:
+                reply.data["expected_file_hash"] = file_hash.group(1)
         self.responses.append(reply.data)
         return reply
 
@@ -239,13 +243,26 @@ def test_wrong_request_nonce_and_wrong_target_path_are_rejected() -> None:
 
 
 def test_fallback_json_rejects_wrong_request_identity_or_path() -> None:
-    fields = {"request_id": "other", "path": "app.css", "operation": "append", "old": "", "content": "body", "done": True}
+    fields = {
+        "request_id": "other", "path": "app.css", "expected_file_hash": "abc",
+        "operation": "append", "old": "", "content": "body", "done": True,
+    }
 
     with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
-        RoleAgents._parse_json_mutation(fields, "token", "app.css", 2_000)
+        RoleAgents._parse_json_mutation(fields, "token", "app.css", "abc", 2_000)
     fields.update(request_id="token", path="other.css")
     with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
-        RoleAgents._parse_json_mutation(fields, "token", "app.css", 2_000)
+        RoleAgents._parse_json_mutation(fields, "token", "app.css", "abc", 2_000)
+
+
+def test_fallback_json_rejects_wrong_file_context_hash() -> None:
+    fields = {
+        "request_id": "token", "path": "app.css", "expected_file_hash": "stale",
+        "operation": "append", "old": "", "content": "body", "done": True,
+    }
+
+    with pytest.raises(ProviderError, match="identity/path mismatch"):
+        RoleAgents._parse_json_mutation(fields, "token", "app.css", "current", 2_000)
 
 
 def test_missing_new_end_is_not_guessed_at_eof_even_for_normal_completion() -> None:
@@ -368,6 +385,145 @@ def test_invalid_fallback_terminates_as_task_protocol_failure_without_crash(tmp_
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == "a { color: red; }\n"
     assert metrics(state)["mutation_frame_fallback_failures"] == 1
     assert metrics(state)["system_crashes"] == 0
+
+
+def test_json_fallback_target_mismatch_refreshes_context_and_recovers_same_attempt(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    original = ".card { color: red; }\n"
+    (tmp_path / "style.css").write_text(original, encoding="utf-8")
+    provider = RecordingProvider({
+        "CODER": [
+            AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nred\nNEW-BEGIN-wrong\nblue\nNEW-END-wrong"}),
+            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": "color: burgundy;", "content": "color: blue;", "done": True}),
+            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": ".card { color: red; }", "content": ".card { color: blue; }", "done": True}),
+        ],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = ProjectState.create("Edit CSS")
+    task = Task.create("Change card color", "Change card color")
+    task.attempts = 1
+
+    runner._execute_coder_actions(state, task, [{"kind": "mutate_file", "path": "style.css", "intent": "change card color"}])
+
+    assert task.attempts == 1
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: blue; }\n"
+    assert len(provider.requests) == 3
+    assert "color: red;" in provider.requests[1].prompt
+    assert "color: red;" in provider.requests[2].prompt
+    assert re.search(r"^Expected file SHA-256: [0-9a-f]{64}$", provider.requests[1].prompt, re.MULTILINE)
+    assert any(event.phase == "MUTATION_TARGET_MISMATCH" for event in state.events)
+    assert any(event.phase == "MUTATION_CONTEXT_RECOVERY_SUCCESS" for event in state.events)
+    assert metrics(state)["mutation_context_recovery_successes"] == 1
+    assert metrics(state)["semantic_retry_count"] == 0
+    assert not any(event.agent == "ARCHITECT" for event in state.events)
+    assert sum(execution.kind == "edit_file" for execution in state.tool_executions) == 1
+
+
+def test_file_version_change_rejects_patch_then_requests_fresh_context(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    path = tmp_path / "style.css"
+    path.write_text(".card { color: red; }\n", encoding="utf-8")
+    original_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    class ChangingProvider(RecordingProvider):
+        def complete(self, request: AgentRequest) -> AgentReply:
+            reply = super().complete(request)
+            if len(self.requests) == 1 and request.raw_response:
+                path.write_text("/* concurrent update */\n.card { color: red; }\n", encoding="utf-8")
+            return reply
+
+    provider = ChangingProvider({
+        "CODER": [
+            _patch(".card { color: blue; }", operation="replace", old=".card { color: red; }", done=True),
+            _patch(".card { color: blue; }", operation="replace", old=".card { color: red; }", done=True),
+        ],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = ProjectState.create("Edit CSS")
+    task = Task.create("Change card color", "Change card color")
+    task.attempts = 1
+
+    runner._execute_mutation_decision(state, task, {"path": "style.css", "intent": "change card color"})
+
+    assert path.read_text(encoding="utf-8") == "/* concurrent update */\n.card { color: blue; }\n"
+    assert task.attempts == 1
+    assert original_hash in provider.requests[0].prompt
+    assert any(event.phase == "MUTATION_STALE_CONTEXT" for event in state.events)
+    assert metrics(state)["mutation_stale_contexts"] == 1
+    assert metrics(state)["mutation_context_recovery_successes"] == 1
+    assert metrics(state)["semantic_retry_count"] == 0
+
+
+def test_context_recovery_exhaustion_is_protocol_only_without_unmutated_rollback(tmp_path: Path, monkeypatch) -> None:
+    _repository(tmp_path)
+    original = ".card { color: red; }\n"
+    (tmp_path / "style.css").write_text(original, encoding="utf-8")
+    wrong_frame = "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nred\nNEW-BEGIN-wrong\nblue\nNEW-END-wrong"
+    provider = RecordingProvider({
+        "CODER": [
+            AgentReply({"actions": [{"kind": "mutate_file", "path": "style.css", "intent": "change card color"}]}),
+            AgentReply({"raw_text": wrong_frame}),
+            *[
+                AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": "not present", "content": ".card { color: blue; }", "done": True})
+                for _ in range(3)
+            ],
+        ],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider, max_attempts=1)
+    monkeypatch.setattr(runner, "_retry_or_block", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("semantic retry must not run")))
+    state = ProjectState.create("Edit CSS")
+    task = Task.create("Change card color", "Change card color")
+    state.tasks = [task]
+
+    runner._run_task(state, task)
+
+    assert task.status is TaskStatus.BLOCKED
+    assert task.attempts == 1
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == original
+    assert not any(event.phase == "ATTEMPT_ROLLBACK" for event in state.events)
+    assert not any(event.agent == "ARCHITECT" for event in state.events)
+    assert metrics(state)["mutation_context_recovery_attempts"] == 2
+    assert metrics(state)["mutation_context_recovery_exhaustions"] == 1
+    assert metrics(state)["attempt_rollbacks_total"] == 0
+    assert metrics(state)["semantic_retry_count"] == 0
+
+
+def test_context_mismatch_recovers_then_exact_acceptance_and_review_continue(tmp_path: Path, monkeypatch) -> None:
+    _repository(tmp_path)
+    original = ".card { color: red; }\n"
+    (tmp_path / "style.css").write_text(original, encoding="utf-8")
+    provider = RecordingProvider({
+        "CODER": [
+            AgentReply({"actions": [{"kind": "mutate_file", "path": "style.css", "intent": "change card color"}], "task_status": "ready_for_validation"}),
+            AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nred\nNEW-BEGIN-wrong\nblue\nNEW-END-wrong"}),
+            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": "color: burgundy;", "content": "color: blue;", "done": True}),
+            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": ".card { color: red; }", "content": ".card { color: blue; }", "done": True}),
+        ],
+        "TESTER": [AgentReply({"command": ["py", "-3", "-c", "print('acceptance pass')"]})],
+        "REVIEWER": [AgentReply({"approved": True, "reasons": []})],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = ProjectState.create("Edit CSS")
+    task = Task.create("Change card color", "Change card color")
+    task.acceptance_validator = {"validator_id": "card-color", "command": ["deterministic acceptance"]}
+    state.tasks = [task]
+    validator_calls: list[dict[str, object]] = []
+
+    def pass_validator(_state: ProjectState, _task: Task, validator: dict[str, object]) -> CommandResult:
+        validator_calls.append(validator)
+        return CommandResult(0, "PASS", "")
+
+    monkeypatch.setattr(runner, "_run_validator", pass_validator)
+
+    runner._run_task(state, task)
+
+    assert task.status is TaskStatus.DONE
+    assert task.attempts == 1
+    assert validator_calls == [task.acceptance_validator["command"]]
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: blue; }\n"
+    assert metrics(state)["mutation_context_recovery_successes"] == 1
+    assert metrics(state)["semantic_retry_count"] == 0
+    assert not any(event.agent == "ARCHITECT" for event in state.events)
 
 
 def test_replace_refuses_old_text_that_matches_more_than_one_current_region(tmp_path: Path) -> None:

@@ -95,6 +95,7 @@ class RoleAgents:
         existing: bool,
         continuation: int,
         request_id: str | None = None,
+        expected_file_hash: str = "",
         max_patch_characters: int = 6_000,
         recovery_reason: str = "",
         representation: str = "framed",
@@ -111,15 +112,16 @@ class RoleAgents:
         new_start = f"NEW-BEGIN-{marker}"
         new_end = f"NEW-END-{marker}"
         common = (
-            f"Mutation request id: {marker}\nPath: {path}\nFile state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
+            f"Mutation request id: {marker}\nPath: {path}\nExpected file SHA-256: {expected_file_hash}\n"
+            f"File state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
             + (f"Recovery: {recovery_reason}. Do not repeat the same framing; use the requested bounded representation.\n" if recovery_reason else "")
             + f"The combined old and new source text must be at most {max_patch_characters} characters.\nCURRENT RELEVANT CONTENT:\n{current}"
         )
         if representation == "json":
             prompt = (
                 "The previous text frame was ambiguous. Return one bounded JSON mutation object and nothing else. "
-                "This is a single-file patch, not the high-level action batch. Required exact keys: request_id, path, operation, old, content, done. "
-                "request_id and path must exactly match the values below. operation is create, append, or replace; old is empty except for replace. "
+                "This is a single-file patch, not the high-level action batch. Required exact keys: request_id, path, expected_file_hash, operation, old, content, done. "
+                "request_id, path, and expected_file_hash must exactly match the values below. operation is create, append, or replace; old is empty except for replace. "
                 "Do not include markdown or prose. Source text belongs only in content and must not exceed the stated combined limit.\n"
                 + common
             )
@@ -135,7 +137,8 @@ class RoleAgents:
                 "For an existing file prefer append or a small exact replacement. For a new file use create for the first section, then append. "
                 "If continuing, return only the next atomic section, not the whole file. Preserve source literally; no JSON escaping is needed.\n"
                 f"OPERATION=...\nDONE=...\nPATH={path}\n"
-                f"Mutation request id: {marker}\nPath: {path}\nFile state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
+                f"Mutation request id: {marker}\nPath: {path}\nExpected file SHA-256: {expected_file_hash}\n"
+                f"File state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
                 + (f"Recovery: {recovery_reason}. Make this patch smaller than the failed response.\n" if recovery_reason else "")
                 + f"CURRENT RELEVANT CONTENT:\n{current}"
             )
@@ -159,7 +162,7 @@ class RoleAgents:
                 raise MutationFrameError("AMBIGUOUS", "mutation response exceeded the bounded payload limit") from error
             raise
         if not raw_response:
-            return AgentReply(self._parse_json_mutation(reply.data, marker, path, max_patch_characters))
+            return AgentReply(self._parse_json_mutation(reply.data, marker, path, expected_file_hash, max_patch_characters))
         raw = reply.data.get("raw_text")
         if not isinstance(raw, str):
             raise MutationFrameError("MALFORMED", "mutation response did not contain raw patch text")
@@ -295,11 +298,21 @@ class RoleAgents:
         return data
 
     @staticmethod
-    def _parse_json_mutation(raw: dict[str, object], marker: str, expected_path: str, max_patch_characters: int) -> dict[str, object]:
-        required = {"request_id", "path", "operation", "old", "content", "done"}
+    def _parse_json_mutation(
+        raw: dict[str, object],
+        marker: str,
+        expected_path: str,
+        expected_file_hash: str,
+        max_patch_characters: int,
+    ) -> dict[str, object]:
+        required = {"request_id", "path", "expected_file_hash", "operation", "old", "content", "done"}
         if set(raw) != required:
             raise MutationFrameError("MALFORMED", "fallback mutation JSON has unexpected or missing fields")
-        if raw.get("request_id") != marker or raw.get("path") != expected_path:
+        if (
+            raw.get("request_id") != marker
+            or raw.get("path") != expected_path
+            or raw.get("expected_file_hash") != expected_file_hash
+        ):
             raise MutationFrameError("AMBIGUOUS", "fallback mutation identity/path mismatch")
         operation, old, content, done = raw.get("operation"), raw.get("old"), raw.get("content"), raw.get("done")
         if not isinstance(operation, str) or operation not in {"create", "append", "replace"} or not isinstance(old, str) or not isinstance(content, str) or not isinstance(done, bool):
@@ -308,7 +321,14 @@ class RoleAgents:
             raise MutationFrameError("AMBIGUOUS", "fallback old text is only valid for replace")
         if not content or len(old) + len(content) > max_patch_characters:
             raise MutationFrameError("AMBIGUOUS", "fallback mutation exceeded its active text budget")
-        return {"operation": operation, "old": old, "content": content, "done": done, "frame_status": "FALLBACK_VALID"}
+        return {
+            "operation": operation,
+            "old": old,
+            "content": content,
+            "done": done,
+            "frame_status": "FALLBACK_VALID",
+            "expected_file_hash": expected_file_hash,
+        }
 
     @staticmethod
     def _framed_section(

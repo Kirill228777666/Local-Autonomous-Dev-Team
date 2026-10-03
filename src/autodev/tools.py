@@ -93,8 +93,10 @@ class WorkspaceTools:
             handle.write(content)
 
     def file_snapshot(self, relative_path: str) -> tuple[str, str]:
+        path = self._path(relative_path)
+        raw = path.read_bytes()
         content = self.read_file(relative_path)
-        return hashlib.sha256(content.encode("utf-8")).hexdigest(), content
+        return hashlib.sha256(raw).hexdigest(), content
 
     def apply_deterministic_patch(
         self,
@@ -115,7 +117,7 @@ class WorkspaceTools:
         if not path.is_file():
             return False
         current = path.read_text(encoding="utf-8")
-        if current != old or hashlib.sha256(current.encode("utf-8")).hexdigest() != expected_hash:
+        if current != old or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
             return False
 
         old_lines = old.splitlines(keepends=True)
@@ -131,7 +133,7 @@ class WorkspaceTools:
         # Verify immediately before writing as well: a file changed after the
         # initial snapshot must never be overwritten by recovery code.
         current = path.read_text(encoding="utf-8")
-        if current != old or hashlib.sha256(current.encode("utf-8")).hexdigest() != expected_hash:
+        if current != old or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
             return False
         path.write_text(patched, encoding="utf-8", newline="")
         return path.read_text(encoding="utf-8") == desired

@@ -61,6 +61,14 @@ class MutationProtocolExhaustedError(ProtocolRecoveryExhaustedError):
     """A bounded per-file patch exchange could not yield an applicable patch."""
 
 
+class MutationContextMismatchError(ValueError):
+    """A schema-valid patch was generated for a different file context."""
+
+    def __init__(self, classification: str, message: str) -> None:
+        self.classification = classification
+        super().__init__(message)
+
+
 class CoderActionBatch(list[object]):
     """One bounded Coder response plus its non-semantic continuation state."""
 
@@ -799,15 +807,22 @@ class AutonomousRunner:
         exists = target.is_file()
         continuation = 0
         failures = 0
+        context_recoveries = 0
+        pending_context_recoveries = 0
+        context_recovery_budget = 2
         patch_limit = 6_000
         recovery_reason = ""
         representation = "framed"
         fallback_requested = False
         while continuation < self.mutation_patch_budget:
-            current = self.tools.read_file(path) if exists else ""
+            exists = target.is_file()
+            if exists:
+                expected_file_hash, current = self.tools.file_snapshot(path)
+            else:
+                expected_file_hash, current = hashlib.sha256(b"").hexdigest(), ""
             context = self._mutation_context(current)
             request_id = uuid4().hex[:16]
-            self._mark(state, "CODER", "MUTATION_PATCH_REQUEST", f"Requesting bounded patch {continuation + 1}/{self.mutation_patch_budget}: {path} (request_id={request_id})", task)
+            self._mark(state, "CODER", "MUTATION_PATCH_REQUEST", f"Requesting bounded patch {continuation + 1}/{self.mutation_patch_budget}: {path} (request_id={request_id}, file_sha256={expected_file_hash})", task)
             self._mark(state, "CODER", "LLM_CALL", f"Coder bounded mutation patch: {path}", task)
             try:
                 patch = self.agents.patch(
@@ -819,6 +834,7 @@ class AutonomousRunner:
                     existing=exists,
                     continuation=continuation,
                     request_id=request_id,
+                    expected_file_hash=expected_file_hash,
                     max_patch_characters=patch_limit,
                     recovery_reason=recovery_reason,
                     representation=representation,
@@ -834,6 +850,15 @@ class AutonomousRunner:
                     self._mark(state, "CODER", "MUTATION_FRAME_RECOVERED", f"Safely recovered an omitted redundant boundary for {path}", task)
                 elif patch.get("frame_status") != "FALLBACK_VALID":
                     self._mark(state, "CODER", "MUTATION_FRAME_VALID", f"Validated bounded mutation framing for {path}", task)
+                context_failure = self._check_mutation_context(
+                    path,
+                    expected_file_hash,
+                    exists,
+                    operation,
+                    old if isinstance(old, str) else "",
+                )
+                if context_failure is not None:
+                    raise MutationContextMismatchError(*context_failure)
                 self._apply_bounded_mutation_payload(
                     state,
                     task,
@@ -848,6 +873,9 @@ class AutonomousRunner:
                     self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_SUCCESS", f"Applied validated JSON fallback framing for {path}", task)
                 exists = True
                 self._mark(state, "CODER", "MUTATION_PATCH_APPLIED", f"Applied bounded {operation} patch: {path}", task)
+                for _ in range(pending_context_recoveries):
+                    self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_SUCCESS", f"Applied refreshed mutation context for {path}", task)
+                pending_context_recoveries = 0
                 failures = 0
                 continuation += 1
                 if done:
@@ -869,6 +897,30 @@ class AutonomousRunner:
                     self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded mutation fallback failed for {path}: {error}", task)
                     self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch protocol exhausted for {path}: {error}", task)
                     raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
+            except MutationContextMismatchError as error:
+                context_recoveries += 1
+                pending_context_recoveries += 1
+                self._mark(state, "CODER", "MUTATION_CONTEXT_MISMATCH", f"{path}: {error}", task)
+                phase = "MUTATION_STALE_CONTEXT" if error.classification == "STALE_MUTATION_CONTEXT" else "MUTATION_TARGET_MISMATCH"
+                self._mark(state, "CODER", phase, f"{path}: {error}", task)
+                if context_recoveries > context_recovery_budget:
+                    self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_EXHAUSTED", f"Context recovery budget exhausted for {path}", task)
+                    raise MutationProtocolExhaustedError("MUTATION_CONTEXT_RECOVERY_EXHAUSTED") from error
+                latest_exists = target.is_file()
+                latest_hash, latest = self.tools.file_snapshot(path) if latest_exists else (hashlib.sha256(b"").hexdigest(), "")
+                failed_old = str(patch.get("old", "")) if "patch" in locals() else ""
+                recovery_reason = (
+                    f"{error.classification}: the prior patch was not applied. Re-read the exact current target below. "
+                    "Return one bounded patch ONLY against this refreshed file content; do not reuse a stale OLD fragment.\n"
+                    f"Current SHA-256: {latest_hash}\nCurrent exists: {str(latest_exists).lower()}\n"
+                    f"Rejected OLD fragment (diagnostic only): {failed_old[:1200]}"
+                )
+                exists = latest_exists
+                self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_ATTEMPT", f"Refreshing {path} and regenerating one bounded patch ({context_recoveries}/{context_recovery_budget})", task)
+                self._mark(state, "CODER", "MUTATION_CONTEXT_REFRESH", f"Refreshing patch context for {path}: {error}", task)
+                continuation += 1
+                failures = 0
+                continue
             except ProviderUnavailableError:
                 if representation == "json":
                     self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded mutation fallback provider was unavailable for {path}", task)
@@ -891,6 +943,32 @@ class AutonomousRunner:
                 continue
         self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch continuation budget exhausted for {path}", task)
         raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED")
+
+    def _check_mutation_context(
+        self,
+        path: str,
+        expected_file_hash: str,
+        expected_exists: bool,
+        operation: object,
+        old: str,
+    ) -> tuple[str, str] | None:
+        """Validate the exact file version and patch anchor before any write."""
+        target = self.tools._path(path)
+        current_exists = target.is_file()
+        current_hash, current = self.tools.file_snapshot(path) if current_exists else (hashlib.sha256(b"").hexdigest(), "")
+        if current_exists != expected_exists or current_hash != expected_file_hash:
+            return (
+                "STALE_MUTATION_CONTEXT",
+                f"target changed after request context was captured (expected {expected_file_hash[:12]}, current {current_hash[:12]})",
+            )
+        if operation == "replace":
+            matches = current.count(old) if old else 0
+            if matches != 1:
+                return (
+                    "MUTATION_TARGET_MISMATCH",
+                    f"replacement anchor must match exactly once in unchanged {path}; found {matches}",
+                )
+        return None
 
     def _mutation_context(self, current: str) -> str:
         if len(current) <= self.mutation_context_characters:
