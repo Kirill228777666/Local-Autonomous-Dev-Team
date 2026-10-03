@@ -9,6 +9,7 @@ from autodev.providers import (
     AgentRequest,
     OllamaProvider,
     ProviderError,
+    ProviderResponseError,
     ProviderUnavailableError,
     ScriptedProvider,
 )
@@ -53,6 +54,46 @@ def test_ollama_provider_sends_low_temperature_and_parses_json_response() -> Non
     assert sent_payloads[0]["keep_alive"] == "10m"
     assert sent_payloads[0]["format"] == "json"
     assert sent_payloads[0]["think"] is False
+
+
+def test_ollama_provider_enforces_request_output_token_and_character_budgets() -> None:
+    sent_payloads: list[dict[str, object]] = []
+
+    def transport(_url: str, payload: bytes, _timeout: float) -> bytes:
+        sent_payloads.append(json.loads(payload))
+        return b'{"message":{"content":"{\\"actions\\":[]}"}}'
+
+    reply = OllamaProvider(model="qwen3.6:35b-coding", transport=transport).complete(
+        AgentRequest(role="CODER", prompt="small decision", max_output_tokens=2048, max_output_characters=12_000)
+    )
+
+    assert reply.data == {"actions": []}
+    assert sent_payloads[0]["options"]["num_predict"] == 2048
+
+
+def test_ollama_provider_raw_response_omits_json_format_and_preserves_patch_text() -> None:
+    sent_payloads: list[dict[str, object]] = []
+    raw_patch = "OPERATION=append\nDONE=true\nCONTENT-BEGIN-token\nprint(\"ok\")\nCONTENT-END-token"
+
+    def transport(_url: str, body: bytes, _timeout: float) -> bytes:
+        sent_payloads.append(json.loads(body))
+        return json.dumps({"message": {"content": raw_patch}}).encode()
+
+    provider = OllamaProvider(model="qwen", retries=0, transport=transport)
+    reply = provider.complete(AgentRequest(role="CODER", prompt="patch", raw_response=True))
+
+    assert "format" not in sent_payloads[0]
+    assert reply.data["raw_text"] == raw_patch
+
+
+def test_ollama_provider_rejects_response_over_declared_character_budget() -> None:
+    huge = json.dumps({"actions": [{"kind": "mutate_file", "path": "a.py", "intent": "x" * 100}]})
+    raw = json.dumps({"message": {"content": huge}}).encode("utf-8")
+
+    with pytest.raises(ProviderError, match="character budget"):
+        OllamaProvider(model="qwen3.6:35b-coding", transport=lambda *_: raw).complete(
+            AgentRequest(role="CODER", prompt="decision", max_output_characters=50)
+        )
 
 
 def test_ollama_provider_can_explicitly_enable_model_thinking() -> None:
@@ -170,3 +211,17 @@ def test_provider_distinguishes_timeout_and_malformed_response_outcomes() -> Non
 
     assert timeout_events == ["ATTEMPT", "TIMEOUT"]
     assert malformed_events == ["ATTEMPT", "MALFORMED_STRUCTURED_OUTPUT"]
+
+
+def test_provider_keeps_a_bounded_excerpt_for_malformed_json_diagnostics() -> None:
+    malformed = OllamaProvider(
+        model="qwen",
+        retries=0,
+        transport=lambda *_: json.dumps({"message": {"content": '{"operation":"create","content":"' + ("x" * 1_000)}}).encode(),
+    )
+
+    with pytest.raises(ProviderResponseError, match="response excerpt") as error:
+        malformed.complete(AgentRequest(role="CODER", prompt="bounded patch"))
+
+    assert len(str(error.value)) < 500
+    assert "x" * 150 in str(error.value)

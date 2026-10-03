@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from .context import ContextBuilder
 from .models import ProjectState, Task
 from .providers import AgentReply, AgentRequest, LLMProvider, ProviderError
@@ -44,7 +46,14 @@ class RoleAgents:
             self._valid_selection,
         )
 
-    def code(self, state: ProjectState, task: Task, relevant_files: list[str] | None = None) -> AgentReply:
+    def code(
+        self,
+        state: ProjectState,
+        task: Task,
+        relevant_files: list[str] | None = None,
+        *,
+        instruction: str = "",
+    ) -> AgentReply:
         schema = (
             "Return {\"actions\":[...],\"task_status\":\"continue\"|\"ready_for_validation\"}. Each action must be exactly one of: "
             "{\"kind\":\"mutate_file\",\"path\":\"relative/path\",\"intent\":\"small concrete mutation goal\"}; "
@@ -58,7 +67,13 @@ class RoleAgents:
             "For a valid no-op return exactly {\"actions\":[],\"task_status\":\"ready_for_validation\"}; never emit an action with empty content. "
             "Paths must be relative to the workspace; do not use shell wrappers.\n\n"
         )
-        return self._ask("CODER", schema + self.context.for_task(state, task, relevant_files or []), self._valid_actions)
+        return self._ask(
+            "CODER",
+            schema + (instruction + "\n\n" if instruction else "") + self.context.for_task(state, task, relevant_files or []),
+            self._valid_actions,
+            max_output_tokens=2048,
+            max_output_characters=12_000,
+        )
 
     def patch(
         self,
@@ -70,20 +85,89 @@ class RoleAgents:
         current: str,
         existing: bool,
         continuation: int,
+        max_patch_characters: int = 6_000,
+        recovery_reason: str = "",
     ) -> AgentReply:
         """Ask for one independently bounded mutation, never a task-sized body."""
         mode = "existing" if existing else "new"
+        token_budget = 1_536 if max_patch_characters > 3_000 else 768 if max_patch_characters > 1_500 else 384
+        response_budget = 16_000
+        marker = uuid4().hex[:16]
+        content_start = f"CONTENT-BEGIN-{marker}"
+        content_end = f"CONTENT-END-{marker}"
+        old_start = f"OLD-BEGIN-{marker}"
+        old_end = f"OLD-END-{marker}"
+        new_start = f"NEW-BEGIN-{marker}"
+        new_end = f"NEW-END-{marker}"
         prompt = (
-            "Return exactly one JSON patch object for this one file. No prose. "
-            "Schema: {\"operation\":\"create\"|\"append\"|\"replace\",\"content\":str,\"old\":str optional for replace,\"done\":bool}. "
-            "content and old together must contain at most 6000 characters. "
-            "For an existing file use replace with exact old text from the supplied context, or append. "
-            "For a new file use create first; if more content is needed, set done=false and return only the next section. "
-            "Never return a full unrelated file or repeat earlier sections.\n\n"
+            "Return one bounded file patch using the exact plain-text framing below. Do not return JSON, markdown fences, or prose. "
+            f"The source body must be at most {max_patch_characters} characters.\n"
+            "First line: OPERATION=create, append, or replace. Second line: DONE=true or DONE=false.\n"
+            f"For create/append, put only the source body between {content_start} and {content_end}, each marker on its own line.\n"
+            f"For replace, put exact old text between {old_start} and {old_end}, then replacement text between {new_start} and {new_end}.\n"
+            "For an existing file prefer append or a small exact replacement. For a new file use create for the first section, then append. "
+            "If continuing, return only the next atomic section, not the whole file. Preserve source literally; no JSON escaping is needed.\n\n"
             f"Path: {path}\nFile state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
-            f"CURRENT RELEVANT CONTENT:\n{current}"
+            + (f"Recovery: {recovery_reason}. Make this patch smaller than the failed response.\n" if recovery_reason else "")
+            + f"CURRENT RELEVANT CONTENT:\n{current}"
         )
-        return self._ask("CODER", prompt, self._valid_patch)
+        reply = self.provider.complete(
+            AgentRequest(
+                role="CODER",
+                prompt=prompt,
+                system_prompt="You are Coder. Return exactly one bounded plain-text patch using the requested framing. Source is raw text, not JSON.",
+                max_output_tokens=token_budget,
+                max_output_characters=response_budget,
+                raw_response=True,
+            )
+        )
+        raw = reply.data.get("raw_text")
+        if not isinstance(raw, str):
+            raise ProviderError("mutation response did not contain raw patch text")
+        return AgentReply(self._parse_raw_patch(raw, marker, 16_000))
+
+    @staticmethod
+    def _parse_raw_patch(raw: str, marker: str, max_patch_characters: int) -> dict[str, object]:
+        lines = raw.splitlines()
+        if len(lines) < 4 or not lines[0].startswith("OPERATION=") or not lines[1].startswith("DONE="):
+            raise ProviderError("mutation response framing is invalid")
+        operation = lines[0].partition("=")[2].strip()
+        done_text = lines[1].partition("=")[2].strip().lower()
+        if operation not in {"create", "append", "replace"} or done_text not in {"true", "false"}:
+            raise ProviderError("mutation response header is invalid")
+        if operation == "replace":
+            old = RoleAgents._framed_section(raw, f"OLD-BEGIN-{marker}", f"OLD-END-{marker}", allow_trailing=True)
+            content = RoleAgents._framed_section(raw, f"NEW-BEGIN-{marker}", f"NEW-END-{marker}", allow_eof=True)
+            data: dict[str, object] = {"operation": operation, "old": old, "content": content, "done": done_text == "true"}
+        else:
+            content = RoleAgents._framed_section(raw, f"CONTENT-BEGIN-{marker}", f"CONTENT-END-{marker}", allow_eof=True)
+            data = {"operation": operation, "content": content, "done": done_text == "true"}
+        if not content or len(content) > max_patch_characters or len(str(data.get("old", ""))) + len(content) > max_patch_characters:
+            raise ProviderError("mutation patch exceeded its active text budget")
+        return data
+
+    @staticmethod
+    def _framed_section(
+        raw: str,
+        start_marker: str,
+        end_marker: str,
+        *,
+        allow_trailing: bool = False,
+        allow_eof: bool = False,
+    ) -> str:
+        start = start_marker + "\n"
+        end = "\n" + end_marker
+        if start not in raw:
+            raise ProviderError(f"mutation response is missing {start_marker}")
+        body = raw.split(start, 1)[1]
+        if end not in body and allow_eof:
+            return body
+        if end not in body:
+            raise ProviderError(f"mutation response is missing {end_marker}")
+        content, trailing = body.split(end, 1)
+        if trailing.strip() and not allow_trailing:
+            raise ProviderError("mutation response has trailing content")
+        return content
 
     def test(self, state: ProjectState, task: Task) -> AgentReply:
         instruction = (
@@ -109,7 +193,16 @@ class RoleAgents:
         )
         return self._ask("FINAL_QA", prompt, self._valid_final_qa)
 
-    def _ask(self, role: str, prompt: str, validator: callable) -> AgentReply:
+    def _ask(
+        self,
+        role: str,
+        prompt: str,
+        validator: callable,
+        *,
+        system_prompt: str | None = None,
+        max_output_tokens: int | None = None,
+        max_output_characters: int | None = None,
+    ) -> AgentReply:
         error = ""
         self.last_structured_role = role
         self.last_structured_invalid_count = 0
@@ -119,7 +212,9 @@ class RoleAgents:
                 AgentRequest(
                     role=role,
                     prompt=prompt if not error else prompt + f"\n\nYour previous JSON was invalid: {error}. Return only the required schema.",
-                    system_prompt=ROLE_PROMPTS[role],
+                    system_prompt=system_prompt or ROLE_PROMPTS[role],
+                    max_output_tokens=max_output_tokens,
+                    max_output_characters=max_output_characters,
                 )
             )
             try:
@@ -160,6 +255,29 @@ class RoleAgents:
         if len(actions) > 4:
             raise ValueError("action batch exceeds maximum action count")
         required = {"mutate_file": ("path", "intent"), "write_file": ("path", "content"), "append_file": ("path", "content"), "edit_file": ("path", "old", "new"), "delete_file": ("path",), "read_file": ("path",), "run_command": ("command",), "start_process": ("command",)}
+        # Older model replies can still carry a complete source file in a
+        # legacy write/edit action. Never pass an oversized source envelope to
+        # the controller: retain only its path and use the task context to
+        # materialize the change through the bounded patch protocol instead.
+        source_kinds = {"write_file", "append_file", "edit_file"}
+        legacy_source_size = sum(
+            sum(len(value) for key, value in action.items() if key in {"content", "old", "new"} and isinstance(value, str))
+            for action in actions
+            if isinstance(action, dict) and action.get("kind", action.get("action")) in source_kinds
+        )
+        if legacy_source_size > 6_000:
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                kind = action.get("kind", action.get("action"))
+                path = action.get("path")
+                if kind in source_kinds and isinstance(path, str) and path:
+                    action.clear()
+                    action.update({
+                        "kind": "mutate_file",
+                        "path": path,
+                        "intent": "Materialize the requested source change through bounded patches.",
+                    })
         textual_payload = 0
         for action in actions:
             # Some local models label the discriminator ``action``.  This is
@@ -179,24 +297,6 @@ class RoleAgents:
                     textual_payload += len(value)
         if textual_payload > 12_000:
             raise ValueError("action batch textual payload exceeds maximum")
-
-    @staticmethod
-    def _valid_patch(data: dict[str, object]) -> None:
-        operation = data.get("operation")
-        if operation not in {"create", "append", "replace"}:
-            raise ValueError("patch operation is invalid")
-        content = data.get("content")
-        if not isinstance(content, str) or not content:
-            raise ValueError("patch content must be non-empty text")
-        old = data.get("old", "")
-        if operation == "replace" and (not isinstance(old, str) or not old):
-            raise ValueError("replace patch requires non-empty old text")
-        if operation != "replace" and old not in {"", None}:
-            raise ValueError("only replace patch may supply old text")
-        if not isinstance(data.get("done"), bool):
-            raise ValueError("patch done must be boolean")
-        if len(content) + (len(old) if isinstance(old, str) else 0) > 6_000:
-            raise ValueError("patch textual payload exceeds maximum")
 
     @staticmethod
     def _valid_command(data: dict[str, object]) -> None:

@@ -262,12 +262,12 @@ def test_coder_action_batches_are_bounded_and_continue_same_attempt() -> None:
     assert valid["task_status"] == "continue"
 
     oversized = {"actions": [{"kind": "write_file", "path": "app.py", "content": "x" * 12_001}]}
-    try:
-        RoleAgents._valid_actions(oversized)
-    except ValueError as error:
-        assert "payload" in str(error)
-    else:
-        raise AssertionError("oversized action batch must be rejected before tool execution")
+    RoleAgents._valid_actions(oversized)
+    assert oversized["actions"] == [{
+        "kind": "mutate_file",
+        "path": "app.py",
+        "intent": "Materialize the requested source change through bounded patches.",
+    }]
 
 
 def test_continuation_batches_execute_within_one_task_attempt(tmp_path: Path) -> None:
@@ -309,11 +309,10 @@ def test_truncated_coder_protocol_recovers_with_small_next_batch(tmp_path: Path)
 
 def test_protocol_exhaustion_is_not_a_semantic_retry_or_architect_escalation(tmp_path: Path) -> None:
     _repository(tmp_path)
-    oversized = AgentReply({"actions": [{"kind": "write_file", "path": "app.py", "content": "x" * 12_001}]})
     provider = ProtocolSequenceProvider([
         ProviderError("Unterminated string starting at character 46000"),
-        oversized, oversized,  # RoleAgent schema repair #1
-        oversized, oversized,  # protocol recovery #2 exhausts
+        ProviderError("Unterminated string starting at character 46000"),
+        ProviderError("Unterminated string starting at character 46000"),
     ])
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)  # type: ignore[arg-type]
     parent = Task.create("Setup", "Create project setup")

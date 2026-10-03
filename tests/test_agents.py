@@ -36,3 +36,20 @@ def test_tester_prompt_requires_an_independent_command_array() -> None:
     RoleAgents(provider).test(state, task)
 
     assert '"command"' in provider.requests[0].prompt
+
+
+def test_large_legacy_source_action_is_reduced_to_a_small_mutation_decision() -> None:
+    class LargeReplyProvider:
+        def complete(self, _request: AgentRequest) -> AgentReply:
+            return AgentReply({"actions": [{"kind": "write_file", "path": "huge.py", "content": "x" * 55_000}]})
+
+    state = ProjectState.create("Build a large application")
+    task = Task.create("Implement source", "Implement the application")
+
+    reply = RoleAgents(LargeReplyProvider()).code(state, task)
+
+    assert reply.data["actions"] == [{
+        "kind": "mutate_file",
+        "path": "huge.py",
+        "intent": "Materialize the requested source change through bounded patches.",
+    }]

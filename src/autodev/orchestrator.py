@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -117,7 +118,7 @@ class AutonomousRunner:
             set_observer(self._record_provider_outcome)
         self._attempt_snapshots: dict[str, Path] = {}
         self.protocol_recovery_budget = 2
-        self.mutation_patch_budget = 24
+        self.mutation_patch_budget = 48
         self.mutation_context_characters = 6_000
         # Scripted and third-party providers without a health endpoint return
         # immediately; a real Ollama-backed run can wait through a short restart.
@@ -501,11 +502,17 @@ class AutonomousRunner:
         relevant_files: list[str] | None = None,
         *,
         protocol_recovery_count: int = 0,
+        coder_instruction: str = "",
     ) -> CoderActionBatch:
         """Make one semantic Coder call with an explicit terminal outcome."""
         self._mark(state, "CODER", "LLM_CALL", message, task)
         try:
-            reply_data = self.agents.code(state, task, relevant_files if relevant_files is not None else self._coder_file_context(task)).data
+            reply_data = self.agents.code(
+                state,
+                task,
+                relevant_files if relevant_files is not None else self._coder_file_context(task),
+                instruction=coder_instruction,
+            ).data
             actions = reply_data.get("actions")
             task_status = reply_data.get("task_status", "ready_for_validation")
         except ProviderUnavailableError:
@@ -567,6 +574,7 @@ class AutonomousRunner:
         actions = initial
         tool_recoveries = 0
         policy_recoveries = 0
+        source_mutation_recoveries = 0
         position = 0
         while position < len(actions):
             action = actions[position]
@@ -611,6 +619,11 @@ class AutonomousRunner:
                 if isinstance(action, dict) and action.get("kind") == "run_command" and self._known_missing_npm(state, action.get("command")):
                     self._pivot_to_static_frontend(state, task)
                     return None
+                if isinstance(action, dict) and action.get("kind") == "run_command":
+                    command = action.get("command")
+                    if isinstance(command, list) and self._command_writes_workspace_files(command):
+                        self._mark(state, "CODER", "SOURCE_MUTATION_COMMAND_REJECTED", "Source files must be changed through bounded mutate_file patches", task)
+                        raise ToolPolicyError("SOURCE_MUTATION_REQUIRES_MUTATE_FILE")
                 self._execute_action(state, task, action)
             except CommandExecutionError as error:
                 if error.result.exit_code == 125:
@@ -643,6 +656,27 @@ class AutonomousRunner:
                 position = 0
                 continue
             except ToolPolicyError as error:
+                if "SOURCE_MUTATION_REQUIRES_MUTATE_FILE" in str(error):
+                    if source_mutation_recoveries >= 2:
+                        raise ToolPolicyError("SOURCE_MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
+                    source_mutation_recoveries += 1
+                    self._mark(state, "CODER", "TOOL_RECOVERY", "Replacing file-writing command with bounded file mutation decisions", task)
+                    recovered = self._request_coder_actions(
+                        state,
+                        task,
+                        "Coder mutation-interface recovery: the previous run_command attempted to write workspace files. Return mutate_file decisions for each intended file; do not use commands, source bodies, or shell writes.",
+                        self._coder_file_context(task),
+                        coder_instruction=(
+                            "The immediately preceding proposed action was rejected before execution because it writes workspace files through a command. "
+                            "Do not repeat any run_command. Convert the intended file change into one or more small mutate_file decisions. "
+                            "The rejected command, for intent/path diagnosis only, was: "
+                            + json.dumps(command, ensure_ascii=False)[:4_000]
+                        ),
+                    )
+                    if not recovered:
+                        raise ToolPolicyError("SOURCE_MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
+                    actions = actions[:position] + list(recovered) + actions[position + 1 :]
+                    continue
                 if "DESTRUCTIVE_WRITE_REQUIRES_TARGETED_EDIT_OR_CURRENT_FULL_FILE" not in str(error):
                     raise
                 path = action.get("path") if isinstance(action, dict) else None
@@ -691,6 +725,63 @@ class AutonomousRunner:
             position += 1
         return actions
 
+    @staticmethod
+    def _command_writes_workspace_files(command: list[str]) -> bool:
+        """Reject shell/interpreter workarounds that bypass mutate_file."""
+        if not command:
+            return False
+        executable = Path(command[0]).stem.lower()
+        if executable in {"cp", "copy", "mv", "move", "tee", "touch"}:
+            return True
+        lowered = [part.lower() for part in command]
+        if executable in {"cmd", "powershell", "pwsh", "bash", "sh"}:
+            script = " ".join(command[1:])
+            if re.search(r"(?:>>?|\|\s*tee\b|\b(?:set-content|add-content|out-file|copy-item|move-item|new-item)\b)", script, re.IGNORECASE):
+                return True
+        if executable in {"node", "nodejs"} and "-e" in lowered:
+            source = command[lowered.index("-e") + 1] if lowered.index("-e") + 1 < len(command) else ""
+            return bool(re.search(r"(?:writeFile|appendFile|createWriteStream)(?:Sync)?\s*\(", source))
+        if executable not in {"python", "python3", "py"} or "-c" not in lowered:
+            return False
+        source_index = lowered.index("-c") + 1
+        if source_index >= len(command):
+            return False
+        try:
+            tree = ast.parse(command[source_index])
+        except SyntaxError:
+            return False
+        write_methods = {"write_text", "write_bytes", "writeFile", "writeFileSync", "appendFile", "appendFileSync", "createWriteStream", "touch"}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            name = function.id if isinstance(function, ast.Name) else function.attr if isinstance(function, ast.Attribute) else ""
+            if name in write_methods:
+                return True
+            if name == "open":
+                mode: ast.expr | None = node.args[1] if len(node.args) > 1 else next((item.value for item in node.keywords if item.arg == "mode"), None)
+                if isinstance(mode, ast.Constant) and isinstance(mode.value, str) and any(flag in mode.value for flag in ("w", "a", "x", "+")):
+                    return True
+            if name in {"copy", "copy2", "copyfile", "move"} and isinstance(function, ast.Attribute):
+                module = function.value.id if isinstance(function.value, ast.Name) else ""
+                if module == "shutil":
+                    return True
+            if name in {"run", "Popen", "call", "check_call", "check_output"} and isinstance(function, ast.Attribute):
+                module = function.value.id if isinstance(function.value, ast.Name) else ""
+                if module == "subprocess":
+                    script = " ".join(str(arg.value) for arg in node.args if isinstance(arg, ast.Constant) and isinstance(arg.value, str))
+                    shell = any(item.arg == "shell" and isinstance(item.value, ast.Constant) and item.value.value is True for item in node.keywords)
+                    if shell or re.search(r"(?:>>?|\b(?:copy|move|tee|set-content|out-file)\b)", script, re.IGNORECASE):
+                        return True
+            if name == "open" and isinstance(function, ast.Attribute):
+                module = function.value.id if isinstance(function.value, ast.Name) else ""
+                flags = node.args[1] if len(node.args) > 1 else None
+                if module == "os" and flags is not None:
+                    write_flags = {"O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND"}
+                    if any(isinstance(item, ast.Attribute) and item.attr in write_flags for item in ast.walk(flags)):
+                        return True
+        return False
+
     def _execute_mutation_decision(self, state: ProjectState, task: Task, decision: dict[str, object]) -> None:
         """Materialize one small Coder decision through bounded per-file patches.
 
@@ -707,6 +798,8 @@ class AutonomousRunner:
         exists = target.is_file()
         continuation = 0
         failures = 0
+        patch_limit = 6_000
+        recovery_reason = ""
         while continuation < self.mutation_patch_budget:
             current = self.tools.read_file(path) if exists else ""
             context = self._mutation_context(current)
@@ -721,6 +814,8 @@ class AutonomousRunner:
                     current=context,
                     existing=exists,
                     continuation=continuation,
+                    max_patch_characters=patch_limit,
+                    recovery_reason=recovery_reason,
                 ).data
                 self._mark(state, "CODER", "LLM_RESPONSE", f"Coder mutation patch received: {path}", task)
                 operation = patch.get("operation")
@@ -729,21 +824,17 @@ class AutonomousRunner:
                 old = patch.get("old", "")
                 if operation not in {"create", "append", "replace"} or not isinstance(content, str) or not isinstance(done, bool):
                     raise ValueError("mutation patch is invalid")
-                if operation == "replace":
-                    if not exists or not isinstance(old, str) or not old:
-                        raise ValueError("replace patch does not match file state")
-                    self._validate_mutation_content(state, task, path, content)
-                    self._execute_action(state, task, {"kind": "edit_file", "path": path, "old": old, "new": content})
-                elif operation == "create":
-                    if exists:
-                        raise ValueError("create patch targets an existing file")
-                    self._validate_mutation_content(state, task, path, content)
-                    self._execute_action(state, task, {"kind": "write_file", "path": path, "content": content})
-                    exists = True
-                else:
-                    self._validate_mutation_content(state, task, path, content)
-                    self._execute_action(state, task, {"kind": "append_file", "path": path, "content": content})
-                    exists = True
+                self._apply_bounded_mutation_payload(
+                    state,
+                    task,
+                    path,
+                    operation,
+                    content,
+                    old if isinstance(old, str) else "",
+                    exists,
+                    patch_limit,
+                )
+                exists = True
                 self._mark(state, "CODER", "MUTATION_PATCH_APPLIED", f"Applied bounded {operation} patch: {path}", task)
                 failures = 0
                 continuation += 1
@@ -753,10 +844,12 @@ class AutonomousRunner:
                 raise
             except (ProviderError, ValueError) as error:
                 failures += 1
-                if failures >= 2 or continuation + 1 >= self.mutation_patch_budget:
+                if failures >= 3 or continuation + 1 >= self.mutation_patch_budget:
                     self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch protocol exhausted for {path}: {error}", task)
                     raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
                 continuation += 1
+                patch_limit = max(500, patch_limit // 2)
+                recovery_reason = str(error)[:300]
                 self._mark(state, "CODER", "MUTATION_CONTEXT_REFRESH", f"Refreshing patch context for {path}: {error}", task)
                 continue
         self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch continuation budget exhausted for {path}", task)
@@ -766,6 +859,55 @@ class AutonomousRunner:
         if len(current) <= self.mutation_context_characters:
             return current
         return "[earlier content omitted]\n" + current[-self.mutation_context_characters :]
+
+    def _apply_bounded_mutation_payload(
+        self,
+        state: ProjectState,
+        task: Task,
+        path: str,
+        operation: str,
+        content: str,
+        old: str,
+        exists: bool,
+        segment_limit: int,
+    ) -> None:
+        """Apply one bounded wire patch as atomic-size file mutations.
+
+        The provider response has its own 16K hard cap. A model may produce a
+        valid section somewhat larger than the requested hunk, so split it
+        deterministically before touching the workspace. Concatenation is
+        lossless; all pieces remain inside the same task attempt snapshot.
+        """
+        if operation == "create" and exists:
+            # Some models repeat the create operation after the first section.
+            # Treat a repeated prefix as continuation data only when it is
+            # strictly a new suffix of the current file; otherwise fail closed.
+            current = self.tools.read_file(path)
+            if content.startswith(current) and len(content) > len(current):
+                content = content[len(current) :]
+                operation = "append"
+            else:
+                raise ValueError("create patch targets an existing file")
+        if operation == "replace" and (not exists or not old):
+            raise ValueError("replace patch does not match file state")
+        if operation not in {"create", "append", "replace"} or not content:
+            raise ValueError("mutation operation/content is invalid")
+        if operation == "replace" and len(old) > segment_limit:
+            raise ValueError("replace anchor exceeds atomic mutation limit")
+        chunks = [content[index : index + segment_limit] for index in range(0, len(content), segment_limit)]
+        first = chunks.pop(0)
+        if operation == "create":
+            self._validate_mutation_content(state, task, path, first)
+            self._execute_action(state, task, {"kind": "write_file", "path": path, "content": first})
+        elif operation == "replace":
+            self._validate_mutation_content(state, task, path, first)
+            self._execute_action(state, task, {"kind": "edit_file", "path": path, "old": old, "new": first})
+        else:
+            self._validate_mutation_content(state, task, path, first)
+            self._execute_action(state, task, {"kind": "append_file", "path": path, "content": first})
+        for chunk in chunks:
+            self._validate_mutation_content(state, task, path, chunk)
+            self._execute_action(state, task, {"kind": "append_file", "path": path, "content": chunk})
 
     def _validate_mutation_content(self, state: ProjectState, task: Task, path: str, content: str) -> None:
         violation = contract_policy_violation(state.project_contract, path, content, self.workspace)
@@ -819,6 +961,15 @@ class AutonomousRunner:
             while True:
                 fingerprint = hashlib.sha256(json.dumps(actions, sort_keys=True).encode()).hexdigest()
                 if fingerprint in task.action_fingerprints:
+                    if self._source_fingerprints() != before_files:
+                        self._mark(
+                            state,
+                            "CONTROLLER",
+                            "DUPLICATE_CONTINUATION_AFTER_PROGRESS",
+                            "Coder repeated a continuation decision after source mutations; validating accumulated work",
+                            task,
+                        )
+                        break
                     self._block(task, state, "repeated identical coder action without progress", "repeated_coder_action")
                     return
                 task.action_fingerprints.append(fingerprint)

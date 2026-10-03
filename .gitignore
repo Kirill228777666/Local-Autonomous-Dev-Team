@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-*/
 .pytest-tmp/
 .pytest-full-*/
 .pytest-control-*/
@@ -10,6 +11,7 @@ __pycache__/
 .pytest-first-failure-*/
 .pytest-stale-*/
 .pytest-protocol-*/
+.pytest-mutation-*/
 .pytest-debug/
 .benchmark/
 .venv/

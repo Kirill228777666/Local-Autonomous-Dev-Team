@@ -29,6 +29,9 @@ class AgentRequest:
     prompt: str
     system_prompt: str = "You are a careful local software-development agent. Reply with JSON only."
     images: tuple[str, ...] = ()
+    max_output_tokens: int | None = None
+    max_output_characters: int | None = None
+    raw_response: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,23 +94,27 @@ class OllamaProvider:
             self._outcome_observer(role, outcome, max(0.0, time.monotonic() - started))
 
     def complete(self, request: AgentRequest) -> AgentReply:
-        payload = json.dumps(
-            {
+        request_body: dict[str, object] = {
                 "model": self.model,
                 "stream": False,
-                "format": "json",
                 "keep_alive": self.keep_alive,
                 # A bounded JSON tool decision benefits from a direct answer;
                 # long hidden reasoning can otherwise keep a local 30B request
                 # alive long after useful work has stopped.
                 "think": self.think,
-                "options": {"temperature": self.temperature, "num_ctx": self.context_limit},
+                "options": {
+                    "temperature": self.temperature,
+                    "num_ctx": self.context_limit,
+                    **({"num_predict": request.max_output_tokens} if request.max_output_tokens is not None else {}),
+                },
                 "messages": [
                     {"role": "system", "content": request.system_prompt},
                     {"role": "user", "content": request.prompt, **({"images": list(request.images)} if request.images else {})},
                 ],
             }
-        ).encode("utf-8")
+        if not request.raw_response:
+            request_body["format"] = "json"
+        payload = json.dumps(request_body).encode("utf-8")
         deadline = time.monotonic() + self.timeout
         transport_error: Exception | None = None
         response_error: Exception | None = None
@@ -118,12 +125,20 @@ class OllamaProvider:
                 break
             started = time.monotonic() if self._outcome_observer is not None else 0.0
             self._observe(request.role, "ATTEMPT", started)
+            content: object = ""
             try:
                 raw = self.transport(f"{self.base_url}/api/chat", payload, remaining)
                 envelope = json.loads(raw)
                 content = envelope["message"]["content"]
                 if not isinstance(content, str) or not content.strip():
                     raise ProviderResponseError("Ollama response content is empty")
+                if request.max_output_characters is not None and len(content) > request.max_output_characters:
+                    raise ProviderResponseError(
+                        f"Ollama structured response exceeded character budget ({len(content)} > {request.max_output_characters})"
+                    )
+                if request.raw_response:
+                    self._observe(request.role, "SUCCESS", started)
+                    return AgentReply(data={"raw_text": content})
                 if isinstance(content, str) and content.strip().startswith("```"):
                     lines = content.strip().splitlines()
                     content = "\n".join(lines[1:-1]) if len(lines) >= 3 else content
@@ -143,7 +158,14 @@ class OllamaProvider:
                 outcome = "CONNECTION_REFUSED" if "refused" in str(exc).lower() or "10061" in str(exc) else "OTHER_ERROR"
                 self._observe(request.role, outcome, started)
             except (KeyError, TypeError, json.JSONDecodeError, ProviderError) as exc:
-                response_error = exc
+                if isinstance(exc, json.JSONDecodeError) and isinstance(content, str):
+                    start = max(0, exc.pos - 100)
+                    excerpt = content[start : exc.pos + 160].replace("\r", "\\r").replace("\n", "\\n")
+                    response_error = ProviderResponseError(
+                        f"Ollama returned malformed JSON at character {exc.pos}; response excerpt={excerpt!r}"
+                    )
+                else:
+                    response_error = exc
                 outcome = "EMPTY_RESPONSE" if "empty" in str(exc).lower() else "MALFORMED_STRUCTURED_OUTPUT"
                 self._observe(request.role, outcome, started)
         if transport_error is not None and response_error is None:
