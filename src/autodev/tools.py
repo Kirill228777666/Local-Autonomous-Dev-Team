@@ -98,6 +98,72 @@ class WorkspaceTools:
         content = self.read_file(relative_path)
         return hashlib.sha256(raw).hexdigest(), content
 
+    def file_snapshot_exact(self, relative_path: str) -> tuple[str, str]:
+        """Return the UTF-8 text without newline normalization for exact ranges."""
+        path = self._path(relative_path)
+        raw = path.read_bytes()
+        return hashlib.sha256(raw).hexdigest(), raw.decode("utf-8")
+
+    def replace_slice_if_snapshot(
+        self,
+        relative_path: str,
+        expected_hash: str,
+        start_offset: int,
+        end_offset: int,
+        expected_slice: str,
+        replacement: str,
+    ) -> bool:
+        """Atomically replace one exact UTF-8 text slice using compare-and-swap.
+
+        All coordinates and content are controller-owned. The raw model response
+        cannot select a path or range, and any file-version/context drift fails
+        closed without touching the workspace.
+        """
+        path = self._path(relative_path)
+        if start_offset < 0 or end_offset < start_offset:
+            return False
+        if path.is_file():
+            original_bytes = path.read_bytes()
+        elif expected_hash == hashlib.sha256(b"").hexdigest() and expected_slice == "" and start_offset == end_offset == 0:
+            original_bytes = b""
+        else:
+            return False
+        if hashlib.sha256(original_bytes).hexdigest() != expected_hash:
+            return False
+        try:
+            original = original_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        if end_offset > len(original) or original[start_offset:end_offset] != expected_slice:
+            return False
+        updated = original[:start_offset] + replacement + original[end_offset:]
+
+        # Recheck the CAS immediately before writing. The temporary file lives
+        # beside the target so os.replace remains atomic on the same volume.
+        latest = path.read_bytes() if path.is_file() else b""
+        if hashlib.sha256(latest).hexdigest() != expected_hash:
+            return False
+        try:
+            latest_text = latest.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        if end_offset > len(latest_text) or latest_text[start_offset:end_offset] != expected_slice:
+            return False
+        temporary = path.with_name(f".{path.name}.{os.urandom(8).hex()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_bytes(updated.encode("utf-8"))
+            # Check once more after staging to guard external writers during
+            # the temporary write window.
+            final_check = path.read_bytes() if path.is_file() else b""
+            if hashlib.sha256(final_check).hexdigest() != expected_hash:
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return path.read_bytes() == updated.encode("utf-8")
+
     def apply_deterministic_patch(
         self,
         relative_path: str,

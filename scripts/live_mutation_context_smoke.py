@@ -19,15 +19,16 @@ from autodev.tools import WorkspaceTools
 
 
 class OneStaleMutationProvider:
-    """Inject one well-formed but contextually wrong OLD, then call real Ollama."""
+    """Inject one wrong anchor, then send the raw replacement request to Ollama."""
 
     def __init__(self, provider: OllamaProvider) -> None:
         self.provider = provider
         self.injected = False
         self.live_requests = 0
+        self.raw_mutation_response = ""
 
     def complete(self, request: AgentRequest) -> AgentReply:
-        if not self.injected and request.raw_response:
+        if not self.injected and request.raw_response and not request.raw_mutation:
             prompt = request.prompt
             request_id = re.search(r"Mutation request id: ([0-9a-f]+)", prompt)
             path = re.search(r"^Path: (.+)$", prompt, re.MULTILINE)
@@ -43,8 +44,12 @@ class OneStaleMutationProvider:
                 ),
                 "response_complete": True,
             })
-        self.live_requests += 1
-        return self.provider.complete(request)
+        if request.raw_mutation:
+            self.live_requests += 1
+        reply = self.provider.complete(request)
+        if request.raw_mutation:
+            self.raw_mutation_response = str(reply.data.get("raw_text", ""))
+        return reply
 
 
 def _git(workspace: Path, *args: str) -> None:
@@ -85,7 +90,7 @@ def run(config_path: Path) -> dict[str, object]:
         runner._execute_coder_actions(state, task, [{
             "kind": "mutate_file",
             "path": "style.css",
-            "intent": "Replace exactly `.card { color: red; }` with `.card { color: blue; }`; preserve the final newline.",
+            "intent": "Replace exactly `.card { color: red; }` with `.card { color: blue; }`.",
         }])
 
         observed = metrics(state)
@@ -98,6 +103,9 @@ def run(config_path: Path) -> dict[str, object]:
             "context_mismatches": observed["mutation_context_mismatches"],
             "context_recovery_attempts": observed["mutation_context_recovery_attempts"],
             "context_recovery_successes": observed["mutation_context_recovery_successes"],
+            "raw_mutation_requests": observed["raw_mutation_requests"],
+            "raw_mutation_successes": observed["raw_mutation_successes"],
+            "raw_mutation_response_bytes": len(provider.raw_mutation_response.encode("utf-8")),
             "protocol_exhaustions": observed["coder_mutation_protocol_exhaustions"],
             "architect_escalations": observed["architect_escalations"],
             "system_crashes": observed["system_crashes"],
@@ -106,12 +114,12 @@ def run(config_path: Path) -> dict[str, object]:
         if profile.model != "qwen3.6:35b-coding":
             raise RuntimeError("live context smoke requires qwen3.6:35b-coding: " + json.dumps(result))
         if not provider.injected or provider.live_requests != 1:
-            raise RuntimeError("expected one injected mismatch followed by one real model patch: " + json.dumps(result))
-        if result["resulting_file"] != ".card { color: blue; }\n":
+            raise RuntimeError("expected one injected mismatch followed by one real raw model replacement: " + json.dumps(result))
+        if result["resulting_file"].strip() != ".card { color: blue; }":
             raise RuntimeError("fresh-context mutation did not produce the expected CSS: " + json.dumps(result))
         if result["semantic_attempts"] != 1 or result["semantic_retries"] != 0:
             raise RuntimeError("context recovery consumed semantic retry budget: " + json.dumps(result))
-        if result["context_mismatches"] != 1 or result["context_recovery_successes"] != 1:
+        if result["context_mismatches"] != 1 or result["context_recovery_successes"] != 1 or result["raw_mutation_successes"] != 1:
             raise RuntimeError("context mismatch was not recovered: " + json.dumps(result))
         if result["protocol_exhaustions"] or result["architect_escalations"] or result["system_crashes"]:
             raise RuntimeError("context recovery escaped its bounded local path: " + json.dumps(result))

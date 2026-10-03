@@ -23,9 +23,17 @@ ROLE_PROMPTS = {
 class MutationFrameError(ProviderError):
     """A bounded mutation envelope is ambiguous or malformed and was not applied."""
 
-    def __init__(self, classification: str, message: str) -> None:
+    def __init__(self, classification: str, message: str, *, raw_response: str = "", provider_attempt: int = 0, response_bytes: int | None = None) -> None:
         self.classification = classification
-        super().__init__(f"MUTATION_PROTOCOL_{classification}: {message}")
+        self.raw_response = raw_response
+        self.provider_attempt = provider_attempt
+        self.response_bytes = len(raw_response.encode("utf-8", errors="replace")) if response_bytes is None else response_bytes
+        super().__init__(
+            f"MUTATION_PROTOCOL_{classification}: {message}",
+            provider_attempt=provider_attempt,
+            raw_response=raw_response,
+            response_bytes=self.response_bytes,
+        )
 
 
 class RoleAgents:
@@ -99,6 +107,8 @@ class RoleAgents:
         max_patch_characters: int = 6_000,
         recovery_reason: str = "",
         representation: str = "framed",
+        start_offset: int = 0,
+        end_offset: int | None = None,
     ) -> AgentReply:
         """Ask for one independently bounded mutation, never a task-sized body."""
         mode = "existing" if existing else "new"
@@ -117,7 +127,25 @@ class RoleAgents:
             + (f"Recovery: {recovery_reason}. Do not repeat the same framing; use the requested bounded representation.\n" if recovery_reason else "")
             + f"The combined old and new source text must be at most {max_patch_characters} characters.\nCURRENT RELEVANT CONTENT:\n{current}"
         )
-        if representation == "json":
+        raw_mutation = False
+        if representation == "raw_replacement":
+            selected_end = end_offset if end_offset is not None else start_offset + len(current)
+            prompt = (
+                "Return ONLY the replacement text for the exact controller-selected region below. "
+                "The entire response body is source content: do not use JSON, markdown fences, prose, "
+                "sentinels, or repeat metadata. The controller owns the target and will reject stale "
+                "file/context versions. Keep the replacement within the byte limit.\n"
+                f"Controller-selected path: {path}\nController mutation request id: {marker}\n"
+                f"Controller expected file SHA-256: {expected_file_hash}\n"
+                f"Controller-selected range: [{start_offset}, {selected_end})\n"
+                f"Mutation intent: {intent}\nMaximum replacement payload: {max_patch_characters} UTF-8 bytes\n"
+                "CURRENT EXACT REGION (replace all of this region with your response):\n"
+                f"{current}"
+            )
+            raw_response = True
+            raw_mutation = True
+            system_prompt = "Return only literal replacement source text. No JSON or explanatory text."
+        elif representation == "json":
             prompt = (
                 "The previous text frame was ambiguous. Return one bounded JSON mutation object and nothing else. "
                 "This is a single-file patch, not the high-level action batch. Required exact keys: request_id, path, expected_file_hash, operation, old, content, done. "
@@ -155,24 +183,65 @@ class RoleAgents:
                     max_output_tokens=token_budget,
                     max_output_characters=response_budget,
                     raw_response=raw_response,
+                    raw_mutation=raw_mutation,
                 )
             )
         except ProviderResponseError as error:
             if "exceeded character budget" in str(error).lower():
-                raise MutationFrameError("AMBIGUOUS", "mutation response exceeded the bounded payload limit") from error
+                raise MutationFrameError("AMBIGUOUS", "mutation response exceeded the bounded payload limit", raw_response=error.raw_response, provider_attempt=error.provider_attempt, response_bytes=error.response_bytes) from error
+            if raw_mutation:
+                raise MutationFrameError("PROVIDER_FAILURE", str(error), raw_response=error.raw_response, provider_attempt=error.provider_attempt, response_bytes=error.response_bytes) from error
             raise
         if not raw_response:
             return AgentReply(self._parse_json_mutation(reply.data, marker, path, expected_file_hash, max_patch_characters))
         raw = reply.data.get("raw_text")
         if not isinstance(raw, str):
             raise MutationFrameError("MALFORMED", "mutation response did not contain raw patch text")
-        return AgentReply(self._parse_raw_patch(
-            raw,
-            marker,
-            max_patch_characters,
-            expected_path=path,
-            response_complete=reply.data.get("response_complete") is True,
-        ))
+        if raw_mutation:
+            payload_bytes = len(raw.encode("utf-8"))
+            if payload_bytes > max_patch_characters:
+                raise MutationFrameError(
+                    "OVERSIZED_RAW_MUTATION",
+                    f"raw replacement exceeded byte budget ({payload_bytes} > {max_patch_characters})",
+                    raw_response=raw,
+                    provider_attempt=int(reply.data.get("provider_attempt", 1)),
+                )
+            if not raw:
+                raise MutationFrameError("MALFORMED", "raw replacement response is empty")
+            return AgentReply({
+                "operation": "replace" if existing else "create",
+                "old": current,
+                "content": raw,
+                "done": True,
+                "frame_status": "RAW_VALID",
+                "request_id": marker,
+                "path": path,
+                "expected_file_hash": expected_file_hash,
+                "start_offset": start_offset,
+                "end_offset": end_offset if end_offset is not None else start_offset + len(current),
+                "provider_attempt": reply.data.get("provider_attempt", 1),
+                "response_bytes": reply.data.get("response_bytes", payload_bytes),
+                "raw_text": raw,
+            })
+        try:
+            parsed = self._parse_raw_patch(
+                raw,
+                marker,
+                max_patch_characters,
+                expected_path=path,
+                response_complete=reply.data.get("response_complete") is True,
+            )
+            parsed["raw_text"] = raw
+            parsed["provider_attempt"] = reply.data.get("provider_attempt", 1)
+            return AgentReply(parsed)
+        except MutationFrameError as error:
+            raise MutationFrameError(
+                error.classification,
+                str(error),
+                raw_response=raw,
+                provider_attempt=int(reply.data.get("provider_attempt", 1)),
+                response_bytes=int(reply.data.get("response_bytes", len(raw.encode("utf-8", errors="replace")))),
+            ) from error
 
     @staticmethod
     def _parse_raw_patch(

@@ -126,6 +126,7 @@ class AutonomousRunner:
         if callable(set_observer):
             set_observer(self._record_provider_outcome)
         self._attempt_snapshots: dict[str, Path] = {}
+        self._active_mutation_requests: dict[str, tuple[str, str, int, int, str]] = {}
         self.protocol_recovery_budget = 2
         self.mutation_patch_budget = 48
         self.mutation_context_characters = 6_000
@@ -811,20 +812,40 @@ class AutonomousRunner:
         pending_context_recoveries = 0
         context_recovery_budget = 2
         patch_limit = 6_000
+        raw_cursor = 0
+        raw_chunk_mode = False
         recovery_reason = ""
         representation = "framed"
         fallback_requested = False
         while continuation < self.mutation_patch_budget:
             exists = target.is_file()
             if exists:
-                expected_file_hash, current = self.tools.file_snapshot(path)
+                expected_file_hash, full_current = (
+                    self.tools.file_snapshot_exact(path)
+                    if representation == "raw_replacement"
+                    else self.tools.file_snapshot(path)
+                )
             else:
-                expected_file_hash, current = hashlib.sha256(b"").hexdigest(), ""
-            context = self._mutation_context(current)
+                expected_file_hash, full_current = hashlib.sha256(b"").hexdigest(), ""
+            if representation == "raw_replacement" and (raw_chunk_mode or len(full_current.encode("utf-8")) > patch_limit):
+                raw_chunk_mode = True
+                region_start = min(raw_cursor, len(full_current))
+                region_end = self._bounded_mutation_region_end(full_current, region_start, patch_limit // 2)
+                if region_end <= region_start:
+                    region_end = min(len(full_current), region_start + patch_limit // 2)
+                current = full_current[region_start:region_end]
+            else:
+                region_start, region_end = 0, len(full_current)
+                current = full_current
+            context = current if representation == "raw_replacement" else self._mutation_context(full_current)
             request_id = uuid4().hex[:16]
             self._mark(state, "CODER", "MUTATION_PATCH_REQUEST", f"Requesting bounded patch {continuation + 1}/{self.mutation_patch_budget}: {path} (request_id={request_id}, file_sha256={expected_file_hash})", task)
+            if representation == "raw_replacement":
+                self._mark(state, "CODER", "MUTATION_RAW_REPLACEMENT_REQUEST", f"Requesting raw replacement for controller-selected region: {path}; request_id={request_id}", task)
             self._mark(state, "CODER", "LLM_CALL", f"Coder bounded mutation patch: {path}", task)
             try:
+                if representation == "raw_replacement":
+                    self._active_mutation_requests[request_id] = (path, expected_file_hash, region_start, region_end, current)
                 patch = self.agents.patch(
                     state,
                     task,
@@ -838,8 +859,60 @@ class AutonomousRunner:
                     max_patch_characters=patch_limit,
                     recovery_reason=recovery_reason,
                     representation=representation,
+                    start_offset=region_start,
+                    end_offset=region_end,
                 ).data
                 self._mark(state, "CODER", "LLM_RESPONSE", f"Coder mutation patch received: {path}", task)
+                if representation == "raw_replacement":
+                    if (
+                        patch.get("request_id") != request_id
+                        or patch.get("path") != path
+                        or patch.get("expected_file_hash") != expected_file_hash
+                        or self._active_mutation_requests.get(request_id)
+                        != (path, expected_file_hash, region_start, region_end, current)
+                    ):
+                        raise MutationFrameError(
+                            "AMBIGUOUS", "raw mutation response no longer matches its active controller request",
+                            raw_response=str(patch.get("raw_text", "")),
+                            provider_attempt=int(patch.get("provider_attempt", 1)),
+                        )
+                    raw_content = patch.get("content")
+                    if not isinstance(raw_content, str):
+                        raise MutationFrameError("MALFORMED", "raw replacement content is missing")
+                    full_file_region = region_start == 0 and region_end == len(full_current)
+                    if exists and full_file_region and len(current) >= 500 and len(raw_content) < len(current) * 0.5:
+                        raise MutationFrameError(
+                            "UNSAFE_DESTRUCTIVE_REPLACEMENT",
+                            "raw whole-file replacement would discard more than half of a substantial existing file",
+                            raw_response=str(patch.get("raw_text", "")),
+                            provider_attempt=int(patch.get("provider_attempt", 1)),
+                            response_bytes=int(patch.get("response_bytes", 0)),
+                        )
+                    self._validate_mutation_content(state, task, path, raw_content)
+                    self._execute_action(state, task, {
+                        "kind": "replace_slice_if_snapshot",
+                        "path": path,
+                        "expected_hash": expected_file_hash,
+                        "start_offset": region_start,
+                        "end_offset": region_end,
+                        "expected_slice": current,
+                        "replacement": raw_content,
+                    })
+                    self._active_mutation_requests.pop(request_id, None)
+                    operation = str(patch.get("operation", "replace"))
+                    done = True
+                    self._mark(state, "CODER", "MUTATION_RAW_REPLACEMENT_SUCCESS", f"Applied raw bounded replacement for {path}; request_id={request_id}", task)
+                    self._mark(state, "CODER", "MUTATION_PATCH_APPLIED", f"Applied bounded raw replacement: {path}", task)
+                    for _ in range(pending_context_recoveries):
+                        self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_SUCCESS", f"Applied refreshed mutation context for {path}", task)
+                    pending_context_recoveries = 0
+                    failures = 0
+                    continuation += 1
+                    if region_end < len(full_current):
+                        raw_cursor = region_start + len(raw_content)
+                        recovery_reason = "Continue with the next controller-selected exact file region; preserve its unrelated content."
+                        continue
+                    return
                 operation = patch.get("operation")
                 content = patch.get("content")
                 done = patch.get("done")
@@ -881,23 +954,41 @@ class AutonomousRunner:
                 if done:
                     return
             except MutationFrameError as error:
+                self._active_mutation_requests.pop(request_id, None)
                 failures += 1
+                self._record_mutation_diagnostic(
+                    state, request_id=request_id, protocol_mode=representation, path=path,
+                    expected_hash=expected_file_hash, response=error.raw_response,
+                    failure_type=error.classification, provider_attempt=error.provider_attempt,
+                    response_bytes=error.response_bytes,
+                )
                 phase = "MUTATION_FRAME_AMBIGUOUS" if error.classification == "AMBIGUOUS" else "MUTATION_FRAME_MALFORMED"
                 self._mark(state, "CODER", phase, str(error), task)
                 if representation == "framed" and not fallback_requested:
-                    # Change representation immediately after framing damage;
-                    # never ask the model to repeat the same sentinel grammar.
+                    # Mutation metadata and target range are controller-owned;
+                    # final transport is now literal bounded source text.
                     fallback_requested = True
-                    representation = "json"
+                    representation = "raw_replacement"
+                    raw_chunk_mode = len(full_current.encode("utf-8")) > patch_limit
                     recovery_reason = str(error)[:300]
                     continuation += 1
-                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK", f"Switching once to bounded JSON mutation for {path}", task)
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK", f"Switching once to controller-bounded raw replacement for {path}", task)
                     continue
-                if representation == "json":
-                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded mutation fallback failed for {path}: {error}", task)
+                if representation == "raw_replacement":
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded raw replacement failed for {path}: {error}", task)
                     self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch protocol exhausted for {path}: {error}", task)
-                    raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
+                    raise MutationProtocolExhaustedError(
+                        f"MUTATION_PROTOCOL_RECOVERY_EXHAUSTED: {error.classification}"
+                    ) from error
             except MutationContextMismatchError as error:
+                self._active_mutation_requests.pop(request_id, None)
+                raw_response = str(patch.get("raw_text", "")) if "patch" in locals() and isinstance(patch, dict) else ""
+                self._record_mutation_diagnostic(
+                    state, request_id=request_id, protocol_mode=representation, path=path,
+                    expected_hash=expected_file_hash, response=raw_response,
+                    failure_type=error.classification, provider_attempt=int(patch.get("provider_attempt", 0)) if "patch" in locals() and isinstance(patch, dict) else 0,
+                    response_bytes=int(patch.get("response_bytes", len(raw_response.encode("utf-8", errors="replace")))) if "patch" in locals() and isinstance(patch, dict) else None,
+                )
                 context_recoveries += 1
                 pending_context_recoveries += 1
                 self._mark(state, "CODER", "MUTATION_CONTEXT_MISMATCH", f"{path}: {error}", task)
@@ -907,27 +998,49 @@ class AutonomousRunner:
                     self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_EXHAUSTED", f"Context recovery budget exhausted for {path}", task)
                     raise MutationProtocolExhaustedError("MUTATION_CONTEXT_RECOVERY_EXHAUSTED") from error
                 latest_exists = target.is_file()
-                latest_hash, latest = self.tools.file_snapshot(path) if latest_exists else (hashlib.sha256(b"").hexdigest(), "")
+                latest_hash, latest = (
+                    self.tools.file_snapshot_exact(path)
+                    if latest_exists and representation == "raw_replacement"
+                    else self.tools.file_snapshot(path)
+                    if latest_exists
+                    else (hashlib.sha256(b"").hexdigest(), "")
+                )
                 failed_old = str(patch.get("old", "")) if "patch" in locals() else ""
                 recovery_reason = (
                     f"{error.classification}: the prior patch was not applied. Re-read the exact current target below. "
-                    "Return one bounded patch ONLY against this refreshed file content; do not reuse a stale OLD fragment.\n"
+                    "The next request will contain the current controller-owned exact region; return only its replacement text.\n"
                     f"Current SHA-256: {latest_hash}\nCurrent exists: {str(latest_exists).lower()}\n"
                     f"Rejected OLD fragment (diagnostic only): {failed_old[:1200]}"
                 )
                 exists = latest_exists
+                representation = "raw_replacement"
+                raw_chunk_mode = len(latest.encode("utf-8")) > patch_limit
+                fallback_requested = True
                 self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_ATTEMPT", f"Refreshing {path} and regenerating one bounded patch ({context_recoveries}/{context_recovery_budget})", task)
                 self._mark(state, "CODER", "MUTATION_CONTEXT_REFRESH", f"Refreshing patch context for {path}: {error}", task)
                 continuation += 1
                 failures = 0
                 continue
-            except ProviderUnavailableError:
-                if representation == "json":
-                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded mutation fallback provider was unavailable for {path}", task)
+            except ProviderUnavailableError as error:
+                self._active_mutation_requests.pop(request_id, None)
+                self._record_mutation_diagnostic(
+                    state, request_id=request_id, protocol_mode=representation, path=path,
+                    expected_hash=expected_file_hash, response=getattr(error, "raw_response", ""), failure_type="PROVIDER_UNAVAILABLE",
+                    provider_attempt=int(getattr(error, "provider_attempt", 0)),
+                )
+                if representation == "raw_replacement":
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded raw replacement provider was unavailable for {path}", task)
                 raise
             except (ProviderError, ValueError) as error:
-                if representation == "json":
-                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded mutation fallback could not be applied for {path}: {error}", task)
+                self._active_mutation_requests.pop(request_id, None)
+                self._record_mutation_diagnostic(
+                    state, request_id=request_id, protocol_mode=representation, path=path,
+                    expected_hash=expected_file_hash, response=getattr(error, "raw_response", ""),
+                    failure_type=type(error).__name__.upper(), provider_attempt=int(getattr(error, "provider_attempt", 0)),
+                    response_bytes=getattr(error, "response_bytes", None),
+                )
+                if representation == "raw_replacement":
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded raw replacement could not be applied for {path}: {error}", task)
                     self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch protocol exhausted for {path}: {error}", task)
                     raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
                 if "edit target was not found" in str(error):
@@ -970,10 +1083,69 @@ class AutonomousRunner:
                 )
         return None
 
+    @staticmethod
+    def _bounded_mutation_region_end(content: str, start: int, max_bytes: int) -> int:
+        """Select an exact controller-owned UTF-8 region, preferring line ends."""
+        if start >= len(content):
+            return len(content)
+        byte_count = 0
+        last_line_end = start
+        for index in range(start, len(content)):
+            byte_count += len(content[index].encode("utf-8"))
+            if byte_count > max_bytes:
+                break
+            if content[index] == "\n":
+                last_line_end = index + 1
+        if last_line_end > start:
+            return last_line_end
+        byte_count = 0
+        end = start
+        for index in range(start, len(content)):
+            size = len(content[index].encode("utf-8"))
+            if byte_count + size > max_bytes:
+                break
+            byte_count += size
+            end = index + 1
+        return end
+
     def _mutation_context(self, current: str) -> str:
         if len(current) <= self.mutation_context_characters:
             return current
         return "[earlier content omitted]\n" + current[-self.mutation_context_characters :]
+
+    def _record_mutation_diagnostic(
+        self,
+        state: ProjectState,
+        *,
+        request_id: str,
+        protocol_mode: str,
+        path: str,
+        expected_hash: str,
+        response: str,
+        failure_type: str,
+        provider_attempt: int,
+        response_bytes: int | None = None,
+    ) -> None:
+        """Persist bounded, local-only evidence for an unusable mutation reply."""
+        response_payload_bytes = response.encode("utf-8", errors="replace")
+        capped_bytes = response_payload_bytes[:16_000]
+        capped = capped_bytes.decode("utf-8", errors="replace")
+        while len(capped.encode("utf-8")) > 16_000:
+            capped = capped[:-1]
+        state.mutation_diagnostics.append({
+            "timestamp": utc_now(),
+            "mutation_request_id": request_id,
+            "protocol_mode": protocol_mode,
+            "path": path,
+            "expected_hash": expected_hash,
+            "response_bytes": len(response_payload_bytes) if response_bytes is None else response_bytes,
+            "failure_type": failure_type,
+            "provider_attempt": provider_attempt,
+            "raw_response": capped,
+            "raw_response_truncated": len(response_payload_bytes) > 16_000,
+        })
+        state.mutation_diagnostics = state.mutation_diagnostics[-100:]
+        self.store.save(state)
 
     def _apply_bounded_mutation_payload(
         self,
@@ -1476,6 +1648,10 @@ class AutonomousRunner:
         self._mark(state, "CODER", "TOOL_STARTED", f"Started tool: {kind}", task)
         try:
             self._execute_action_once(action)
+        except MutationContextMismatchError as error:
+            execution.finish(ToolExecutionStatus.FAILED, str(error))
+            self._mark(state, "CODER", "TOOL_FAILED", f"Tool failed: {kind}: {error}", task)
+            raise
         except CommandExecutionError:
             # The caller needs the command result to classify deterministic
             # environment failures.  It is still a task-local failure.
@@ -1507,6 +1683,26 @@ class AutonomousRunner:
             self.tools.write_file(self._string(action, "path"), self._string(action, "content"))
         elif kind == "edit_file":
             self.tools.edit_file(self._string(action, "path"), self._string(action, "old"), self._string(action, "new"))
+        elif kind == "replace_slice_if_snapshot":
+            path = self._string(action, "path")
+            expected_hash = self._string(action, "expected_hash")
+            expected_slice = self._string(action, "expected_slice")
+            replacement = self._string(action, "replacement")
+            start_offset = action.get("start_offset")
+            end_offset = action.get("end_offset")
+            if not isinstance(start_offset, int) or not isinstance(end_offset, int):
+                raise ValueError("replace_slice_if_snapshot requires integer offsets")
+            if not self.tools.replace_slice_if_snapshot(path, expected_hash, start_offset, end_offset, expected_slice, replacement):
+                current_hash = hashlib.sha256(self.tools._path(path).read_bytes()).hexdigest() if self.tools._path(path).is_file() else hashlib.sha256(b"").hexdigest()
+                current_slice = ""
+                if self.tools._path(path).is_file():
+                    try:
+                        text = self.tools._path(path).read_bytes().decode("utf-8")
+                        current_slice = text[start_offset:end_offset]
+                    except UnicodeDecodeError:
+                        pass
+                classification = "STALE_MUTATION_CONTEXT" if current_hash != expected_hash else "MUTATION_TARGET_MISMATCH"
+                raise MutationContextMismatchError(classification, f"atomic raw mutation precondition failed for {path}; captured slice still matches={current_slice == expected_slice}")
         elif kind == "append_file":
             self.tools.append_file(self._string(action, "path"), self._string(action, "content"))
         elif kind == "delete_file":

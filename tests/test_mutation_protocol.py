@@ -36,7 +36,10 @@ class RecordingProvider(ScriptedProvider):
     def complete(self, request: AgentRequest) -> AgentReply:
         self.requests.append(request)
         reply = super().complete(request)
-        if request.raw_response and "operation" in reply.data:
+        if request.raw_mutation:
+            raw = reply.data.get("content", reply.data.get("raw_text", ""))
+            reply = AgentReply({"raw_text": raw, "response_complete": True, "provider_attempt": 1})
+        elif request.raw_response and "operation" in reply.data:
             operation = reply.data.get("operation")
             done = str(reply.data.get("done", False)).lower()
             token = re.search(r"(?:CONTENT|OLD)-BEGIN-([0-9a-f]+)", request.prompt)
@@ -141,8 +144,8 @@ def test_stale_patch_refreshes_context_without_consuming_semantic_retry(tmp_path
     (tmp_path / "app.txt").write_text("value = old\n", encoding="utf-8")
     provider = RecordingProvider({
         "CODER": [
-            _patch("value = new", operation="replace", old="stale value", done=False),
-            _patch("value = new", operation="replace", old="value = old", done=True),
+            _patch("value = new\n", operation="replace", old="stale value", done=False),
+            _patch("value = new\n", operation="replace", old="value = old", done=True),
         ],
     })
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
@@ -282,7 +285,7 @@ def test_trailing_prose_after_new_end_is_rejected() -> None:
         RoleAgents._parse_raw_patch(raw, "token", 2_000, expected_path="style.css")
 
 
-def test_ambiguous_frame_uses_one_bounded_json_fallback_in_same_semantic_attempt(tmp_path: Path) -> None:
+def test_ambiguous_frame_uses_one_bounded_raw_fallback_in_same_semantic_attempt(tmp_path: Path) -> None:
     _repository(tmp_path)
     (tmp_path / "style.css").write_text(".card { color: red; }\n", encoding="utf-8")
     provider = RecordingProvider({
@@ -290,7 +293,7 @@ def test_ambiguous_frame_uses_one_bounded_json_fallback_in_same_semantic_attempt
             AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-token\nold\nNEW-BEGIN-token\nnew\nNEW-END-token\nNEW-BEGIN-token"}),
             AgentReply({
                 "request_id": "AUTO", "path": "", "operation": "replace", "old": ".card { color: red; }",
-                "content": ".card { color: blue; }", "done": True,
+                "content": ".card { color: blue; }\n", "done": True,
             }),
         ],
     })
@@ -304,13 +307,13 @@ def test_ambiguous_frame_uses_one_bounded_json_fallback_in_same_semantic_attempt
     assert task.attempts == 1
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: blue; }\n"
     assert len(provider.requests) == 2
-    assert provider.requests[-1].raw_response is False
-    request_ids = [re.search(r"Mutation request id: ([0-9a-f]+)", request.prompt).group(1) for request in provider.requests]
+    assert provider.requests[-1].raw_mutation is True
+    request_ids = [re.search(r"(?:Mutation request id|Controller mutation request id): ([0-9a-f]+)", request.prompt).group(1) for request in provider.requests]
     assert request_ids[0] != request_ids[1]
-    assert all("Path: style.css" in request.prompt for request in provider.requests)
+    assert "Controller-selected path: style.css" in provider.requests[-1].prompt
     assert metrics(state)["mutation_frames_ambiguous"] == 1
     assert metrics(state)["mutation_frame_fallbacks"] == 1
-    assert metrics(state)["mutation_frame_fallback_successes"] == 1
+    assert metrics(state)["raw_mutation_successes"] == 1
 
 
 def test_missing_old_end_is_applied_and_counted_without_semantic_retry(tmp_path: Path, monkeypatch) -> None:
@@ -342,13 +345,13 @@ def test_missing_old_end_is_applied_and_counted_without_semantic_retry(tmp_path:
     assert any(request_id in event.message for event in state.events if event.phase == "MUTATION_PATCH_REQUEST")
 
 
-def test_recovered_old_block_must_still_match_current_file_before_any_mutation(tmp_path: Path) -> None:
+def test_context_mismatch_fallback_replaces_only_the_controller_selected_current_file(tmp_path: Path) -> None:
     _repository(tmp_path)
     (tmp_path / "style.css").write_text(".card { color: green; }\n", encoding="utf-8")
     provider = RecordingProvider({
         "CODER": [
-            _patch(".card { color: blue; }", operation="replace", old=".card { color: red; }", done=True, omit_old_end=True),
-            AgentReply({"request_id": "wrong", "path": "style.css", "operation": "replace", "old": "red", "content": "blue", "done": True}),
+            _patch(".card { color: blue; }", operation="replace", old=".card { color: red; }", done=True),
+            AgentReply({"raw_text": ".card { color: blue; }\n", "response_complete": True}),
         ],
     })
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
@@ -356,10 +359,9 @@ def test_recovered_old_block_must_still_match_current_file_before_any_mutation(t
     task = Task.create("Change card color", "Change the card color")
     task.attempts = 1
 
-    with pytest.raises(MutationProtocolExhaustedError, match="MUTATION_PROTOCOL_RECOVERY_EXHAUSTED"):
-        runner._execute_coder_actions(state, task, [{"kind": "mutate_file", "path": "style.css", "intent": "change color"}])
+    runner._execute_coder_actions(state, task, [{"kind": "mutate_file", "path": "style.css", "intent": "change color"}])
 
-    assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: green; }\n"
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: blue; }\n"
     assert task.attempts == 1
 
 
@@ -370,7 +372,7 @@ def test_invalid_fallback_terminates_as_task_protocol_failure_without_crash(tmp_
         "CODER": [
             AgentReply({"actions": [{"kind": "mutate_file", "path": "style.css", "intent": "change color"}]}),
             AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nold\nNEW-BEGIN-wrong\nnew\nNEW-END-wrong"}),
-            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": "missing", "content": "blue", "done": True}),
+            AgentReply({"raw_text": "x" * 6_001, "response_complete": True}),
         ],
     })
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider, max_attempts=1)
@@ -387,15 +389,14 @@ def test_invalid_fallback_terminates_as_task_protocol_failure_without_crash(tmp_
     assert metrics(state)["system_crashes"] == 0
 
 
-def test_json_fallback_target_mismatch_refreshes_context_and_recovers_same_attempt(tmp_path: Path) -> None:
+def test_raw_fallback_recovers_context_mismatch_in_same_attempt(tmp_path: Path) -> None:
     _repository(tmp_path)
     original = ".card { color: red; }\n"
     (tmp_path / "style.css").write_text(original, encoding="utf-8")
     provider = RecordingProvider({
         "CODER": [
-            AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nred\nNEW-BEGIN-wrong\nblue\nNEW-END-wrong"}),
-            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": "color: burgundy;", "content": "color: blue;", "done": True}),
-            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": ".card { color: red; }", "content": ".card { color: blue; }", "done": True}),
+            _patch("color: blue;", operation="replace", old="color: burgundy;", done=True),
+            AgentReply({"content": ".card { color: blue; }\n", "response_complete": True}),
         ],
     })
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
@@ -407,16 +408,16 @@ def test_json_fallback_target_mismatch_refreshes_context_and_recovers_same_attem
 
     assert task.attempts == 1
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: blue; }\n"
-    assert len(provider.requests) == 3
+    assert len(provider.requests) == 2
     assert "color: red;" in provider.requests[1].prompt
-    assert "color: red;" in provider.requests[2].prompt
-    assert re.search(r"^Expected file SHA-256: [0-9a-f]{64}$", provider.requests[1].prompt, re.MULTILINE)
+    assert "CURRENT EXACT REGION" in provider.requests[1].prompt
+    assert re.search(r"^Controller expected file SHA-256: [0-9a-f]{64}$", provider.requests[1].prompt, re.MULTILINE)
     assert any(event.phase == "MUTATION_TARGET_MISMATCH" for event in state.events)
     assert any(event.phase == "MUTATION_CONTEXT_RECOVERY_SUCCESS" for event in state.events)
     assert metrics(state)["mutation_context_recovery_successes"] == 1
     assert metrics(state)["semantic_retry_count"] == 0
     assert not any(event.agent == "ARCHITECT" for event in state.events)
-    assert sum(execution.kind == "edit_file" for execution in state.tool_executions) == 1
+    assert sum(execution.kind == "replace_slice_if_snapshot" for execution in state.tool_executions) == 1
 
 
 def test_file_version_change_rejects_patch_then_requests_fresh_context(tmp_path: Path) -> None:
@@ -434,8 +435,8 @@ def test_file_version_change_rejects_patch_then_requests_fresh_context(tmp_path:
 
     provider = ChangingProvider({
         "CODER": [
-            _patch(".card { color: blue; }", operation="replace", old=".card { color: red; }", done=True),
-            _patch(".card { color: blue; }", operation="replace", old=".card { color: red; }", done=True),
+            _patch("/* concurrent update */\n.card { color: blue; }\n", operation="replace", old=".card { color: red; }", done=True),
+            _patch("/* concurrent update */\n.card { color: blue; }\n", operation="replace", old=".card { color: red; }", done=True),
         ],
     })
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
@@ -458,15 +459,11 @@ def test_context_recovery_exhaustion_is_protocol_only_without_unmutated_rollback
     _repository(tmp_path)
     original = ".card { color: red; }\n"
     (tmp_path / "style.css").write_text(original, encoding="utf-8")
-    wrong_frame = "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nred\nNEW-BEGIN-wrong\nblue\nNEW-END-wrong"
     provider = RecordingProvider({
         "CODER": [
             AgentReply({"actions": [{"kind": "mutate_file", "path": "style.css", "intent": "change card color"}]}),
-            AgentReply({"raw_text": wrong_frame}),
-            *[
-                AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": "not present", "content": ".card { color: blue; }", "done": True})
-                for _ in range(3)
-            ],
+            AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nred\nNEW-BEGIN-wrong\nblue\nNEW-END-wrong"}),
+            AgentReply({"raw_text": "x" * 6_001, "response_complete": True}),
         ],
     })
     runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider, max_attempts=1)
@@ -482,8 +479,7 @@ def test_context_recovery_exhaustion_is_protocol_only_without_unmutated_rollback
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == original
     assert not any(event.phase == "ATTEMPT_ROLLBACK" for event in state.events)
     assert not any(event.agent == "ARCHITECT" for event in state.events)
-    assert metrics(state)["mutation_context_recovery_attempts"] == 2
-    assert metrics(state)["mutation_context_recovery_exhaustions"] == 1
+    assert metrics(state)["raw_mutation_requests"] == 1
     assert metrics(state)["attempt_rollbacks_total"] == 0
     assert metrics(state)["semantic_retry_count"] == 0
 
@@ -495,9 +491,8 @@ def test_context_mismatch_recovers_then_exact_acceptance_and_review_continue(tmp
     provider = RecordingProvider({
         "CODER": [
             AgentReply({"actions": [{"kind": "mutate_file", "path": "style.css", "intent": "change card color"}], "task_status": "ready_for_validation"}),
-            AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nred\nNEW-BEGIN-wrong\nblue\nNEW-END-wrong"}),
-            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": "color: burgundy;", "content": "color: blue;", "done": True}),
-            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": ".card { color: red; }", "content": ".card { color: blue; }", "done": True}),
+            _patch("color: blue;", operation="replace", old="color: burgundy;", done=True),
+            AgentReply({"raw_text": ".card { color: blue; }\n", "response_complete": True}),
         ],
         "TESTER": [AgentReply({"command": ["py", "-3", "-c", "print('acceptance pass')"]})],
         "REVIEWER": [AgentReply({"approved": True, "reasons": []})],

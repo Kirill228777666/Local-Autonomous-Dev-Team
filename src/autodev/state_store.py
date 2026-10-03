@@ -35,6 +35,10 @@ class StateStore:
         state.updated_at = utc_now()
         self._write_projections(state)
         write_metrics(self.directory, state)
+        (self.directory / "mutation_diagnostics.jsonl").write_text(
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in state.mutation_diagnostics[-100:]),
+            encoding="utf-8",
+        )
         temporary_path = self.path.with_suffix(".json.tmp")
         temporary_path.write_text(
             json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n",

@@ -88,6 +88,27 @@ def test_ollama_provider_raw_response_omits_json_format_and_preserves_patch_text
     assert reply.data["done_reason"] == "stop"
 
 
+def test_ollama_raw_mutation_transport_returns_literal_content_without_structured_limits() -> None:
+    sent_payloads: list[dict[str, object]] = []
+    source = 'a { content: "quoted\\\\text"; background: url("x"); }\n'
+
+    def transport(_url: str, body: bytes, _timeout: float) -> bytes:
+        sent_payloads.append(json.loads(body))
+        return json.dumps({"message": {"content": source}, "done": True}).encode("utf-8")
+
+    reply = OllamaProvider(model="qwen3.6:35b-coding", retries=0, transport=transport).complete(
+        AgentRequest(
+            role="CODER", prompt="raw replacement", raw_response=True, raw_mutation=True,
+            max_output_characters=8,
+        )
+    )
+
+    assert "format" not in sent_payloads[0]
+    assert reply.data["raw_text"] == source
+    assert reply.data["provider_attempt"] == 1
+    assert reply.data["response_complete"] is True
+
+
 def test_ollama_provider_rejects_response_over_declared_character_budget() -> None:
     huge = json.dumps({"actions": [{"kind": "mutate_file", "path": "a.py", "intent": "x" * 100}]})
     raw = json.dumps({"message": {"content": huge}}).encode("utf-8")

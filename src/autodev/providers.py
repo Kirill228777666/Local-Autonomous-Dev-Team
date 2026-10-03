@@ -14,6 +14,12 @@ from urllib.request import Request, urlopen
 class ProviderError(RuntimeError):
     """The provider could not produce a valid structured reply."""
 
+    def __init__(self, message: str, *, provider_attempt: int = 0, raw_response: str = "", response_bytes: int | None = None) -> None:
+        self.provider_attempt = provider_attempt
+        self.raw_response = raw_response
+        self.response_bytes = len(raw_response.encode("utf-8", errors="replace")) if response_bytes is None else response_bytes
+        super().__init__(message)
+
 
 class ProviderUnavailableError(ProviderError):
     """The model endpoint could not be contacted or rejected the request."""
@@ -32,6 +38,9 @@ class AgentRequest:
     max_output_tokens: int | None = None
     max_output_characters: int | None = None
     raw_response: bool = False
+    # Mutation bodies are transported as literal assistant text after the
+    # controller has already fixed path, version, and target range.
+    raw_mutation: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +127,11 @@ class OllamaProvider:
         deadline = time.monotonic() + self.timeout
         transport_error: Exception | None = None
         response_error: Exception | None = None
+        last_content = ""
+        last_response_bytes = 0
+        last_attempt = 0
         for _attempt in range(self.retries + 1):
+            last_attempt = _attempt + 1
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 transport_error = TimeoutError(f"Ollama request exceeded hard wall-clock timeout of {self.timeout}s")
@@ -128,11 +141,16 @@ class OllamaProvider:
             content: object = ""
             try:
                 raw = self.transport(f"{self.base_url}/api/chat", payload, remaining)
+                last_content = raw.decode("utf-8", errors="replace")[:16_000]
+                last_response_bytes = len(raw)
                 envelope = json.loads(raw)
                 content = envelope["message"]["content"]
+                if isinstance(content, str):
+                    last_content = content
+                    last_response_bytes = len(content.encode("utf-8", errors="replace"))
                 if not isinstance(content, str) or not content.strip():
                     raise ProviderResponseError("Ollama response content is empty")
-                if request.max_output_characters is not None and len(content) > request.max_output_characters:
+                if not request.raw_mutation and request.max_output_characters is not None and len(content) > request.max_output_characters:
                     raise ProviderResponseError(
                         f"Ollama structured response exceeded character budget ({len(content)} > {request.max_output_characters})"
                     )
@@ -142,6 +160,8 @@ class OllamaProvider:
                         "raw_text": content,
                         "response_complete": envelope.get("done") is True,
                         "done_reason": envelope.get("done_reason"),
+                        "provider_attempt": _attempt + 1,
+                        "response_bytes": last_response_bytes,
                     })
                 if isinstance(content, str) and content.strip().startswith("```"):
                     lines = content.strip().splitlines()
@@ -156,6 +176,12 @@ class OllamaProvider:
                 self._observe(request.role, "TIMEOUT", started)
             except HTTPError as exc:
                 transport_error = exc
+                try:
+                    body = exc.read()
+                    last_content = body.decode("utf-8", errors="replace")[:16_000]
+                    last_response_bytes = len(body)
+                except OSError:
+                    last_content = ""
                 self._observe(request.role, "HTTP_ERROR", started)
             except (URLError, OSError) as exc:
                 transport_error = exc
@@ -174,10 +200,16 @@ class OllamaProvider:
                 self._observe(request.role, outcome, started)
         if transport_error is not None and response_error is None:
             raise ProviderUnavailableError(
-                f"Ollama endpoint unavailable after {self.retries + 1} attempts: {transport_error}"
+                f"Ollama endpoint unavailable after {self.retries + 1} attempts: {transport_error}",
+                provider_attempt=last_attempt,
+                raw_response=last_content,
+                response_bytes=last_response_bytes,
             )
         raise ProviderResponseError(
-            f"Ollama response invalid after {self.retries + 1} attempts: {response_error or transport_error}"
+            f"Ollama response invalid after {self.retries + 1} attempts: {response_error or transport_error}",
+            provider_attempt=last_attempt,
+            raw_response=last_content,
+            response_bytes=last_response_bytes,
         )
 
     def health(self) -> bool:

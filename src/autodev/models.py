@@ -238,6 +238,9 @@ class ProjectState:
     # live here: only a designated validator may decide task acceptance.
     validator_runs: list[dict[str, object]] = field(default_factory=list)
     provider_request_stats: dict[str, object] = field(default_factory=dict)
+    # Local-only bounded evidence for failed mutation transport. Raw responses
+    # are capped by the controller and are never copied into source Git.
+    mutation_diagnostics: list[dict[str, object]] = field(default_factory=list)
     terminal_status: str = ""
     terminal_reason: str = ""
 
@@ -287,6 +290,7 @@ class ProjectState:
             accepted_regressions=[dict(item) for item in value.get("accepted_regressions", []) if isinstance(item, dict)],  # type: ignore[arg-type]
             validator_runs=[dict(item) for item in value.get("validator_runs", []) if isinstance(item, dict)],  # type: ignore[arg-type]
             provider_request_stats=dict(value.get("provider_request_stats", {})),  # type: ignore[arg-type]
+            mutation_diagnostics=[dict(item) for item in value.get("mutation_diagnostics", []) if isinstance(item, dict)],  # type: ignore[arg-type]
             terminal_status=str(value.get("terminal_status", "")),
             terminal_reason=str(value.get("terminal_reason", "")),
         )
@@ -326,6 +330,7 @@ class ProjectState:
             "accepted_regressions": self.accepted_regressions[-20:],
             "validator_runs": self.validator_runs[-300:],
             "provider_request_stats": self.provider_request_stats,
+            "mutation_diagnostics": self.mutation_diagnostics[-100:],
             "terminal_status": self.terminal_status,
             "terminal_reason": self.terminal_reason,
         }
