@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from uuid import uuid4
 
 from .context import ContextBuilder
 from .models import ProjectState, Task
-from .providers import AgentReply, AgentRequest, LLMProvider, ProviderError
+from .providers import AgentReply, AgentRequest, LLMProvider, ProviderError, ProviderResponseError
 
 
 ROLE_PROMPTS = {
@@ -17,6 +18,14 @@ ROLE_PROMPTS = {
     "REVIEWER": "You are Reviewer. Return only JSON: approved boolean and optional reasons array. Do not add scope.",
     "FINAL_QA": "You are Final QA. Independently compare the completed product against the original specification. Return only JSON with status PASS or FAIL and a findings array. Do not add scope.",
 }
+
+
+class MutationFrameError(ProviderError):
+    """A bounded mutation envelope is ambiguous or malformed and was not applied."""
+
+    def __init__(self, classification: str, message: str) -> None:
+        self.classification = classification
+        super().__init__(f"MUTATION_PROTOCOL_{classification}: {message}")
 
 
 class RoleAgents:
@@ -85,66 +94,221 @@ class RoleAgents:
         current: str,
         existing: bool,
         continuation: int,
+        request_id: str | None = None,
         max_patch_characters: int = 6_000,
         recovery_reason: str = "",
+        representation: str = "framed",
     ) -> AgentReply:
         """Ask for one independently bounded mutation, never a task-sized body."""
         mode = "existing" if existing else "new"
         token_budget = 1_536 if max_patch_characters > 3_000 else 768 if max_patch_characters > 1_500 else 384
         response_budget = 16_000
-        marker = uuid4().hex[:16]
+        marker = request_id or uuid4().hex[:16]
         content_start = f"CONTENT-BEGIN-{marker}"
         content_end = f"CONTENT-END-{marker}"
         old_start = f"OLD-BEGIN-{marker}"
         old_end = f"OLD-END-{marker}"
         new_start = f"NEW-BEGIN-{marker}"
         new_end = f"NEW-END-{marker}"
-        prompt = (
-            "Return one bounded file patch using the exact plain-text framing below. Do not return JSON, markdown fences, or prose. "
-            f"The source body must be at most {max_patch_characters} characters.\n"
-            "First line: OPERATION=create, append, or replace. Second line: DONE=true or DONE=false.\n"
-            f"For create/append, put only the source body between {content_start} and {content_end}, each marker on its own line.\n"
-            f"For replace, put exact old text between {old_start} and {old_end}, then replacement text between {new_start} and {new_end}.\n"
-            "For an existing file prefer append or a small exact replacement. For a new file use create for the first section, then append. "
-            "If continuing, return only the next atomic section, not the whole file. Preserve source literally; no JSON escaping is needed.\n\n"
-            f"Path: {path}\nFile state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
-            + (f"Recovery: {recovery_reason}. Make this patch smaller than the failed response.\n" if recovery_reason else "")
-            + f"CURRENT RELEVANT CONTENT:\n{current}"
+        common = (
+            f"Mutation request id: {marker}\nPath: {path}\nFile state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
+            + (f"Recovery: {recovery_reason}. Do not repeat the same framing; use the requested bounded representation.\n" if recovery_reason else "")
+            + f"The combined old and new source text must be at most {max_patch_characters} characters.\nCURRENT RELEVANT CONTENT:\n{current}"
         )
-        reply = self.provider.complete(
-            AgentRequest(
-                role="CODER",
-                prompt=prompt,
-                system_prompt="You are Coder. Return exactly one bounded plain-text patch using the requested framing. Source is raw text, not JSON.",
-                max_output_tokens=token_budget,
-                max_output_characters=response_budget,
-                raw_response=True,
+        if representation == "json":
+            prompt = (
+                "The previous text frame was ambiguous. Return one bounded JSON mutation object and nothing else. "
+                "This is a single-file patch, not the high-level action batch. Required exact keys: request_id, path, operation, old, content, done. "
+                "request_id and path must exactly match the values below. operation is create, append, or replace; old is empty except for replace. "
+                "Do not include markdown or prose. Source text belongs only in content and must not exceed the stated combined limit.\n"
+                + common
             )
-        )
+            raw_response = False
+            system_prompt = "Return exactly one JSON object for the bounded file mutation. No prose or markdown."
+        elif representation == "framed":
+            prompt = (
+                "Return one bounded file patch using the exact plain-text framing below. Do not return JSON, markdown fences, or prose. "
+                f"The source body must be at most {max_patch_characters} characters.\n"
+                "First line: OPERATION=create, append, or replace. Second line: DONE=true or DONE=false. Third line must be PATH with the exact target path.\n"
+                f"For create/append, put only the source body between {content_start} and {content_end}, each marker on its own line.\n"
+                f"For replace, put exact old text between {old_start} and {old_end}, then replacement text between {new_start} and {new_end}.\n"
+                "For an existing file prefer append or a small exact replacement. For a new file use create for the first section, then append. "
+                "If continuing, return only the next atomic section, not the whole file. Preserve source literally; no JSON escaping is needed.\n"
+                f"OPERATION=...\nDONE=...\nPATH={path}\n"
+                f"Mutation request id: {marker}\nPath: {path}\nFile state: {mode}\nMutation goal: {intent}\nContinuation: {continuation}\n"
+                + (f"Recovery: {recovery_reason}. Make this patch smaller than the failed response.\n" if recovery_reason else "")
+                + f"CURRENT RELEVANT CONTENT:\n{current}"
+            )
+            raw_response = True
+            system_prompt = "You are Coder. Return exactly one bounded plain-text patch using the requested framing. Source is raw text, not JSON."
+        else:
+            raise ValueError(f"unknown mutation representation: {representation}")
+        try:
+            reply = self.provider.complete(
+                AgentRequest(
+                    role="CODER",
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    max_output_tokens=token_budget,
+                    max_output_characters=response_budget,
+                    raw_response=raw_response,
+                )
+            )
+        except ProviderResponseError as error:
+            if "exceeded character budget" in str(error).lower():
+                raise MutationFrameError("AMBIGUOUS", "mutation response exceeded the bounded payload limit") from error
+            raise
+        if not raw_response:
+            return AgentReply(self._parse_json_mutation(reply.data, marker, path, max_patch_characters))
         raw = reply.data.get("raw_text")
         if not isinstance(raw, str):
-            raise ProviderError("mutation response did not contain raw patch text")
-        return AgentReply(self._parse_raw_patch(raw, marker, 16_000))
+            raise MutationFrameError("MALFORMED", "mutation response did not contain raw patch text")
+        return AgentReply(self._parse_raw_patch(
+            raw,
+            marker,
+            max_patch_characters,
+            expected_path=path,
+            response_complete=reply.data.get("response_complete") is True,
+        ))
 
     @staticmethod
-    def _parse_raw_patch(raw: str, marker: str, max_patch_characters: int) -> dict[str, object]:
-        lines = raw.splitlines()
-        if len(lines) < 4 or not lines[0].startswith("OPERATION=") or not lines[1].startswith("DONE="):
-            raise ProviderError("mutation response framing is invalid")
-        operation = lines[0].partition("=")[2].strip()
-        done_text = lines[1].partition("=")[2].strip().lower()
+    def _parse_raw_patch(
+        raw: str,
+        marker: str,
+        max_patch_characters: int,
+        *,
+        expected_path: str,
+        response_complete: bool = False,
+    ) -> dict[str, object]:
+        """Parse the mutation wire format as an explicit, fail-closed state machine.
+
+        NEW-BEGIN is an unambiguous structural boundary for OLD when OLD-END is
+        omitted. A missing final terminator is not recoverable: with arbitrary
+        source text there is no deterministic way to distinguish payload from
+        trailing prose, even if the transport reports normal completion.
+        """
+        lines = raw.splitlines(keepends=True)
+        header = [line.rstrip("\r\n") for line in lines[:3]]
+        if len(header) != 3 or not header[0].startswith("OPERATION=") or not header[1].startswith("DONE=") or not header[2].startswith("PATH="):
+            raise MutationFrameError("MALFORMED", "mutation response header is invalid")
+        operation = header[0].partition("=")[2].strip()
+        done_text = header[1].partition("=")[2].strip().lower()
+        path = header[2].partition("=")[2]
         if operation not in {"create", "append", "replace"} or done_text not in {"true", "false"}:
-            raise ProviderError("mutation response header is invalid")
+            raise MutationFrameError("MALFORMED", "mutation response operation/status is invalid")
+        if path != expected_path:
+            raise MutationFrameError("AMBIGUOUS", "mutation response path does not match the requested target")
+
+        body_lines = [line.rstrip("\r\n") for line in lines[3:]]
+        marker_re = re.compile(r"^(?:OLD|NEW|CONTENT)-(?:BEGIN|END)-([A-Za-z0-9]+)$")
+        discovered = [(index + 3, text, marker_re.fullmatch(text)) for index, text in enumerate(body_lines)]
+        allowed_markers = (
+            {"OLD-BEGIN", "OLD-END", "NEW-BEGIN", "NEW-END"}
+            if operation == "replace"
+            else {"CONTENT-BEGIN", "CONTENT-END"}
+        )
+        for _index, text, match in discovered:
+            if text.startswith(("OLD-", "NEW-", "CONTENT-")) and (match is None or match.group(1) != marker):
+                raise MutationFrameError("AMBIGUOUS", "mutation response contains a foreign or malformed boundary marker")
+            if match is not None and text.rsplit("-", 1)[0] not in allowed_markers:
+                raise MutationFrameError("AMBIGUOUS", "mutation response contains an unexpected boundary for this operation")
+
+        def positions(name: str) -> list[int]:
+            wanted = f"{name}-{marker}"
+            return [index for index, text, _match in discovered if text == wanted]
+
+        def exactly_one(name: str) -> int:
+            found = positions(name)
+            if len(found) != 1:
+                raise MutationFrameError("AMBIGUOUS", f"expected exactly one {name}-{marker} boundary")
+            return found[0]
+
+        def optional_one(name: str) -> int | None:
+            found = positions(name)
+            if len(found) > 1:
+                raise MutationFrameError("AMBIGUOUS", f"duplicate {name}-{marker} boundary")
+            return found[0] if found else None
+
+        def section(start: int, end: int) -> str:
+            if end <= start:
+                raise MutationFrameError("AMBIGUOUS", "mutation boundary order is invalid")
+            value = "".join(lines[start + 1 : end])
+            # The newline immediately before a marker belongs to the framing,
+            # not to the source body. Any additional newline remains verbatim.
+            if value.endswith("\r\n"):
+                value = value[:-2]
+            elif value.endswith(("\n", "\r")):
+                value = value[:-1]
+            return value
+
+        recovered = False
         if operation == "replace":
-            old = RoleAgents._framed_section(raw, f"OLD-BEGIN-{marker}", f"OLD-END-{marker}", allow_trailing=True)
-            content = RoleAgents._framed_section(raw, f"NEW-BEGIN-{marker}", f"NEW-END-{marker}", allow_eof=True)
-            data: dict[str, object] = {"operation": operation, "old": old, "content": content, "done": done_text == "true"}
+            old_start = exactly_one("OLD-BEGIN")
+            new_start = exactly_one("NEW-BEGIN")
+            old_end = optional_one("OLD-END")
+            new_end = optional_one("NEW-END")
+            if new_end is None:
+                reason = "normal EOF cannot distinguish source text from trailing prose" if response_complete else "provider response ended without a final boundary"
+                raise MutationFrameError("AMBIGUOUS", f"NEW-END is missing; {reason}")
+            if not old_start < new_start < new_end:
+                raise MutationFrameError("AMBIGUOUS", "replace boundary order is invalid")
+            if any(text.strip() for text in lines[3:old_start]):
+                raise MutationFrameError("AMBIGUOUS", "unexpected content precedes OLD-BEGIN")
+            if old_end is None:
+                # The unique matching NEW-BEGIN safely closes OLD.
+                old_end = new_start
+                recovered = True
+            elif not old_start < old_end < new_start:
+                raise MutationFrameError("AMBIGUOUS", "OLD-END is not between OLD-BEGIN and NEW-BEGIN")
+            if any(text.strip() for text in lines[old_end + 1 : new_start]):
+                raise MutationFrameError("AMBIGUOUS", "unexpected content appears between replace sections")
+            old = section(old_start, old_end)
+            content = section(new_start, new_end)
+            trailing = "".join(lines[new_end + 1 :])
+            if trailing.strip():
+                raise MutationFrameError("AMBIGUOUS", "mutation response has trailing unstructured content")
+            data: dict[str, object] = {
+                "operation": operation,
+                "old": old,
+                "content": content,
+                "done": done_text == "true",
+                "frame_status": "RECOVERED_VALID" if recovered else "VALID",
+            }
         else:
-            content = RoleAgents._framed_section(raw, f"CONTENT-BEGIN-{marker}", f"CONTENT-END-{marker}", allow_eof=True)
-            data = {"operation": operation, "content": content, "done": done_text == "true"}
+            content_start = exactly_one("CONTENT-BEGIN")
+            content_end = optional_one("CONTENT-END")
+            if content_end is None:
+                reason = "normal EOF cannot distinguish source text from trailing prose" if response_complete else "provider response ended without a final boundary"
+                raise MutationFrameError("AMBIGUOUS", f"CONTENT-END is missing; {reason}")
+            if not content_start < content_end:
+                raise MutationFrameError("AMBIGUOUS", "content boundary order is invalid")
+            if any(text.strip() for text in lines[3:content_start]):
+                raise MutationFrameError("AMBIGUOUS", "unexpected content precedes CONTENT-BEGIN")
+            content = section(content_start, content_end)
+            trailing = "".join(lines[content_end + 1 :])
+            if trailing.strip():
+                raise MutationFrameError("AMBIGUOUS", "mutation response has trailing unstructured content")
+            data = {"operation": operation, "content": content, "done": done_text == "true", "frame_status": "VALID"}
+
         if not content or len(content) > max_patch_characters or len(str(data.get("old", ""))) + len(content) > max_patch_characters:
-            raise ProviderError("mutation patch exceeded its active text budget")
+            raise MutationFrameError("AMBIGUOUS", "mutation patch exceeded its active text budget")
         return data
+
+    @staticmethod
+    def _parse_json_mutation(raw: dict[str, object], marker: str, expected_path: str, max_patch_characters: int) -> dict[str, object]:
+        required = {"request_id", "path", "operation", "old", "content", "done"}
+        if set(raw) != required:
+            raise MutationFrameError("MALFORMED", "fallback mutation JSON has unexpected or missing fields")
+        if raw.get("request_id") != marker or raw.get("path") != expected_path:
+            raise MutationFrameError("AMBIGUOUS", "fallback mutation identity/path mismatch")
+        operation, old, content, done = raw.get("operation"), raw.get("old"), raw.get("content"), raw.get("done")
+        if not isinstance(operation, str) or operation not in {"create", "append", "replace"} or not isinstance(old, str) or not isinstance(content, str) or not isinstance(done, bool):
+            raise MutationFrameError("MALFORMED", "fallback mutation fields have invalid types")
+        if operation != "replace" and old:
+            raise MutationFrameError("AMBIGUOUS", "fallback old text is only valid for replace")
+        if not content or len(old) + len(content) > max_patch_characters:
+            raise MutationFrameError("AMBIGUOUS", "fallback mutation exceeded its active text budget")
+        return {"operation": operation, "old": old, "content": content, "done": done, "frame_status": "FALLBACK_VALID"}
 
     @staticmethod
     def _framed_section(

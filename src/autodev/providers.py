@@ -138,7 +138,11 @@ class OllamaProvider:
                     )
                 if request.raw_response:
                     self._observe(request.role, "SUCCESS", started)
-                    return AgentReply(data={"raw_text": content})
+                    return AgentReply(data={
+                        "raw_text": content,
+                        "response_complete": envelope.get("done") is True,
+                        "done_reason": envelope.get("done_reason"),
+                    })
                 if isinstance(content, str) and content.strip().startswith("```"):
                     lines = content.strip().splitlines()
                     content = "\n".join(lines[1:-1]) if len(lines) >= 3 else content

@@ -77,13 +77,15 @@ def test_ollama_provider_raw_response_omits_json_format_and_preserves_patch_text
 
     def transport(_url: str, body: bytes, _timeout: float) -> bytes:
         sent_payloads.append(json.loads(body))
-        return json.dumps({"message": {"content": raw_patch}}).encode()
+        return json.dumps({"message": {"content": raw_patch}, "done": True, "done_reason": "stop"}).encode()
 
     provider = OllamaProvider(model="qwen", retries=0, transport=transport)
     reply = provider.complete(AgentRequest(role="CODER", prompt="patch", raw_response=True))
 
     assert "format" not in sent_payloads[0]
     assert reply.data["raw_text"] == raw_patch
+    assert reply.data["response_complete"] is True
+    assert reply.data["done_reason"] == "stop"
 
 
 def test_ollama_provider_rejects_response_over_declared_character_budget() -> None:

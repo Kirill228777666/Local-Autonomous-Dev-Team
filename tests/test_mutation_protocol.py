@@ -6,11 +6,13 @@ import subprocess
 import re
 from pathlib import Path
 
+import pytest
+
 from autodev.models import ProjectState, Task, TaskStatus
-from autodev.agents import RoleAgents
+from autodev.agents import MutationFrameError, RoleAgents
 from autodev.metrics import metrics
-from autodev.orchestrator import AutonomousRunner
-from autodev.providers import AgentReply, AgentRequest, ScriptedProvider
+from autodev.orchestrator import AutonomousRunner, MutationProtocolExhaustedError
+from autodev.providers import AgentReply, AgentRequest, ProviderError, ScriptedProvider
 from autodev.state_store import StateStore
 from autodev.tools import CommandResult, WorkspaceTools
 
@@ -39,25 +41,37 @@ class RecordingProvider(ScriptedProvider):
             token = re.search(r"(?:CONTENT|OLD)-BEGIN-([0-9a-f]+)", request.prompt)
             assert token is not None
             marker = token.group(1)
+            path = re.search(r"^Path: (.+)$", request.prompt, re.MULTILINE)
+            assert path is not None
+            target = path.group(1)
             if operation == "replace":
+                old_end = "" if reply.data.get("omit_old_end") else f"\nOLD-END-{marker}"
                 raw = (
-                    f"OPERATION=replace\nDONE={done}\nOLD-BEGIN-{marker}\n{reply.data.get('old', '')}"
-                    f"\nOLD-END-{marker}\nNEW-BEGIN-{marker}\n{reply.data.get('content', '')}\nNEW-END-{marker}"
+                    f"OPERATION=replace\nDONE={done}\nPATH={target}\nOLD-BEGIN-{marker}\n{reply.data.get('old', '')}"
+                    f"{old_end}\nNEW-BEGIN-{marker}\n{reply.data.get('content', '')}\nNEW-END-{marker}"
                 )
             else:
                 raw = (
-                    f"OPERATION={operation}\nDONE={done}\nCONTENT-BEGIN-{marker}\n{reply.data.get('content', '')}"
+                    f"OPERATION={operation}\nDONE={done}\nPATH={target}\nCONTENT-BEGIN-{marker}\n{reply.data.get('content', '')}"
                     f"\nCONTENT-END-{marker}"
                 )
-            reply = AgentReply({"raw_text": raw})
+            reply = AgentReply({"raw_text": raw, "response_complete": True})
+        elif not request.raw_response and reply.data.get("request_id") == "AUTO":
+            token = re.search(r"Mutation request id: ([0-9a-f]+)", request.prompt)
+            path = re.search(r"^Path: (.+)$", request.prompt, re.MULTILINE)
+            assert token is not None and path is not None
+            reply.data["request_id"] = token.group(1)
+            reply.data["path"] = path.group(1)
         self.responses.append(reply.data)
         return reply
 
 
-def _patch(content: str, *, operation: str = "append", done: bool = False, old: str = "") -> AgentReply:
+def _patch(content: str, *, operation: str = "append", done: bool = False, old: str = "", omit_old_end: bool = False) -> AgentReply:
     data: dict[str, object] = {"operation": operation, "content": content, "done": done}
     if old:
         data["old"] = old
+    if omit_old_end:
+        data["omit_old_end"] = True
     return AgentReply(data)
 
 
@@ -169,11 +183,207 @@ def test_coder_command_file_write_is_rerouted_through_bounded_mutation_protocol(
 
 
 def test_raw_mutation_payload_is_parsed_without_json_escaping_or_closing_marker() -> None:
-    raw = "OPERATION=append\nDONE=true\nCONTENT-BEGIN-token\nvalue = \"quoted\"\n"
+    raw = "OPERATION=append\nDONE=true\nPATH=app.py\nCONTENT-BEGIN-token\nvalue = \"quoted\"\nCONTENT-END-token"
 
-    patch = RoleAgents._parse_raw_patch(raw, "token", 2_000)
+    patch = RoleAgents._parse_raw_patch(raw, "token", 2_000, expected_path="app.py")
 
-    assert patch == {"operation": "append", "content": "value = \"quoted\"\n", "done": True}
+    assert patch == {"operation": "append", "content": "value = \"quoted\"", "done": True, "frame_status": "VALID"}
+
+
+def test_missing_old_end_recovers_at_unique_matching_new_begin() -> None:
+    raw = (
+        "OPERATION=replace\nDONE=true\nPATH=style.css\n"
+        "OLD-BEGIN-token\ncolor: red;\n"
+        "NEW-BEGIN-token\ncolor: blue;\nNEW-END-token"
+    )
+
+    patch = RoleAgents._parse_raw_patch(raw, "token", 2_000, expected_path="style.css")
+
+    assert patch == {
+        "operation": "replace",
+        "old": "color: red;",
+        "content": "color: blue;",
+        "done": True,
+        "frame_status": "RECOVERED_VALID",
+    }
+
+
+def test_duplicate_new_begin_is_ambiguous_not_recovered() -> None:
+    raw = (
+        "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-token\nold\n"
+        "NEW-BEGIN-token\nfirst\nNEW-BEGIN-token\nsecond\nNEW-END-token"
+    )
+
+    with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        RoleAgents._parse_raw_patch(raw, "token", 2_000, expected_path="style.css")
+
+
+@pytest.mark.parametrize("raw", [
+    "OPERATION=replace\nDONE=true\nPATH=style.css\nprose\nOLD-BEGIN-token\nold\nNEW-BEGIN-token\nnew\nNEW-END-token",
+    "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-token\nold\nOLD-END-token\nprose\nNEW-BEGIN-token\nnew\nNEW-END-token",
+    "OPERATION=replace\nDONE=true\nPATH=style.css\nCONTENT-BEGIN-token\nwrong-operation\nCONTENT-END-token",
+])
+def test_unexpected_preamble_inter_section_prose_or_boundary_family_is_ambiguous(raw: str) -> None:
+    with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        RoleAgents._parse_raw_patch(raw, "token", 2_000, expected_path="style.css")
+
+
+def test_wrong_request_nonce_and_wrong_target_path_are_rejected() -> None:
+    nonce_mismatch = "OPERATION=append\nDONE=true\nPATH=app.css\nCONTENT-BEGIN-other\nbody\nCONTENT-END-other"
+    path_mismatch = "OPERATION=append\nDONE=true\nPATH=other.css\nCONTENT-BEGIN-token\nbody\nCONTENT-END-token"
+
+    with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        RoleAgents._parse_raw_patch(nonce_mismatch, "token", 2_000, expected_path="app.css")
+    with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        RoleAgents._parse_raw_patch(path_mismatch, "token", 2_000, expected_path="app.css")
+
+
+def test_fallback_json_rejects_wrong_request_identity_or_path() -> None:
+    fields = {"request_id": "other", "path": "app.css", "operation": "append", "old": "", "content": "body", "done": True}
+
+    with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        RoleAgents._parse_json_mutation(fields, "token", "app.css", 2_000)
+    fields.update(request_id="token", path="other.css")
+    with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        RoleAgents._parse_json_mutation(fields, "token", "app.css", 2_000)
+
+
+def test_missing_new_end_is_not_guessed_at_eof_even_for_normal_completion() -> None:
+    raw = "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-token\nold\nOLD-END-token\nNEW-BEGIN-token\nnew"
+
+    with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        RoleAgents._parse_raw_patch(raw, "token", 2_000, expected_path="style.css", response_complete=True)
+
+
+def test_trailing_prose_after_new_end_is_rejected() -> None:
+    raw = (
+        "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-token\nold\nOLD-END-token\n"
+        "NEW-BEGIN-token\nnew\nNEW-END-token\nHere is the patch."
+    )
+
+    with pytest.raises(ProviderError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        RoleAgents._parse_raw_patch(raw, "token", 2_000, expected_path="style.css")
+
+
+def test_ambiguous_frame_uses_one_bounded_json_fallback_in_same_semantic_attempt(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    (tmp_path / "style.css").write_text(".card { color: red; }\n", encoding="utf-8")
+    provider = RecordingProvider({
+        "CODER": [
+            AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-token\nold\nNEW-BEGIN-token\nnew\nNEW-END-token\nNEW-BEGIN-token"}),
+            AgentReply({
+                "request_id": "AUTO", "path": "", "operation": "replace", "old": ".card { color: red; }",
+                "content": ".card { color: blue; }", "done": True,
+            }),
+        ],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = ProjectState.create("Edit a stylesheet")
+    task = Task.create("Change card color", "Change the card color")
+    task.attempts = 1
+
+    runner._execute_coder_actions(state, task, [{"kind": "mutate_file", "path": "style.css", "intent": "change card color"}])
+
+    assert task.attempts == 1
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: blue; }\n"
+    assert len(provider.requests) == 2
+    assert provider.requests[-1].raw_response is False
+    request_ids = [re.search(r"Mutation request id: ([0-9a-f]+)", request.prompt).group(1) for request in provider.requests]
+    assert request_ids[0] != request_ids[1]
+    assert all("Path: style.css" in request.prompt for request in provider.requests)
+    assert metrics(state)["mutation_frames_ambiguous"] == 1
+    assert metrics(state)["mutation_frame_fallbacks"] == 1
+    assert metrics(state)["mutation_frame_fallback_successes"] == 1
+
+
+def test_missing_old_end_is_applied_and_counted_without_semantic_retry(tmp_path: Path, monkeypatch) -> None:
+    _repository(tmp_path)
+    (tmp_path / "style.css").write_text(".card { color: red; }\n", encoding="utf-8")
+    provider = RecordingProvider({
+        "CODER": [
+            AgentReply({"actions": [{"kind": "mutate_file", "path": "style.css", "intent": "change card color"}], "task_status": "ready_for_validation"}),
+            _patch(".card { color: blue; }", operation="replace", old=".card { color: red; }", done=True, omit_old_end=True),
+        ],
+        "TESTER": [AgentReply({"command": ["py", "-3", "-c", "print('pass')"]})],
+        "REVIEWER": [AgentReply({"approved": True, "reasons": []})],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = ProjectState.create("Edit a stylesheet")
+    task = Task.create("Change card color", "Change the card color")
+    task.acceptance_validator = {"validator_id": "css", "command": ["deterministic acceptance"]}
+    state.tasks = [task]
+    monkeypatch.setattr(runner, "_run_validator", lambda *_args: CommandResult(0, "PASS", ""))
+
+    runner._run_task(state, task)
+
+    assert task.status is TaskStatus.DONE
+    assert task.attempts == 1
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: blue; }\n"
+    assert metrics(state)["mutation_frames_recovered"] == 1
+    assert metrics(state)["mutation_frame_fallbacks"] == 0
+    request_id = re.search(r"Mutation request id: ([0-9a-f]+)", provider.requests[1].prompt).group(1)
+    assert any(request_id in event.message for event in state.events if event.phase == "MUTATION_PATCH_REQUEST")
+
+
+def test_recovered_old_block_must_still_match_current_file_before_any_mutation(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    (tmp_path / "style.css").write_text(".card { color: green; }\n", encoding="utf-8")
+    provider = RecordingProvider({
+        "CODER": [
+            _patch(".card { color: blue; }", operation="replace", old=".card { color: red; }", done=True, omit_old_end=True),
+            AgentReply({"request_id": "wrong", "path": "style.css", "operation": "replace", "old": "red", "content": "blue", "done": True}),
+        ],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider)
+    state = ProjectState.create("Edit a stylesheet")
+    task = Task.create("Change card color", "Change the card color")
+    task.attempts = 1
+
+    with pytest.raises(MutationProtocolExhaustedError, match="MUTATION_PROTOCOL_RECOVERY_EXHAUSTED"):
+        runner._execute_coder_actions(state, task, [{"kind": "mutate_file", "path": "style.css", "intent": "change color"}])
+
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: green; }\n"
+    assert task.attempts == 1
+
+
+def test_invalid_fallback_terminates_as_task_protocol_failure_without_crash(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    (tmp_path / "style.css").write_text("a { color: red; }\n", encoding="utf-8")
+    provider = RecordingProvider({
+        "CODER": [
+            AgentReply({"actions": [{"kind": "mutate_file", "path": "style.css", "intent": "change color"}]}),
+            AgentReply({"raw_text": "OPERATION=replace\nDONE=true\nPATH=style.css\nOLD-BEGIN-wrong\nold\nNEW-BEGIN-wrong\nnew\nNEW-END-wrong"}),
+            AgentReply({"request_id": "AUTO", "path": "style.css", "operation": "replace", "old": "missing", "content": "blue", "done": True}),
+        ],
+    })
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), provider, max_attempts=1)
+    state = ProjectState.create("Edit a stylesheet")
+    task = Task.create("Change color", "Change the color")
+    state.tasks = [task]
+
+    runner._run_task(state, task)
+
+    assert task.status is TaskStatus.BLOCKED
+    assert task.attempts == 1
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == "a { color: red; }\n"
+    assert metrics(state)["mutation_frame_fallback_failures"] == 1
+    assert metrics(state)["system_crashes"] == 0
+
+
+def test_replace_refuses_old_text_that_matches_more_than_one_current_region(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    (tmp_path / "style.css").write_text("a { color: red; }\nb { color: red; }\n", encoding="utf-8")
+    runner = AutonomousRunner(tmp_path, StateStore(tmp_path), WorkspaceTools(tmp_path), ScriptedProvider({}))
+    state = ProjectState.create("Edit a stylesheet")
+    task = Task.create("Change one color", "Change one exact color region")
+
+    with pytest.raises(MutationFrameError, match="MUTATION_PROTOCOL_AMBIGUOUS"):
+        runner._apply_bounded_mutation_payload(
+            state, task, "style.css", "replace", "color: blue;", "color: red;", True, 6_000
+        )
+
+    assert (tmp_path / "style.css").read_text(encoding="utf-8") == "a { color: red; }\nb { color: red; }\n"
+    assert not state.tool_executions
 
 
 def test_valid_oversized_hunk_is_split_before_workspace_mutations(tmp_path: Path) -> None:

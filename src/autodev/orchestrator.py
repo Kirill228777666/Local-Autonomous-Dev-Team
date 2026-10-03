@@ -12,8 +12,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
-from .agents import RoleAgents
+from .agents import MutationFrameError, RoleAgents
 from .architecture import default_contract, validate_architecture
 from .capabilities import build_project_contract, contract_conflicting_review_reasons, contract_conflicting_test_action, contract_policy_violation, find_contract_policy_violations, repair_generated_test_for_contract, reviewer_scope_violations, normalize_plan
 from .controller import FailureDecision, TaskController, TaskPhase
@@ -800,10 +801,13 @@ class AutonomousRunner:
         failures = 0
         patch_limit = 6_000
         recovery_reason = ""
+        representation = "framed"
+        fallback_requested = False
         while continuation < self.mutation_patch_budget:
             current = self.tools.read_file(path) if exists else ""
             context = self._mutation_context(current)
-            self._mark(state, "CODER", "MUTATION_PATCH_REQUEST", f"Requesting bounded patch {continuation + 1}/{self.mutation_patch_budget}: {path}", task)
+            request_id = uuid4().hex[:16]
+            self._mark(state, "CODER", "MUTATION_PATCH_REQUEST", f"Requesting bounded patch {continuation + 1}/{self.mutation_patch_budget}: {path} (request_id={request_id})", task)
             self._mark(state, "CODER", "LLM_CALL", f"Coder bounded mutation patch: {path}", task)
             try:
                 patch = self.agents.patch(
@@ -814,8 +818,10 @@ class AutonomousRunner:
                     current=context,
                     existing=exists,
                     continuation=continuation,
+                    request_id=request_id,
                     max_patch_characters=patch_limit,
                     recovery_reason=recovery_reason,
+                    representation=representation,
                 ).data
                 self._mark(state, "CODER", "LLM_RESPONSE", f"Coder mutation patch received: {path}", task)
                 operation = patch.get("operation")
@@ -824,6 +830,10 @@ class AutonomousRunner:
                 old = patch.get("old", "")
                 if operation not in {"create", "append", "replace"} or not isinstance(content, str) or not isinstance(done, bool):
                     raise ValueError("mutation patch is invalid")
+                if patch.get("frame_status") == "RECOVERED_VALID":
+                    self._mark(state, "CODER", "MUTATION_FRAME_RECOVERED", f"Safely recovered an omitted redundant boundary for {path}", task)
+                elif patch.get("frame_status") != "FALLBACK_VALID":
+                    self._mark(state, "CODER", "MUTATION_FRAME_VALID", f"Validated bounded mutation framing for {path}", task)
                 self._apply_bounded_mutation_payload(
                     state,
                     task,
@@ -834,15 +844,42 @@ class AutonomousRunner:
                     exists,
                     patch_limit,
                 )
+                if patch.get("frame_status") == "FALLBACK_VALID":
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_SUCCESS", f"Applied validated JSON fallback framing for {path}", task)
                 exists = True
                 self._mark(state, "CODER", "MUTATION_PATCH_APPLIED", f"Applied bounded {operation} patch: {path}", task)
                 failures = 0
                 continuation += 1
                 if done:
                     return
+            except MutationFrameError as error:
+                failures += 1
+                phase = "MUTATION_FRAME_AMBIGUOUS" if error.classification == "AMBIGUOUS" else "MUTATION_FRAME_MALFORMED"
+                self._mark(state, "CODER", phase, str(error), task)
+                if representation == "framed" and not fallback_requested:
+                    # Change representation immediately after framing damage;
+                    # never ask the model to repeat the same sentinel grammar.
+                    fallback_requested = True
+                    representation = "json"
+                    recovery_reason = str(error)[:300]
+                    continuation += 1
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK", f"Switching once to bounded JSON mutation for {path}", task)
+                    continue
+                if representation == "json":
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded mutation fallback failed for {path}: {error}", task)
+                    self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch protocol exhausted for {path}: {error}", task)
+                    raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
             except ProviderUnavailableError:
+                if representation == "json":
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded mutation fallback provider was unavailable for {path}", task)
                 raise
             except (ProviderError, ValueError) as error:
+                if representation == "json":
+                    self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE", f"Bounded mutation fallback could not be applied for {path}: {error}", task)
+                    self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch protocol exhausted for {path}: {error}", task)
+                    raise MutationProtocolExhaustedError("MUTATION_PROTOCOL_RECOVERY_EXHAUSTED") from error
+                if "edit target was not found" in str(error):
+                    recovery_reason = "The OLD text no longer matches the current file. Refresh the current target and choose a smaller exact replacement."
                 failures += 1
                 if failures >= 3 or continuation + 1 >= self.mutation_patch_budget:
                     self._mark(state, "CODER", "MUTATION_PROTOCOL_RECOVERY_EXHAUSTED", f"Patch protocol exhausted for {path}: {error}", task)
@@ -890,6 +927,13 @@ class AutonomousRunner:
                 raise ValueError("create patch targets an existing file")
         if operation == "replace" and (not exists or not old):
             raise ValueError("replace patch does not match file state")
+        if operation == "replace":
+            current = self.tools.read_file(path)
+            matches = current.count(old)
+            if matches == 0:
+                raise ValueError("edit target was not found")
+            if matches > 1:
+                raise MutationFrameError("AMBIGUOUS", f"replace anchor must match exactly once in current {path}; found {matches}")
         if operation not in {"create", "append", "replace"} or not content:
             raise ValueError("mutation operation/content is invalid")
         if operation == "replace" and len(old) > segment_limit:
