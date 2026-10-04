@@ -84,6 +84,17 @@ class EnvironmentRepairOutcome:
     result: CommandResult
 
 
+@dataclass(frozen=True, slots=True)
+class ReadObservation:
+    fingerprint: str
+    path: str
+    requested_range: str
+    file_hash: str
+    content: str
+    order: int
+    observed_at: str
+
+
 class AutonomousRunner:
     def __init__(
         self,
@@ -127,6 +138,8 @@ class AutonomousRunner:
             set_observer(self._record_provider_outcome)
         self._attempt_snapshots: dict[str, Path] = {}
         self._active_mutation_requests: dict[str, tuple[str, str, int, int, str]] = {}
+        self._attempt_observations: dict[str, dict[str, ReadObservation]] = {}
+        self.no_progress_recovery_budget = 2
         self.protocol_recovery_budget = 2
         self.mutation_patch_budget = 48
         self.mutation_context_characters = 6_000
@@ -518,12 +531,15 @@ class AutonomousRunner:
     ) -> CoderActionBatch:
         """Make one semantic Coder call with an explicit terminal outcome."""
         self._mark(state, "CODER", "LLM_CALL", message, task)
+        observation_context = self._observation_context(task)
+        instructions = [item for item in (coder_instruction, observation_context) if item]
+        combined_instruction = "\n\n".join(instructions)
         try:
             reply_data = self.agents.code(
                 state,
                 task,
                 relevant_files if relevant_files is not None else self._coder_file_context(task),
-                instruction=coder_instruction,
+                instruction=combined_instruction,
             ).data
             actions = reply_data.get("actions")
             task_status = reply_data.get("task_status", "ready_for_validation")
@@ -736,6 +752,151 @@ class AutonomousRunner:
                 continue
             position += 1
         return actions
+
+    @staticmethod
+    def _read_range_identity(action: dict[str, object]) -> str:
+        start = action.get("start_line")
+        end = action.get("end_line")
+        if start is None and end is None:
+            return "whole"
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise ValueError("read_file line range requires both start_line and end_line")
+        return f"lines:{start}-{end}"
+
+    def _action_batch_fingerprint(self, actions: list[object]) -> str:
+        """Include observed file versions so a reread after a change is new work."""
+        normalized: list[object] = []
+        for action in actions:
+            if isinstance(action, dict) and action.get("kind") == "read_file" and isinstance(action.get("path"), str):
+                identity = dict(action)
+                try:
+                    resolved = self.tools._path(str(action["path"]))
+                    canonical_path = resolved.relative_to(self.workspace).as_posix()
+                    file_hash, _content = self.tools.file_snapshot(canonical_path)
+                    identity["_observation_identity"] = {
+                        "path": canonical_path,
+                        "range": self._read_range_identity(action),
+                        "file_hash": file_hash,
+                    }
+                except (OSError, ValueError):
+                    identity["_observation_identity"] = "unavailable"
+                normalized.append(identity)
+            else:
+                normalized.append(action)
+        return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _current_read_observation(self, task: Task, action: dict[str, object]) -> ReadObservation | None:
+        path = action.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            resolved = self.tools._path(path)
+            canonical_path = resolved.relative_to(self.workspace).as_posix()
+            file_hash, _content = self.tools.file_snapshot(canonical_path)
+            requested_range = self._read_range_identity(action)
+        except (OSError, ValueError):
+            return None
+        fingerprint = hashlib.sha256(
+            f"read_file\0{canonical_path}\0{requested_range}\0{file_hash}".encode("utf-8")
+        ).hexdigest()
+        return self._attempt_observations.get(task.id, {}).get(fingerprint)
+
+    def _remember_read_observation(self, task: Task, action: dict[str, object], content: str) -> None:
+        path = self._string(action, "path")
+        resolved = self.tools._path(path)
+        canonical_path = resolved.relative_to(self.workspace).as_posix()
+        file_hash, _current_content = self.tools.file_snapshot(canonical_path)
+        requested_range = self._read_range_identity(action)
+        fingerprint = hashlib.sha256(
+            f"read_file\0{canonical_path}\0{requested_range}\0{file_hash}".encode("utf-8")
+        ).hexdigest()
+        observations = self._attempt_observations.setdefault(task.id, {})
+        observations[fingerprint] = ReadObservation(
+            fingerprint=fingerprint,
+            path=canonical_path,
+            requested_range=requested_range,
+            file_hash=file_hash,
+            content=content,
+            order=len(observations) + 1,
+            observed_at=utc_now(),
+        )
+
+    def _invalidate_read_observations(self, task: Task, path: str) -> None:
+        try:
+            canonical_path = self.tools._path(path).relative_to(self.workspace).as_posix()
+        except (OSError, ValueError):
+            return
+        observations = self._attempt_observations.get(task.id)
+        if observations is None:
+            return
+        for key in [key for key, item in observations.items() if item.path == canonical_path]:
+            del observations[key]
+
+    def _record_observation_hit(self, state: ProjectState, task: Task, observation: ReadObservation) -> None:
+        self._mark(
+            state,
+            "CODER",
+            "OBSERVATION_ALREADY_AVAILABLE",
+            f"{observation.path} {observation.requested_range} @ {observation.file_hash[:12]} is already current; cached content reused",
+            task,
+        )
+        self._mark(state, "CONTROLLER", "OBSERVATION_CACHE_HIT", observation.fingerprint, task)
+        self._mark(state, "CONTROLLER", "DUPLICATE_OBSERVATION_SUPPRESSED", observation.fingerprint, task)
+
+    def _is_repeated_observation_packet(self, task: Task, actions: list[object]) -> bool:
+        if not actions:
+            return False
+        for action in actions:
+            if not isinstance(action, dict) or action.get("kind") != "read_file":
+                return False
+            if self._current_read_observation(task, action) is None:
+                return False
+        return True
+
+    def _suppress_observation_packet(self, state: ProjectState, task: Task, actions: list[object]) -> None:
+        for action in actions:
+            if isinstance(action, dict):
+                observation = self._current_read_observation(task, action)
+                if observation is not None:
+                    self._record_observation_hit(state, task, observation)
+
+    def _observation_context(self, task: Task, max_characters: int = 6_000) -> str:
+        observations = sorted(
+            self._attempt_observations.get(task.id, {}).values(),
+            key=lambda item: item.order,
+        )
+        if not observations:
+            return ""
+        parts = [
+            "OBSERVATIONS ALREADY AVAILABLE IN THIS SEMANTIC ATTEMPT. These file reads succeeded and remain current. "
+            "Use their content; do not request the same path/range again unless the file changed or you need another range."
+        ]
+        remaining = max_characters - len(parts[0])
+        for item in observations:
+            if remaining <= 0:
+                break
+            header = f"\n\n[{item.order}] {item.path} {item.requested_range} sha256={item.file_hash} (observed {item.observed_at})\n"
+            body_budget = max(0, min(2_000, remaining - len(header) - 40))
+            body = item.content
+            if len(body) > body_budget:
+                body = body[:body_budget] + "\n...[excerpt truncated; reread a different range if needed]"
+            section = header + "CONTENT BEGIN\n" + body + "\nCONTENT END"
+            if len(section) > remaining:
+                section = section[:remaining]
+            parts.append(section)
+            remaining -= len(section)
+        return "\n".join(parts)
+
+    def _block_no_progress(self, task: Task, state: ProjectState, reason: str) -> None:
+        if self._attempt_workspace_changed(task):
+            self._rollback_attempt_snapshot(task, state, "no_progress_recovery")
+        else:
+            self._discard_attempt_snapshot(task)
+        task.errors.append(reason)
+        self.controller.block(task, reason)
+        state.current_task_id = None
+        state.run_history.append(f"Task blocked after bounded no-progress recovery: {task.title}; {reason}")
+        self._mark(state, "CONTROLLER", "NO_PROGRESS_RECOVERY_EXHAUSTED", reason, task)
 
     @staticmethod
     def _command_writes_workspace_files(command: list[str]) -> bool:
@@ -1328,6 +1489,14 @@ class AutonomousRunner:
             self._execute_action(state, task, action)
 
     def _run_task(self, state: ProjectState, task: Task) -> None:
+        """Run one semantic attempt with bounded task-local observations."""
+        self._attempt_observations[task.id] = {}
+        try:
+            self._run_task_attempt(state, task)
+        finally:
+            self._attempt_observations.pop(task.id, None)
+
+    def _run_task_attempt(self, state: ProjectState, task: Task) -> None:
         self._active_state = state
         accepted = {candidate.id for candidate in state.tasks if candidate.status is TaskStatus.DONE}
         unmet = [dependency for dependency in task.dependencies if dependency not in accepted]
@@ -1354,11 +1523,19 @@ class AutonomousRunner:
                 return
             actions = self._request_coder_actions(state, task, "Coder implementation request")
             continuation_batches = 0
+            no_progress_recoveries = 0
+            awaiting_no_progress_recovery = False
             completed_actions: list[object] = []
             while True:
-                fingerprint = hashlib.sha256(json.dumps(actions, sort_keys=True).encode()).hexdigest()
-                if fingerprint in task.action_fingerprints:
-                    if self._source_fingerprints() != before_files:
+                fingerprint = self._action_batch_fingerprint(actions)
+                repeated_fingerprint = fingerprint in task.action_fingerprints
+                if repeated_fingerprint:
+                    has_prior_mutation = any(
+                        isinstance(item, dict)
+                        and item.get("kind") in {"mutate_file", "write_file", "edit_file", "append_file", "delete_file", "replace_slice_if_snapshot"}
+                        for item in completed_actions
+                    )
+                    if has_prior_mutation and self._source_fingerprints() != before_files:
                         self._mark(
                             state,
                             "CONTROLLER",
@@ -1367,14 +1544,79 @@ class AutonomousRunner:
                             task,
                         )
                         break
+                if self._is_repeated_observation_packet(task, actions):
+                    self._mark(
+                        state,
+                        "CONTROLLER",
+                        "NO_PROGRESS_OBSERVATION_REPEAT",
+                        "Coder repeated only read_file observations whose path, range, and file version are already available",
+                        task,
+                    )
+                    self._mark(state, "CONTROLLER", "READ_ONLY_NO_PROGRESS_BATCH", "Repeated observation packet produced no new information", task)
+                    self._suppress_observation_packet(state, task, actions)
+                    if no_progress_recoveries >= self.no_progress_recovery_budget:
+                        reason = (
+                            "NO_PROGRESS_RECOVERY_EXHAUSTED: "
+                            f"repeated observation packets after {no_progress_recoveries} bounded recovery request(s); "
+                            f"available observations={self._observation_context(task, max_characters=2_000)}"
+                        )
+                        self._block_no_progress(task, state, reason)
+                        return
+                    no_progress_recoveries += 1
+                    awaiting_no_progress_recovery = True
+                    self._mark(
+                        state,
+                        "CONTROLLER",
+                        "NO_PROGRESS_RECOVERY_ATTEMPT",
+                        f"Requesting a different meaningful next action ({no_progress_recoveries}/{self.no_progress_recovery_budget})",
+                        task,
+                    )
+                    instruction = (
+                        "NO_PROGRESS_RECOVERY. The preceding batch repeated observations already supplied below; those files and ranges have not changed. "
+                        "Do not reread them. Use the available observations and return a different meaningful next batch: make a bounded mutation, "
+                        "run a useful diagnostic/validator, inspect genuinely new information (a different file or uncached range), or state a concrete blocker. "
+                        "Do not force a write if another genuinely new observation is needed. Return only the next bounded action batch."
+                    )
+                    continuation_batches += 1
+                    if continuation_batches > 8:
+                        self._block_no_progress(task, state, "NO_PROGRESS_RECOVERY_EXHAUSTED: continuation batch budget exhausted")
+                        return
+                    actions = self._request_coder_actions(
+                        state,
+                        task,
+                        "Coder no-progress observation recovery request",
+                        coder_instruction=instruction,
+                    )
+                    continue
+                if repeated_fingerprint:
                     self._block(task, state, "repeated identical coder action without progress", "repeated_coder_action")
                     return
-                task.action_fingerprints.append(fingerprint)
+                if not repeated_fingerprint:
+                    task.action_fingerprints.append(fingerprint)
                 batch_status = actions.task_status if isinstance(actions, CoderActionBatch) else "ready_for_validation"
+                observations_before = set(self._attempt_observations.get(task.id, {}))
+                files_before_batch = self._source_fingerprints()
+                tools_before_batch = len(state.tool_executions)
                 executed = self._execute_coder_actions(state, task, actions)
                 if executed is None:
                     return
                 completed_actions.extend(executed)
+                if awaiting_no_progress_recovery:
+                    new_observation = bool(set(self._attempt_observations.get(task.id, {})) - observations_before)
+                    file_mutation = files_before_batch != self._source_fingerprints()
+                    successful_diagnostic = any(
+                        item.status is ToolExecutionStatus.SUCCEEDED and item.kind == "run_command"
+                        for item in state.tool_executions[tools_before_batch:]
+                    )
+                    if new_observation or file_mutation or successful_diagnostic:
+                        self._mark(
+                            state,
+                            "CONTROLLER",
+                            "NO_PROGRESS_RECOVERY_SUCCESS",
+                            "No-progress recovery produced a new observation, successful diagnostic, or workspace change",
+                            task,
+                        )
+                        awaiting_no_progress_recovery = False
                 if batch_status != "continue":
                     break
                 continuation_batches += 1
@@ -1736,10 +1978,15 @@ class AutonomousRunner:
         self._mark(state, "RUNTIME", "SERVICE_REQUIRED", "HTTP validation requires a managed application process", task)
         self._reroute_server_command(state, task, ["python", candidate])
 
-    def _execute_action(self, state: ProjectState, task: Task, action: object) -> None:
+    def _execute_action(self, state: ProjectState, task: Task, action: object) -> object | None:
         if not isinstance(action, dict):
             raise ValueError("Coder action must be an object")
         kind = action.get("kind")
+        if kind == "read_file":
+            cached = self._current_read_observation(task, action)
+            if cached is not None:
+                self._record_observation_hit(state, task, cached)
+                return cached.content
         payload: list[str] | str
         if kind == "run_command":
             command = action.get("command")
@@ -1750,7 +1997,7 @@ class AutonomousRunner:
         state.tool_executions.append(execution)
         self._mark(state, "CODER", "TOOL_STARTED", f"Started tool: {kind}", task)
         try:
-            self._execute_action_once(action)
+            result = self._execute_action_once(action)
         except MutationContextMismatchError as error:
             execution.finish(ToolExecutionStatus.FAILED, str(error))
             self._mark(state, "CODER", "TOOL_FAILED", f"Tool failed: {kind}: {error}", task)
@@ -1779,8 +2026,15 @@ class AutonomousRunner:
             raise ToolPolicyError(f"TOOL_FAILED {kind}: {error}") from error
         execution.finish(ToolExecutionStatus.SUCCEEDED)
         self._mark(state, "CODER", "TOOL_SUCCEEDED", f"Completed tool: {kind}", task)
+        if kind == "read_file" and isinstance(result, str):
+            self._remember_read_observation(task, action, result)
+        elif kind in {"write_file", "edit_file", "append_file", "delete_file", "replace_slice_if_snapshot"}:
+            path = action.get("path")
+            if isinstance(path, str):
+                self._invalidate_read_observations(task, path)
+        return result
 
-    def _execute_action_once(self, action: dict[str, object]) -> None:
+    def _execute_action_once(self, action: dict[str, object]) -> object | None:
         kind = action.get("kind")
         if kind == "write_file":
             self.tools.write_file(self._string(action, "path"), self._string(action, "content"))
@@ -1811,7 +2065,16 @@ class AutonomousRunner:
         elif kind == "delete_file":
             self.tools.delete_file(self._string(action, "path"))
         elif kind == "read_file":
-            self.tools.read_file(self._string(action, "path"))
+            path = self._string(action, "path")
+            content = self.tools.read_file(path)
+            start_line = action.get("start_line")
+            end_line = action.get("end_line")
+            if start_line is not None or end_line is not None:
+                if not isinstance(start_line, int) or not isinstance(end_line, int) or start_line < 1 or end_line < start_line:
+                    raise ValueError("read_file line range must use positive inclusive start_line/end_line")
+                lines = content.splitlines(keepends=True)
+                content = "".join(lines[start_line - 1 : end_line])
+            return content
         elif kind == "run_command":
             command = action.get("command")
             if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
@@ -1821,6 +2084,7 @@ class AutonomousRunner:
                 raise CommandExecutionError(command, result)
         else:
             raise ValueError(f"unsupported action kind: {kind}")
+        return None
 
     def _resume_invariants(self, state: ProjectState) -> list[str]:
         problems: list[str] = []

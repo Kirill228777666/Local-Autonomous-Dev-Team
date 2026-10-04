@@ -560,6 +560,20 @@ class RoleAgents:
                     raise ValueError(f"action field {field} must be non-empty text")
                 if isinstance(value, str) and field in {"content", "old", "new"}:
                     textual_payload += len(value)
+            if action["kind"] == "read_file":
+                start_line = action.get("start_line")
+                end_line = action.get("end_line")
+                if (start_line is None) != (end_line is None):
+                    raise ValueError("read_file range requires both start_line and end_line")
+                if start_line is not None and (
+                    not isinstance(start_line, int)
+                    or isinstance(start_line, bool)
+                    or not isinstance(end_line, int)
+                    or isinstance(end_line, bool)
+                    or start_line < 1
+                    or end_line < start_line
+                ):
+                    raise ValueError("read_file line range must use positive inclusive start_line/end_line")
         if textual_payload > 12_000:
             raise ValueError("action batch textual payload exceeds maximum")
 
