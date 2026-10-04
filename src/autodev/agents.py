@@ -109,6 +109,7 @@ class RoleAgents:
         representation: str = "framed",
         start_offset: int = 0,
         end_offset: int | None = None,
+        read_context: str = "",
     ) -> AgentReply:
         """Ask for one independently bounded mutation, never a task-sized body."""
         mode = "existing" if existing else "new"
@@ -131,20 +132,23 @@ class RoleAgents:
         if representation == "raw_replacement":
             selected_end = end_offset if end_offset is not None else start_offset + len(current)
             prompt = (
-                "Return ONLY the replacement text for the exact controller-selected region below. "
-                "The entire response body is source content: do not use JSON, markdown fences, prose, "
-                "sentinels, or repeat metadata. The controller owns the target and will reject stale "
-                "file/context versions. Keep the replacement within the byte limit.\n"
+                "This is the current file. Return ONLY the replacement text for the controller-selected WRITE SCOPE. "
+                "Do not repeat read-only context or rewrite the whole file. The entire response body is source "
+                "content: no JSON, markdown fences, prose, sentinels, or metadata. The controller owns the "
+                "target and rejects stale file/context versions. Keep the complete response within the byte limit.\n"
                 f"Controller-selected path: {path}\nController mutation request id: {marker}\n"
                 f"Controller expected file SHA-256: {expected_file_hash}\n"
                 f"Controller-selected range: [{start_offset}, {selected_end})\n"
                 f"Mutation intent: {intent}\nMaximum replacement payload: {max_patch_characters} UTF-8 bytes\n"
-                "CURRENT EXACT REGION (replace all of this region with your response):\n"
-                f"{current}"
+                "READ-ONLY SURROUNDING CONTEXT (for understanding only; never return it):\n"
+                f"{read_context}\n"
+                "WRITE SCOPE (replace only this exact region):\n"
+                f"{current}\nEND WRITE SCOPE {marker}"
             )
             raw_response = True
             raw_mutation = True
             system_prompt = "Return only literal replacement source text. No JSON or explanatory text."
+            token_budget = min(token_budget, max(128, max_patch_characters // 3))
         elif representation == "json":
             prompt = (
                 "The previous text frame was ambiguous. Return one bounded JSON mutation object and nothing else. "
@@ -199,6 +203,14 @@ class RoleAgents:
             raise MutationFrameError("MALFORMED", "mutation response did not contain raw patch text")
         if raw_mutation:
             payload_bytes = len(raw.encode("utf-8"))
+            if reply.data.get("response_complete") is not True or reply.data.get("done_reason") == "length":
+                raise MutationFrameError(
+                    "OVERSIZED_RAW_MUTATION",
+                    "raw replacement generation did not finish within its output budget",
+                    raw_response=raw,
+                    provider_attempt=int(reply.data.get("provider_attempt", 1)),
+                    response_bytes=int(reply.data.get("response_bytes", payload_bytes)),
+                )
             if payload_bytes > max_patch_characters:
                 raise MutationFrameError(
                     "OVERSIZED_RAW_MUTATION",

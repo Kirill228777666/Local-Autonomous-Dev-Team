@@ -130,6 +130,8 @@ class AutonomousRunner:
         self.protocol_recovery_budget = 2
         self.mutation_patch_budget = 48
         self.mutation_context_characters = 6_000
+        self.mutation_payload_limit = 6_000
+        self.mutation_decomposition_budget = 8
         # Scripted and third-party providers without a health endpoint return
         # immediately; a real Ollama-backed run can wait through a short restart.
         self.provider_wait_seconds = (
@@ -811,9 +813,12 @@ class AutonomousRunner:
         context_recoveries = 0
         pending_context_recoveries = 0
         context_recovery_budget = 2
-        patch_limit = 6_000
+        patch_limit = self.mutation_payload_limit
         raw_cursor = 0
         raw_chunk_mode = False
+        raw_scope_bytes = max(128, patch_limit // 2)
+        decomposition_attempts = 0
+        decomposition_pending = False
         recovery_reason = ""
         representation = "framed"
         fallback_requested = False
@@ -830,7 +835,7 @@ class AutonomousRunner:
             if representation == "raw_replacement" and (raw_chunk_mode or len(full_current.encode("utf-8")) > patch_limit):
                 raw_chunk_mode = True
                 region_start = min(raw_cursor, len(full_current))
-                region_end = self._bounded_mutation_region_end(full_current, region_start, patch_limit // 2)
+                region_end = self._bounded_mutation_region_end(full_current, region_start, raw_scope_bytes)
                 if region_end <= region_start:
                     region_end = min(len(full_current), region_start + patch_limit // 2)
                 current = full_current[region_start:region_end]
@@ -838,6 +843,11 @@ class AutonomousRunner:
                 region_start, region_end = 0, len(full_current)
                 current = full_current
             context = current if representation == "raw_replacement" else self._mutation_context(full_current)
+            read_context = (
+                self._mutation_read_context(full_current, region_start, region_end)
+                if representation == "raw_replacement" and raw_chunk_mode
+                else ""
+            )
             request_id = uuid4().hex[:16]
             self._mark(state, "CODER", "MUTATION_PATCH_REQUEST", f"Requesting bounded patch {continuation + 1}/{self.mutation_patch_budget}: {path} (request_id={request_id}, file_sha256={expected_file_hash})", task)
             if representation == "raw_replacement":
@@ -861,6 +871,7 @@ class AutonomousRunner:
                     representation=representation,
                     start_offset=region_start,
                     end_offset=region_end,
+                    read_context=read_context,
                 ).data
                 self._mark(state, "CODER", "LLM_RESPONSE", f"Coder mutation patch received: {path}", task)
                 if representation == "raw_replacement":
@@ -903,6 +914,18 @@ class AutonomousRunner:
                     done = True
                     self._mark(state, "CODER", "MUTATION_RAW_REPLACEMENT_SUCCESS", f"Applied raw bounded replacement for {path}; request_id={request_id}", task)
                     self._mark(state, "CODER", "MUTATION_PATCH_APPLIED", f"Applied bounded raw replacement: {path}", task)
+                    if raw_chunk_mode:
+                        updated_hash = self.tools.file_snapshot_exact(path)[0]
+                        self._mark(
+                            state, "CODER", "MUTATION_SUBREGION_APPLIED",
+                            f"Applied controller-selected subregion {region_start}:{region_end} in {path}; request_id={request_id}; new_hash={updated_hash}", task,
+                        )
+                        if decomposition_pending:
+                            self._mark(
+                                state, "CODER", "MUTATION_DECOMPOSITION_SUCCESS",
+                                f"Smaller mutation scope applied for {path}; level={decomposition_attempts}; request_id={request_id}", task,
+                            )
+                            decomposition_pending = False
                     for _ in range(pending_context_recoveries):
                         self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_SUCCESS", f"Applied refreshed mutation context for {path}", task)
                     pending_context_recoveries = 0
@@ -955,6 +978,52 @@ class AutonomousRunner:
                     return
             except MutationFrameError as error:
                 self._active_mutation_requests.pop(request_id, None)
+                if error.classification == "OVERSIZED_RAW_MUTATION" and representation == "raw_replacement":
+                    read_context_size = len(read_context.encode("utf-8"))
+                    write_scope_size = len(current.encode("utf-8"))
+                    was_chunk_mode = raw_chunk_mode
+                    proposed_scope_bytes = (raw_scope_bytes if was_chunk_mode else write_scope_size) // 2
+                    next_scope_bytes = max(128, proposed_scope_bytes)
+                    outcome = "RESPLIT"
+                    if decomposition_attempts >= self.mutation_decomposition_budget or (was_chunk_mode and raw_scope_bytes <= 128):
+                        outcome = "DECOMPOSITION_EXHAUSTED"
+                    self._mark(
+                        state, "CODER", "MUTATION_RAW_REPLACEMENT_OVERSIZED",
+                        f"Discarded oversized raw response for {path}; request_id={request_id}; response_bytes={error.response_bytes}; limit={patch_limit}; read_context_bytes={read_context_size}; write_scope_bytes={write_scope_size}; level={decomposition_attempts}", task,
+                    )
+                    self._record_mutation_diagnostic(
+                        state, request_id=request_id, protocol_mode=representation, path=path,
+                        expected_hash=expected_file_hash, response=error.raw_response,
+                        failure_type=error.classification, provider_attempt=error.provider_attempt,
+                        response_bytes=error.response_bytes, read_context_size=read_context_size,
+                        write_scope_size=write_scope_size, payload_limit=patch_limit,
+                        decomposition_level=decomposition_attempts, next_scope_size=next_scope_bytes,
+                        outcome=outcome,
+                    )
+                    if outcome == "DECOMPOSITION_EXHAUSTED":
+                        self._mark(
+                            state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE",
+                            f"Adaptive raw mutation could not fit minimum safe scope for {path}; request_id={request_id}", task,
+                        )
+                        self._mark(
+                            state, "CODER", "MUTATION_DECOMPOSITION_EXHAUSTED",
+                            f"Mutation decomposition budget exhausted for {path}; minimum_scope_bytes={raw_scope_bytes}", task,
+                        )
+                        raise MutationProtocolExhaustedError("MUTATION_DECOMPOSITION_EXHAUSTED") from error
+                    decomposition_attempts += 1
+                    raw_scope_bytes = next_scope_bytes
+                    raw_chunk_mode = True
+                    raw_cursor = region_start if was_chunk_mode else 0
+                    # An oversized whole-file response starts from the first
+                    # subregion. An oversized subregion is retried from its
+                    # exact beginning at the smaller controller-owned width.
+                    decomposition_pending = True
+                    self._mark(
+                        state, "CODER", "MUTATION_DECOMPOSITION_ATTEMPT",
+                        f"Shrinking write scope for {path}; level={decomposition_attempts}; previous_scope_bytes={write_scope_size}; next_scope_bytes={raw_scope_bytes}; cursor={raw_cursor}", task,
+                    )
+                    continuation += 1
+                    continue
                 failures += 1
                 self._record_mutation_diagnostic(
                     state, request_id=request_id, protocol_mode=representation, path=path,
@@ -1090,12 +1159,20 @@ class AutonomousRunner:
             return len(content)
         byte_count = 0
         last_line_end = start
+        last_structural_end = start
+        line_start = start
         for index in range(start, len(content)):
             byte_count += len(content[index].encode("utf-8"))
             if byte_count > max_bytes:
                 break
             if content[index] == "\n":
                 last_line_end = index + 1
+                line = content[line_start:index].strip()
+                if not line or line.endswith(("}", ");", "]", "*/")):
+                    last_structural_end = index + 1
+                line_start = index + 1
+        if last_structural_end > start:
+            return last_structural_end
         if last_line_end > start:
             return last_line_end
         byte_count = 0
@@ -1107,6 +1184,15 @@ class AutonomousRunner:
             byte_count += size
             end = index + 1
         return end
+
+    @staticmethod
+    def _mutation_read_context(content: str, start: int, end: int, radius: int = 1_200) -> str:
+        """Provide adjacent read-only source around the exact writable slice."""
+        before_start = max(0, start - radius)
+        after_end = min(len(content), end + radius)
+        before = content[before_start:start]
+        after = content[end:after_end]
+        return f"[before write range]\n{before}\n[after write range]\n{after}"
 
     def _mutation_context(self, current: str) -> str:
         if len(current) <= self.mutation_context_characters:
@@ -1125,6 +1211,12 @@ class AutonomousRunner:
         failure_type: str,
         provider_attempt: int,
         response_bytes: int | None = None,
+        read_context_size: int | None = None,
+        write_scope_size: int | None = None,
+        payload_limit: int | None = None,
+        decomposition_level: int | None = None,
+        next_scope_size: int | None = None,
+        outcome: str | None = None,
     ) -> None:
         """Persist bounded, local-only evidence for an unusable mutation reply."""
         response_payload_bytes = response.encode("utf-8", errors="replace")
@@ -1144,6 +1236,17 @@ class AutonomousRunner:
             "raw_response": capped,
             "raw_response_truncated": len(response_payload_bytes) > 16_000,
         })
+        diagnostic = state.mutation_diagnostics[-1]
+        for key, value in (
+            ("read_context_size", read_context_size),
+            ("write_scope_size", write_scope_size),
+            ("payload_limit", payload_limit),
+            ("decomposition_level", decomposition_level),
+            ("next_scope_size", next_scope_size),
+            ("outcome", outcome),
+        ):
+            if value is not None:
+                diagnostic[key] = value
         state.mutation_diagnostics = state.mutation_diagnostics[-100:]
         self.store.save(state)
 

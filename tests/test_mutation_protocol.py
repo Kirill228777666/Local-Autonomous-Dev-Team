@@ -410,7 +410,7 @@ def test_raw_fallback_recovers_context_mismatch_in_same_attempt(tmp_path: Path) 
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".card { color: blue; }\n"
     assert len(provider.requests) == 2
     assert "color: red;" in provider.requests[1].prompt
-    assert "CURRENT EXACT REGION" in provider.requests[1].prompt
+    assert "WRITE SCOPE (replace only this exact region)" in provider.requests[1].prompt
     assert re.search(r"^Controller expected file SHA-256: [0-9a-f]{64}$", provider.requests[1].prompt, re.MULTILINE)
     assert any(event.phase == "MUTATION_TARGET_MISMATCH" for event in state.events)
     assert any(event.phase == "MUTATION_CONTEXT_RECOVERY_SUCCESS" for event in state.events)
@@ -479,7 +479,9 @@ def test_context_recovery_exhaustion_is_protocol_only_without_unmutated_rollback
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == original
     assert not any(event.phase == "ATTEMPT_ROLLBACK" for event in state.events)
     assert not any(event.agent == "ARCHITECT" for event in state.events)
-    assert metrics(state)["raw_mutation_requests"] == 1
+    assert metrics(state)["raw_mutation_requests"] == 2
+    assert metrics(state)["raw_mutation_oversized"] == 1
+    assert metrics(state)["mutation_decomposition_attempts"] == 1
     assert metrics(state)["attempt_rollbacks_total"] == 0
     assert metrics(state)["semantic_retry_count"] == 0
 
