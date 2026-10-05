@@ -109,6 +109,28 @@ def test_ollama_raw_mutation_transport_returns_literal_content_without_structure
     assert reply.data["response_complete"] is True
 
 
+def test_ollama_raw_mutation_preserves_length_finish_reason_for_staged_continuation() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def transport(_url: str, body: bytes, _timeout: float) -> bytes:
+        payloads.append(json.loads(body))
+        return json.dumps({
+            "message": {"role": "assistant", "content": "partial source tail"},
+            "done": True,
+            "done_reason": "length",
+            "eval_count": 128,
+        }).encode("utf-8")
+
+    reply = OllamaProvider(model="qwen3.6:35b-coding", retries=0, transport=transport).complete(
+        AgentRequest(role="CODER", prompt="continue this mutation body", raw_response=True, raw_mutation=True, max_output_tokens=128)
+    )
+
+    assert payloads[0]["options"]["num_predict"] == 128
+    assert reply.data["raw_text"] == "partial source tail"
+    assert reply.data["response_complete"] is True
+    assert reply.data["done_reason"] == "length"
+
+
 def test_ollama_provider_rejects_response_over_declared_character_budget() -> None:
     huge = json.dumps({"actions": [{"kind": "mutate_file", "path": "a.py", "intent": "x" * 100}]})
     raw = json.dumps({"message": {"content": huge}}).encode("utf-8")

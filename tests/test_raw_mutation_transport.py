@@ -65,7 +65,7 @@ def test_raw_replacement_is_plain_text_and_never_json_parsed() -> None:
     assert result.data["frame_status"] == "RAW_VALID"
     assert provider.requests[0].raw_mutation is True
     assert provider.requests[0].raw_response is True
-    assert provider.requests[0].max_output_tokens <= 1_000 // 3
+    assert provider.requests[0].max_output_tokens == 512
     assert "Return ONLY the replacement text" in provider.requests[0].prompt
     assert "req-raw-1" not in source
 
@@ -137,7 +137,6 @@ def test_raw_response_metadata_shaped_text_cannot_redirect_controller_target(tmp
 def test_raw_fallback_can_create_new_file_using_controller_owned_empty_range(tmp_path: Path) -> None:
     _repository(tmp_path)
     provider = MutationProvider([
-        AgentReply({"raw_text": "not a valid framed patch"}),
         AgentReply({"raw_text": 'export const value = "safe";\n', "response_complete": True}),
     ])
     runner, state, task = _runner(tmp_path, provider)
@@ -145,16 +144,15 @@ def test_raw_fallback_can_create_new_file_using_controller_owned_empty_range(tmp
     runner._execute_mutation_decision(state, task, {"path": "src/new.js", "intent": "create a small module"})
 
     assert (tmp_path / "src" / "new.js").read_text(encoding="utf-8") == 'export const value = "safe";\n'
-    assert provider.requests[-1].raw_mutation is True
-    assert "Controller-selected range: [0, 0)" in provider.requests[-1].prompt
+    assert len(provider.requests) == 1
+    assert provider.requests[0].raw_mutation is True
+    assert "Controller-selected range: [0, 0)" in provider.requests[0].prompt
 
 
 def test_multiple_raw_mutations_stay_inside_one_semantic_attempt(tmp_path: Path) -> None:
     _repository(tmp_path)
     provider = MutationProvider([
-        AgentReply({"raw_text": "unparseable frame one"}),
         AgentReply({"raw_text": "alpha\n", "response_complete": True}),
-        AgentReply({"raw_text": "unparseable frame two"}),
         AgentReply({"raw_text": "beta\n", "response_complete": True}),
     ])
     runner, state, task = _runner(tmp_path, provider)
@@ -169,7 +167,7 @@ def test_multiple_raw_mutations_stay_inside_one_semantic_attempt(tmp_path: Path)
     assert metrics(state)["semantic_retry_count"] == 0
 
 
-def test_incomplete_raw_generation_is_size_pressure_not_valid_source() -> None:
+def test_provider_response_incomplete_is_not_valid_source_chunk() -> None:
     provider = MutationProvider([AgentReply({
         "raw_text": "partial source",
         "response_complete": False,
@@ -188,7 +186,7 @@ def test_incomplete_raw_generation_is_size_pressure_not_valid_source() -> None:
             max_patch_characters=1_000, representation="raw_replacement", start_offset=0, end_offset=8,
         )
 
-    assert error.value.classification == "OVERSIZED_RAW_MUTATION"
+    assert error.value.classification == "PROVIDER_RESPONSE_INCOMPLETE"
     assert error.value.response_bytes == 14
 
 
@@ -245,9 +243,8 @@ def test_oversized_raw_replacement_is_rejected_without_partial_write_or_persiste
         AgentReply({"raw_text": oversized, "response_complete": True, "provider_attempt": 2}),
     ])
     runner, state, task = _runner(tmp_path, provider)
-
-    runner.mutation_decomposition_budget = 0
-    with pytest.raises(Exception, match="MUTATION_DECOMPOSITION_EXHAUSTED"):
+    runner.mutation_transport_chunk_bytes = 1_000
+    with pytest.raises(Exception, match="MUTATION_TRANSPORT_CHUNK_TOO_LARGE"):
         runner._execute_mutation_decision(state, task, {"path": "style.css", "intent": "replace the stylesheet"})
 
     assert css.read_text(encoding="utf-8") == original
@@ -278,7 +275,7 @@ def test_raw_fallback_preserves_destructive_write_guard_for_substantial_file(tmp
     assert state.mutation_diagnostics[-1]["failure_type"] == "UNSAFE_DESTRUCTIVE_REPLACEMENT"
 
 
-def test_raw_fallback_splits_large_existing_file_into_controller_selected_regions(tmp_path: Path) -> None:
+def test_large_existing_file_replacement_is_staged_then_applied_atomically(tmp_path: Path) -> None:
     _repository(tmp_path)
     css = tmp_path / "style.css"
     original = "".join(f".item-{index} {{ color: red; }}\n" for index in range(500))
@@ -288,13 +285,19 @@ def test_raw_fallback_splits_large_existing_file_into_controller_selected_region
         def __init__(self) -> None:
             super().__init__({})
             self.requests: list[AgentRequest] = []
+            self.offset = 0
+            self.target_observations: list[str] = []
 
         def complete(self, request: AgentRequest) -> AgentReply:
             self.requests.append(request)
             if not request.raw_mutation:
                 return AgentReply({"raw_text": "not a valid framed mutation"})
+            self.target_observations.append(css.read_text(encoding="utf-8"))
             region = request.prompt.split("WRITE SCOPE (replace only this exact region):\n", 1)[1].split("\nEND WRITE SCOPE", 1)[0]
-            return AgentReply({"raw_text": region, "response_complete": True})
+            chunk = region[self.offset:self.offset + 5_000]
+            self.offset += len(chunk)
+            reason = "stop" if self.offset >= len(region) else "length"
+            return AgentReply({"raw_text": chunk, "response_complete": True, "done_reason": reason})
 
     provider = RegionEchoProvider()
     runner, state, task = _runner(tmp_path, provider)
@@ -302,47 +305,51 @@ def test_raw_fallback_splits_large_existing_file_into_controller_selected_region
     runner._execute_mutation_decision(state, task, {"path": "style.css", "intent": "preserve all selectors and normalize the stylesheet"})
 
     assert css.read_text(encoding="utf-8") == original
-    assert sum(request.raw_mutation for request in provider.requests) >= 3
-    assert all(len(request.prompt.split("WRITE SCOPE (replace only this exact region):\n", 1)[1].split("\nEND WRITE SCOPE", 1)[0].encode("utf-8")) <= 3_000 for request in provider.requests if request.raw_mutation)
+    expected_chunks = (len(original.encode("utf-8")) + 4_999) // 5_000
+    assert sum(request.raw_mutation for request in provider.requests) == expected_chunks
+    assert all(observed == original for observed in provider.target_observations)
+    assert metrics(state)["mutation_stream_chunks"] == expected_chunks
+    assert len([item for item in state.tool_executions if item.kind == "replace_slice_if_snapshot"]) == 1
     assert task.attempts == 1
     assert metrics(state)["semantic_retry_count"] == 0
 
 
-def test_oversized_raw_response_adaptively_splits_scope_and_finishes_same_attempt(tmp_path: Path) -> None:
+def test_output_limited_raw_response_continues_same_staged_mutation(tmp_path: Path) -> None:
     _repository(tmp_path)
-    source = "".join(f"const item{index:03d} = 'old';\n" for index in range(120))
+    source = "const value = 'old';\n"
     target = tmp_path / "app.js"
     target.write_text(source, encoding="utf-8")
+    replacement = "".join(f"const item{index:03d} = 'new';\n" for index in range(120))
+    chunks = [replacement[index:index + 900] for index in range(0, len(replacement), 900)]
 
     class AdaptiveProvider(ScriptedProvider):
         def __init__(self) -> None:
             super().__init__({})
             self.requests: list[AgentRequest] = []
-            self.first_raw = True
+            self.chunk_index = 0
 
         def complete(self, request: AgentRequest) -> AgentReply:
             self.requests.append(request)
             if not request.raw_mutation:
                 return AgentReply({"raw_text": "not a valid framed mutation"})
-            if self.first_raw:
-                self.first_raw = False
-                return AgentReply({"raw_text": "x" * 1_201, "response_complete": True})
-            region = request.prompt.split("WRITE SCOPE (replace only this exact region):\n", 1)[1].split("\nEND WRITE SCOPE", 1)[0]
-            return AgentReply({"raw_text": region.replace("'old'", "'new'"), "response_complete": True})
+            chunk = chunks[self.chunk_index]
+            reason = "stop" if self.chunk_index == len(chunks) - 1 else "length"
+            self.chunk_index += 1
+            return AgentReply({"raw_text": chunk, "response_complete": True, "done_reason": reason})
 
     provider = AdaptiveProvider()
     runner, state, task = _runner(tmp_path, provider)
     runner.mutation_payload_limit = 1_000
+    runner.mutation_transport_chunk_bytes = 1_000
 
     runner._execute_mutation_decision(state, task, {"path": "app.js", "intent": "change every item value from old to new"})
 
-    assert target.read_text(encoding="utf-8") == source.replace("'old'", "'new'")
+    assert target.read_text(encoding="utf-8") == replacement
     assert task.attempts == 1
     assert metrics(state)["semantic_retry_count"] == 0
-    assert metrics(state)["raw_mutation_oversized"] == 1
-    assert metrics(state)["mutation_decomposition_attempts"] >= 1
-    assert metrics(state)["mutation_decomposition_successes"] >= 1
-    assert metrics(state)["mutation_subregions_applied"] >= 2
+    assert metrics(state)["mutation_stream_chunks"] == len(chunks)
+    assert metrics(state)["mutation_stream_continuations"] == len(chunks) - 1
+    assert metrics(state)["mutation_stream_completions"] == 1
     assert not any(event.agent == "ARCHITECT" for event in state.events)
     assert not any(event.phase == "ATTEMPT_ROLLBACK" for event in state.events)
     assert len(provider.requests) == metrics(state)["llm_requests_attempted"]
@@ -350,20 +357,13 @@ def test_oversized_raw_response_adaptively_splits_scope_and_finishes_same_attemp
         request.prompt.split("WRITE SCOPE (replace only this exact region):\n", 1)[1].split("\nEND WRITE SCOPE", 1)[0]
         for request in provider.requests if request.raw_mutation and "WRITE SCOPE (replace only this exact region):\n" in request.prompt
     ]
-    assert len(scopes) >= 2
-    assert all(len(scope.encode("utf-8")) < 1_000 for scope in scopes)
+    assert len(chunks) > 1
     raw_prompts = [request.prompt for request in provider.requests if request.raw_mutation]
-    hashes = [re.search(r"Controller expected file SHA-256: ([0-9a-f]{64})", prompt).group(1) for prompt in raw_prompts]
-    assert len(set(hashes[1:])) > 1
-    read_context = raw_prompts[1].split("READ-ONLY SURROUNDING CONTEXT (for understanding only; never return it):\n", 1)[1].split("\nWRITE SCOPE", 1)[0]
-    first_scope = raw_prompts[1].split("WRITE SCOPE (replace only this exact region):\n", 1)[1].split("\nEND WRITE SCOPE", 1)[0]
-    assert len(read_context) > len(first_scope)
-    oversize_diagnostic = next(item for item in state.mutation_diagnostics if item["failure_type"] == "OVERSIZED_RAW_MUTATION")
-    assert oversize_diagnostic["write_scope_size"] > oversize_diagnostic["next_scope_size"]
-    assert oversize_diagnostic["payload_limit"] == 1_000
+    assert all("TRANSPORT CHUNK" in prompt for prompt in raw_prompts[1:])
+    assert all(len(chunk.encode("utf-8")) <= 1_000 for chunk in chunks)
 
 
-def test_oversized_subregion_is_recursively_shrunk_with_a_fresh_hash(tmp_path: Path) -> None:
+def test_semantic_scope_is_not_shrunk_to_match_transport_payload_limit(tmp_path: Path) -> None:
     _repository(tmp_path)
     source = "".join(f"function item{index:03d}() {{ return 'old'; }}\n" for index in range(80))
     target = tmp_path / "app.js"
@@ -380,26 +380,24 @@ def test_oversized_subregion_is_recursively_shrunk_with_a_fresh_hash(tmp_path: P
             if not request.raw_mutation:
                 return AgentReply({"raw_text": "bad frame"})
             self.raw_count += 1
-            if self.raw_count in {1, 2}:
-                return AgentReply({"raw_text": "x" * 1_201, "response_complete": True})
             region = request.prompt.split("WRITE SCOPE (replace only this exact region):\n", 1)[1].split("\nEND WRITE SCOPE", 1)[0]
-            return AgentReply({"raw_text": region.replace("'old'", "'new'"), "response_complete": True})
+            return AgentReply({"raw_text": region.replace("'old'", "'new'"), "response_complete": True, "done_reason": "stop"})
 
     provider = RecursiveProvider()
     runner, state, task = _runner(tmp_path, provider)
     runner.mutation_payload_limit = 1_000
+    runner.mutation_transport_chunk_bytes = 6_000
 
     runner._execute_mutation_decision(state, task, {"path": "app.js", "intent": "change each return value to new"})
 
     assert target.read_text(encoding="utf-8") == source.replace("'old'", "'new'")
-    assert metrics(state)["raw_mutation_oversized"] == 2
-    assert metrics(state)["mutation_decomposition_attempts"] == 2
-    assert metrics(state)["mutation_decomposition_successes"] >= 1
+    assert metrics(state)["raw_mutation_oversized"] == 0
+    assert metrics(state)["mutation_decomposition_attempts"] == 0
     assert task.attempts == 1
     assert metrics(state)["semantic_retry_count"] == 0
 
 
-def test_adaptive_decomposition_exhaustion_is_protocol_only_and_bounded(tmp_path: Path) -> None:
+def test_transport_chunk_overflow_fails_closed_without_semantic_decomposition(tmp_path: Path) -> None:
     _repository(tmp_path)
     source = "".join(f"const item{index:03d} = 'old';\n" for index in range(120))
     target = tmp_path / "app.js"
@@ -419,52 +417,45 @@ def test_adaptive_decomposition_exhaustion_is_protocol_only_and_bounded(tmp_path
     provider = AlwaysOversizedProvider()
     runner, state, task = _runner(tmp_path, provider)
     runner.mutation_payload_limit = 1_000
-    runner.mutation_decomposition_budget = 2
+    runner.mutation_transport_chunk_bytes = 1_000
 
-    with pytest.raises(Exception, match="MUTATION_DECOMPOSITION_EXHAUSTED"):
+    with pytest.raises(Exception, match="MUTATION_TRANSPORT_CHUNK_TOO_LARGE"):
         runner._execute_mutation_decision(state, task, {"path": "app.js", "intent": "change every item value"})
 
     assert target.read_text(encoding="utf-8") == source
     assert task.attempts == 1
     assert metrics(state)["semantic_retry_count"] == 0
-    assert metrics(state)["mutation_decomposition_exhaustions"] == 1
+    assert metrics(state)["mutation_decomposition_exhaustions"] == 0
     assert not any(event.agent == "ARCHITECT" for event in state.events)
     assert not any(event.phase == "ATTEMPT_ROLLBACK" for event in state.events)
 
 
-def test_attempt_rollback_restores_all_successful_adaptive_subregions(tmp_path: Path) -> None:
+def test_attempt_rollback_restores_completed_staged_replacement(tmp_path: Path) -> None:
     _repository(tmp_path)
-    original = "".join(f".item-{index} {{ color: red; }}\n" for index in range(120))
+    original = ".card { color: red; }\n"
     target = tmp_path / "style.css"
     target.write_text(original, encoding="utf-8")
 
     class FailAfterTwoSubregions(ScriptedProvider):
         def __init__(self) -> None:
             super().__init__({})
-            self.raw_count = 0
 
         def complete(self, request: AgentRequest) -> AgentReply:
             if not request.raw_mutation:
                 return AgentReply({"raw_text": "bad frame"})
-            self.raw_count += 1
-            if self.raw_count <= 2:
-                region = request.prompt.split("WRITE SCOPE (replace only this exact region):\n", 1)[1].split("\nEND WRITE SCOPE", 1)[0]
-                return AgentReply({"raw_text": region.replace("red", "blue"), "response_complete": True})
-            return AgentReply({"raw_text": "x" * 1_201, "response_complete": True})
+            return AgentReply({"raw_text": ".card { color: blue; }\n", "response_complete": True, "done_reason": "stop"})
 
     provider = FailAfterTwoSubregions()
     runner, state, task = _runner(tmp_path, provider)
     runner.mutation_payload_limit = 1_000
-    runner.mutation_decomposition_budget = 0
     runner._begin_attempt_snapshot(task)
 
-    with pytest.raises(Exception, match="MUTATION_DECOMPOSITION_EXHAUSTED"):
-        runner._execute_mutation_decision(state, task, {"path": "style.css", "intent": "change color to blue"})
-    assert target.read_text(encoding="utf-8") != original
+    runner._execute_mutation_decision(state, task, {"path": "style.css", "intent": "change color to blue"})
+    assert target.read_text(encoding="utf-8") == ".card { color: blue; }\n"
     runner._rollback_attempt_snapshot(task, state, "protocol_failure")
 
     assert target.read_text(encoding="utf-8") == original
-    assert metrics(state)["mutation_subregions_applied"] == 2
+    assert metrics(state)["mutation_stream_completions"] == 1
 
 
 def test_workspace_raw_slice_replace_is_compare_and_swap_atomic(tmp_path: Path) -> None:

@@ -38,7 +38,12 @@ class RecordingProvider(ScriptedProvider):
         reply = super().complete(request)
         if request.raw_mutation:
             raw = reply.data.get("content", reply.data.get("raw_text", ""))
-            reply = AgentReply({"raw_text": raw, "response_complete": True, "provider_attempt": 1})
+            reply = AgentReply({
+                "raw_text": raw,
+                "response_complete": True,
+                "done_reason": "stop" if reply.data.get("done", True) else "length",
+                "provider_attempt": 1,
+            })
         elif request.raw_response and "operation" in reply.data:
             operation = reply.data.get("operation")
             done = str(reply.data.get("done", False)).lower()
@@ -84,14 +89,14 @@ def _patch(content: str, *, operation: str = "append", done: bool = False, old: 
 
 def test_large_multi_file_source_is_created_in_bounded_patch_substeps_without_large_decision_payload(tmp_path: Path) -> None:
     _repository(tmp_path)
-    section = "x" * 2_000
+    sections = [f"SECTION-{index:02d}:" + chr(65 + index % 26) * (2_000 - 11) for index in range(54)]
     provider = RecordingProvider({
         "CODER": [
             AgentReply({"actions": [
                 {"kind": "mutate_file", "path": "large-a.txt", "intent": "create at least 54000 characters of generated source"},
                 {"kind": "mutate_file", "path": "large-b.txt", "intent": "create at least 54000 characters of generated source"},
             ], "task_status": "ready_for_validation"}),
-            *[_patch(section, operation="create" if index in {0, 27} else "append", done=index in {26, 53}) for index in range(54)],
+                *[_patch(sections[index], operation="create" if index in {0, 27} else "append", done=index in {26, 53}) for index in range(54)],
         ],
         "TESTER": [AgentReply({"command": ["py", "-3", "-c", "from pathlib import Path; assert Path('large-a.txt').stat().st_size + Path('large-b.txt').stat().st_size == 108000"]})],
         "REVIEWER": [AgentReply({"approved": True, "reasons": []})],
@@ -102,7 +107,6 @@ def test_large_multi_file_source_is_created_in_bounded_patch_substeps_without_la
     state.tasks = [task]
 
     runner._run_task(state, task)
-
     assert task.status is TaskStatus.DONE
     assert task.attempts == 1
     assert (tmp_path / "large-a.txt").stat().st_size + (tmp_path / "large-b.txt").stat().st_size == 108_000
@@ -115,7 +119,8 @@ def test_large_multi_file_source_is_created_in_bounded_patch_substeps_without_la
     assert not any(event.phase == "CODER_PROTOCOL_RECOVERY_EXHAUSTED" for event in state.events)
     observed = metrics(state)
     assert observed["coder_mutation_patch_requests"] == 54
-    assert observed["coder_mutation_patches_applied"] == 54
+    assert observed["coder_mutation_patches_applied"] == 2
+    assert observed["mutation_stream_chunks"] == 54
     assert observed["llm_requests_attempted"] == len(provider.requests)
 
 
@@ -385,7 +390,7 @@ def test_invalid_fallback_terminates_as_task_protocol_failure_without_crash(tmp_
     assert task.status is TaskStatus.BLOCKED
     assert task.attempts == 1
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == "a { color: red; }\n"
-    assert metrics(state)["mutation_frame_fallback_failures"] == 1
+    assert metrics(state)["mutation_stream_failures"] == 1
     assert metrics(state)["system_crashes"] == 0
 
 
@@ -479,9 +484,9 @@ def test_context_recovery_exhaustion_is_protocol_only_without_unmutated_rollback
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == original
     assert not any(event.phase == "ATTEMPT_ROLLBACK" for event in state.events)
     assert not any(event.agent == "ARCHITECT" for event in state.events)
-    assert metrics(state)["raw_mutation_requests"] == 2
+    assert metrics(state)["raw_mutation_requests"] == 1
     assert metrics(state)["raw_mutation_oversized"] == 1
-    assert metrics(state)["mutation_decomposition_attempts"] == 1
+    assert metrics(state)["mutation_decomposition_attempts"] == 0
     assert metrics(state)["attempt_rollbacks_total"] == 0
     assert metrics(state)["semantic_retry_count"] == 0
 

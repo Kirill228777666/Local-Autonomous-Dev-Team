@@ -110,6 +110,10 @@ class RoleAgents:
         start_offset: int = 0,
         end_offset: int | None = None,
         read_context: str = "",
+        staged_prefix: str = "",
+        chunk_index: int = 1,
+        transport_chunk_tokens: int = 512,
+        max_transport_bytes: int = 6_000,
     ) -> AgentReply:
         """Ask for one independently bounded mutation, never a task-sized body."""
         mode = "existing" if existing else "new"
@@ -131,24 +135,37 @@ class RoleAgents:
         raw_mutation = False
         if representation == "raw_replacement":
             selected_end = end_offset if end_offset is not None else start_offset + len(current)
+            continuation_text = ""
+            if staged_prefix:
+                tail = staged_prefix[-2_000:]
+                continuation_text = (
+                    f"\nTRANSPORT CHUNK {chunk_index}: Continue the SAME replacement body immediately after the exact staged tail below. "
+                    "Do not restart, summarize, repeat the target region, or include metadata. "
+                    "If you repeat an exact tail prefix, it will be removed only when unambiguous.\n"
+                    f"ALREADY STAGED BYTE COUNT: {len(staged_prefix.encode('utf-8'))}\n"
+                    f"EXACT STAGED TAIL (read-only continuity context):\n{tail}\nEND EXACT STAGED TAIL\n"
+                )
             prompt = (
                 "This is the current file. Return ONLY the replacement text for the controller-selected WRITE SCOPE. "
                 "Do not repeat read-only context or rewrite the whole file. The entire response body is source "
                 "content: no JSON, markdown fences, prose, sentinels, or metadata. The controller owns the "
-                "target and rejects stale file/context versions. Keep the complete response within the byte limit.\n"
+                "target and rejects stale file/context versions. This response is one transport chunk; if the "
+                "provider stops at its output-token limit, continue the same replacement body in the next chunk.\n"
                 f"Controller-selected path: {path}\nController mutation request id: {marker}\n"
                 f"Controller expected file SHA-256: {expected_file_hash}\n"
                 f"Controller-selected range: [{start_offset}, {selected_end})\n"
-                f"Mutation intent: {intent}\nMaximum replacement payload: {max_patch_characters} UTF-8 bytes\n"
+                f"Mutation intent: {intent}\nTransport output-token limit per response: {transport_chunk_tokens}\n"
+                f"Maximum complete staged replacement: {max_patch_characters} UTF-8 bytes\n"
                 "READ-ONLY SURROUNDING CONTEXT (for understanding only; never return it):\n"
                 f"{read_context}\n"
                 "WRITE SCOPE (replace only this exact region):\n"
                 f"{current}\nEND WRITE SCOPE {marker}"
+                f"{continuation_text}"
             )
             raw_response = True
             raw_mutation = True
             system_prompt = "Return only literal replacement source text. No JSON or explanatory text."
-            token_budget = min(token_budget, max(128, max_patch_characters // 3))
+            token_budget = max(64, transport_chunk_tokens)
         elif representation == "json":
             prompt = (
                 "The previous text frame was ambiguous. Return one bounded JSON mutation object and nothing else. "
@@ -203,18 +220,18 @@ class RoleAgents:
             raise MutationFrameError("MALFORMED", "mutation response did not contain raw patch text")
         if raw_mutation:
             payload_bytes = len(raw.encode("utf-8"))
-            if reply.data.get("response_complete") is not True or reply.data.get("done_reason") == "length":
+            if reply.data.get("response_complete") is not True:
                 raise MutationFrameError(
-                    "OVERSIZED_RAW_MUTATION",
-                    "raw replacement generation did not finish within its output budget",
+                    "PROVIDER_RESPONSE_INCOMPLETE",
+                    "provider did not finish returning this raw mutation transport chunk",
                     raw_response=raw,
                     provider_attempt=int(reply.data.get("provider_attempt", 1)),
                     response_bytes=int(reply.data.get("response_bytes", payload_bytes)),
                 )
-            if payload_bytes > max_patch_characters:
+            if payload_bytes > max_transport_bytes:
                 raise MutationFrameError(
                     "OVERSIZED_RAW_MUTATION",
-                    f"raw replacement exceeded byte budget ({payload_bytes} > {max_patch_characters})",
+                    f"raw mutation transport chunk exceeded byte budget ({payload_bytes} > {max_transport_bytes})",
                     raw_response=raw,
                     provider_attempt=int(reply.data.get("provider_attempt", 1)),
                 )
@@ -226,6 +243,10 @@ class RoleAgents:
                 "content": raw,
                 "done": True,
                 "frame_status": "RAW_VALID",
+                "transport_status": "OUTPUT_LIMIT_REACHED" if reply.data.get("done_reason") == "length" else "COMPLETE",
+                "body_complete": reply.data.get("done_reason") != "length",
+                "response_complete": reply.data.get("response_complete") is True,
+                "done_reason": reply.data.get("done_reason"),
                 "request_id": marker,
                 "path": path,
                 "expected_file_hash": expected_file_hash,

@@ -23,6 +23,7 @@ from .environment import EnvironmentManager, FailureKind, classify_failure, vali
 from .git import GitError, GitRepository
 from .models import Heartbeat, ProjectState, Task, TaskStatus, ToolExecution, ToolExecutionStatus
 from .models import utc_now
+from .mutation import MutationStreamError, StagedMutationBody
 from .providers import LLMProvider, ProviderError, ProviderUnavailableError
 from .repair import FailureClass, RepairEvidencePacket, RepairMemory
 from .research import WebResearch
@@ -144,6 +145,10 @@ class AutonomousRunner:
         self.mutation_patch_budget = 48
         self.mutation_context_characters = 6_000
         self.mutation_payload_limit = 6_000
+        self.mutation_transport_chunk_bytes = 6_000
+        self.mutation_transport_chunk_tokens = 512
+        self.mutation_max_staged_bytes = 256_000
+        self.mutation_max_staged_chunks = 128
         self.mutation_decomposition_budget = 8
         # Scripted and third-party providers without a health endpoint return
         # immediately; a real Ollama-backed run can wait through a short restart.
@@ -975,14 +980,16 @@ class AutonomousRunner:
         pending_context_recoveries = 0
         context_recovery_budget = 2
         patch_limit = self.mutation_payload_limit
-        raw_cursor = 0
-        raw_chunk_mode = False
-        raw_scope_bytes = max(128, patch_limit // 2)
-        decomposition_attempts = 0
-        decomposition_pending = False
+        staged_body: StagedMutationBody | None = None
         recovery_reason = ""
-        representation = "framed"
-        fallback_requested = False
+        if exists:
+            _, initial_current = self.tools.file_snapshot_exact(path)
+        else:
+            initial_current = ""
+        # New files and large existing files enter the literal staged transport
+        # directly; no large source body is first generated as a single frame.
+        representation = "raw_replacement" if not exists or len(initial_current.encode("utf-8")) > patch_limit else "framed"
+        fallback_requested = representation == "raw_replacement"
         while continuation < self.mutation_patch_budget:
             exists = target.is_file()
             if exists:
@@ -993,23 +1000,44 @@ class AutonomousRunner:
                 )
             else:
                 expected_file_hash, full_current = hashlib.sha256(b"").hexdigest(), ""
-            if representation == "raw_replacement" and (raw_chunk_mode or len(full_current.encode("utf-8")) > patch_limit):
-                raw_chunk_mode = True
-                region_start = min(raw_cursor, len(full_current))
-                region_end = self._bounded_mutation_region_end(full_current, region_start, raw_scope_bytes)
-                if region_end <= region_start:
-                    region_end = min(len(full_current), region_start + patch_limit // 2)
-                current = full_current[region_start:region_end]
-            else:
-                region_start, region_end = 0, len(full_current)
-                current = full_current
+            region_start, region_end = 0, len(full_current)
+            current = full_current
+            if representation == "raw_replacement" and staged_body is not None:
+                if (
+                    staged_body.path != path
+                    or staged_body.expected_file_hash != expected_file_hash
+                    or staged_body.start_offset != region_start
+                    or staged_body.end_offset != region_end
+                    or staged_body.expected_slice != current
+                ):
+                    self._active_mutation_requests.pop(staged_body.request_id, None)
+                    self._mark(
+                        state, "CODER", "MUTATION_STREAM_STALE_DISCARDED",
+                        f"Discarded incomplete staged body for {path}; target changed during generation", task,
+                    )
+                    self._mark(state, "CODER", "MUTATION_STALE_CONTEXT", f"{path}: staged target hash changed while the provider was generating", task)
+                    self._record_mutation_diagnostic(
+                        state, request_id=staged_body.request_id, protocol_mode="staged_raw",
+                        path=path, expected_hash=staged_body.expected_file_hash,
+                        response="".join(staged_body.chunks), failure_type="STALE_MUTATION_CONTEXT",
+                        provider_attempt=staged_body.chunk_count, response_bytes=staged_body.total_bytes,
+                        outcome="STAGED_BODY_DISCARDED",
+                    )
+                    staged_body = None
+                    context_recoveries += 1
+                    pending_context_recoveries += 1
+                    if context_recoveries > context_recovery_budget:
+                        self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_EXHAUSTED", f"Context recovery budget exhausted for {path}", task)
+                        raise MutationProtocolExhaustedError("STALE_MUTATION_CONTEXT: staged mutation target kept changing")
+                    recovery_reason = "STALE_MUTATION_CONTEXT: the file changed before staged body completion. Restart against the newly supplied exact current target."
             context = current if representation == "raw_replacement" else self._mutation_context(full_current)
-            read_context = (
-                self._mutation_read_context(full_current, region_start, region_end)
-                if representation == "raw_replacement" and raw_chunk_mode
-                else ""
-            )
-            request_id = uuid4().hex[:16]
+            read_context = ""
+            if representation == "raw_replacement" and staged_body is not None:
+                request_id = staged_body.request_id
+                expected_file_hash = staged_body.expected_file_hash
+                region_start, region_end, current = staged_body.start_offset, staged_body.end_offset, staged_body.expected_slice
+            else:
+                request_id = uuid4().hex[:16]
             self._mark(state, "CODER", "MUTATION_PATCH_REQUEST", f"Requesting bounded patch {continuation + 1}/{self.mutation_patch_budget}: {path} (request_id={request_id}, file_sha256={expected_file_hash})", task)
             if representation == "raw_replacement":
                 self._mark(state, "CODER", "MUTATION_RAW_REPLACEMENT_REQUEST", f"Requesting raw replacement for controller-selected region: {path}; request_id={request_id}", task)
@@ -1027,12 +1055,16 @@ class AutonomousRunner:
                     continuation=continuation,
                     request_id=request_id,
                     expected_file_hash=expected_file_hash,
-                    max_patch_characters=patch_limit,
+                    max_patch_characters=(self.mutation_max_staged_bytes if representation == "raw_replacement" else patch_limit),
                     recovery_reason=recovery_reason,
                     representation=representation,
                     start_offset=region_start,
                     end_offset=region_end,
                     read_context=read_context,
+                    staged_prefix=staged_body.content if staged_body is not None else "",
+                    chunk_index=(staged_body.chunk_count + 1) if staged_body is not None else 1,
+                    transport_chunk_tokens=self.mutation_transport_chunk_tokens,
+                    max_transport_bytes=self.mutation_transport_chunk_bytes,
                 ).data
                 self._mark(state, "CODER", "LLM_RESPONSE", f"Coder mutation patch received: {path}", task)
                 if representation == "raw_replacement":
@@ -1051,6 +1083,88 @@ class AutonomousRunner:
                     raw_content = patch.get("content")
                     if not isinstance(raw_content, str):
                         raise MutationFrameError("MALFORMED", "raw replacement content is missing")
+                    if staged_body is None:
+                        staged_body = StagedMutationBody(
+                            request_id=request_id,
+                            path=path,
+                            expected_file_hash=expected_file_hash,
+                            start_offset=region_start,
+                            end_offset=region_end,
+                            expected_slice=current,
+                            max_bytes=self.mutation_max_staged_bytes,
+                            max_chunks=self.mutation_max_staged_chunks,
+                        )
+                    try:
+                        body_complete = staged_body.add_chunk(
+                            raw_content,
+                            response_complete=patch.get("response_complete") is True,
+                            done_reason=patch.get("done_reason") if isinstance(patch.get("done_reason"), str) else None,
+                        )
+                    except MutationStreamError as stream_error:
+                        self._record_mutation_diagnostic(
+                            state, request_id=request_id, protocol_mode="staged_raw", path=path,
+                            expected_hash=expected_file_hash, response=raw_content,
+                            failure_type=str(stream_error), provider_attempt=staged_body.chunk_count + 1,
+                            response_bytes=int(patch.get("response_bytes", len(raw_content.encode("utf-8")))),
+                            read_context_size=len(read_context.encode("utf-8")),
+                            write_scope_size=len(current.encode("utf-8")),
+                            payload_limit=self.mutation_transport_chunk_bytes,
+                            decomposition_level=staged_body.chunk_count,
+                            next_scope_size=0, outcome="STAGED_BODY_REJECTED",
+                        )
+                        self._mark(state, "CODER", "MUTATION_STREAM_FAILURE", f"{path}: {stream_error}", task)
+                        raise MutationProtocolExhaustedError(f"MUTATION_STREAM_{stream_error}") from stream_error
+                    self._mark(
+                        state, "CODER", "MUTATION_STREAM_CHUNK_STAGED",
+                        f"Staged mutation chunk {staged_body.chunk_count} for {path}; bytes={len(raw_content.encode('utf-8'))}; total={staged_body.total_bytes}; finish={patch.get('done_reason')}", task,
+                    )
+                    self._record_mutation_diagnostic(
+                        state, request_id=request_id, protocol_mode="staged_raw", path=path,
+                        expected_hash=expected_file_hash, response=raw_content,
+                        failure_type="MUTATION_CHUNK_STAGED", provider_attempt=staged_body.chunk_count,
+                        response_bytes=int(patch.get("response_bytes", len(raw_content.encode("utf-8")))),
+                        read_context_size=len(read_context.encode("utf-8")),
+                        write_scope_size=len(current.encode("utf-8")),
+                        payload_limit=self.mutation_transport_chunk_bytes,
+                        decomposition_level=staged_body.chunk_count,
+                        next_scope_size=staged_body.total_bytes,
+                        outcome="COMPLETE" if body_complete else "CONTINUE",
+                        details={
+                            "chunk_index": staged_body.chunk_count,
+                            "chunk_bytes": len(raw_content.encode("utf-8")),
+                            "total_staged_bytes": staged_body.total_bytes,
+                            "provider_finish_reason": patch.get("done_reason"),
+                            "join_outcome": staged_body.last_join_outcome,
+                            "target_hash": staged_body.expected_file_hash,
+                            "final_application_outcome": "PENDING" if body_complete else "STAGING",
+                        },
+                    )
+                    if not body_complete:
+                        self._mark(
+                            state, "CODER", "MUTATION_STREAM_CONTINUATION",
+                            f"Provider reached output limit for {path}; continuing staged body chunk {staged_body.chunk_count + 1}", task,
+                        )
+                        recovery_reason = "Continue the same staged replacement body; do not regenerate already staged content."
+                        continuation += 1
+                        continue
+                    raw_content = staged_body.content
+                    # Recheck controller-owned identity against the live target immediately before apply.
+                    current_hash, current_file = self.tools.file_snapshot_exact(path) if target.is_file() else (hashlib.sha256(b"").hexdigest(), "")
+                    if (
+                        current_hash != staged_body.expected_file_hash
+                        or current_file[staged_body.start_offset:staged_body.end_offset] != staged_body.expected_slice
+                    ):
+                        self._active_mutation_requests.pop(request_id, None)
+                        self._mark(state, "CODER", "MUTATION_STREAM_STALE_DISCARDED", f"Discarded completed staged body for {path}; target changed before atomic apply", task)
+                        self._mark(state, "CODER", "MUTATION_STALE_CONTEXT", f"{path}: file hash or exact target slice changed before staged application", task)
+                        staged_body = None
+                        context_recoveries += 1
+                        pending_context_recoveries += 1
+                        if context_recoveries > context_recovery_budget:
+                            raise MutationProtocolExhaustedError("STALE_MUTATION_CONTEXT: target changed before staged body application")
+                        recovery_reason = "STALE_MUTATION_CONTEXT: regenerate the complete replacement against the refreshed current target."
+                        continuation += 1
+                        continue
                     full_file_region = region_start == 0 and region_end == len(full_current)
                     if exists and full_file_region and len(current) >= 500 and len(raw_content) < len(current) * 0.5:
                         raise MutationFrameError(
@@ -1071,31 +1185,33 @@ class AutonomousRunner:
                         "replacement": raw_content,
                     })
                     self._active_mutation_requests.pop(request_id, None)
+                    self._record_mutation_diagnostic(
+                        state, request_id=request_id, protocol_mode="staged_raw", path=path,
+                        expected_hash=expected_file_hash, response="", failure_type="STAGED_MUTATION_APPLIED",
+                        provider_attempt=staged_body.chunk_count, response_bytes=staged_body.total_bytes,
+                        payload_limit=self.mutation_transport_chunk_bytes,
+                        outcome="ATOMIC_APPLICATION_SUCCEEDED",
+                        details={
+                            "chunk_index": staged_body.chunk_count,
+                            "total_staged_bytes": staged_body.total_bytes,
+                            "target_hash": expected_file_hash,
+                            "final_application_outcome": "APPLIED",
+                        },
+                    )
+                    self._mark(
+                        state, "CODER", "MUTATION_STREAM_COMPLETED",
+                        f"Completed staged replacement for {path}; chunks={staged_body.chunk_count}; total_bytes={staged_body.total_bytes}", task,
+                    )
                     operation = str(patch.get("operation", "replace"))
                     done = True
                     self._mark(state, "CODER", "MUTATION_RAW_REPLACEMENT_SUCCESS", f"Applied raw bounded replacement for {path}; request_id={request_id}", task)
                     self._mark(state, "CODER", "MUTATION_PATCH_APPLIED", f"Applied bounded raw replacement: {path}", task)
-                    if raw_chunk_mode:
-                        updated_hash = self.tools.file_snapshot_exact(path)[0]
-                        self._mark(
-                            state, "CODER", "MUTATION_SUBREGION_APPLIED",
-                            f"Applied controller-selected subregion {region_start}:{region_end} in {path}; request_id={request_id}; new_hash={updated_hash}", task,
-                        )
-                        if decomposition_pending:
-                            self._mark(
-                                state, "CODER", "MUTATION_DECOMPOSITION_SUCCESS",
-                                f"Smaller mutation scope applied for {path}; level={decomposition_attempts}; request_id={request_id}", task,
-                            )
-                            decomposition_pending = False
                     for _ in range(pending_context_recoveries):
                         self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_SUCCESS", f"Applied refreshed mutation context for {path}", task)
                     pending_context_recoveries = 0
                     failures = 0
+                    staged_body = None
                     continuation += 1
-                    if region_end < len(full_current):
-                        raw_cursor = region_start + len(raw_content)
-                        recovery_reason = "Continue with the next controller-selected exact file region; preserve its unrelated content."
-                        continue
                     return
                 operation = patch.get("operation")
                 content = patch.get("content")
@@ -1142,49 +1258,24 @@ class AutonomousRunner:
                 if error.classification == "OVERSIZED_RAW_MUTATION" and representation == "raw_replacement":
                     read_context_size = len(read_context.encode("utf-8"))
                     write_scope_size = len(current.encode("utf-8"))
-                    was_chunk_mode = raw_chunk_mode
-                    proposed_scope_bytes = (raw_scope_bytes if was_chunk_mode else write_scope_size) // 2
-                    next_scope_bytes = max(128, proposed_scope_bytes)
-                    outcome = "RESPLIT"
-                    if decomposition_attempts >= self.mutation_decomposition_budget or (was_chunk_mode and raw_scope_bytes <= 128):
-                        outcome = "DECOMPOSITION_EXHAUSTED"
                     self._mark(
                         state, "CODER", "MUTATION_RAW_REPLACEMENT_OVERSIZED",
-                        f"Discarded oversized raw response for {path}; request_id={request_id}; response_bytes={error.response_bytes}; limit={patch_limit}; read_context_bytes={read_context_size}; write_scope_bytes={write_scope_size}; level={decomposition_attempts}", task,
+                        f"Discarded oversized raw response for {path}; request_id={request_id}; response_bytes={error.response_bytes}; limit={self.mutation_transport_chunk_bytes}; read_context_bytes={read_context_size}; write_scope_bytes={write_scope_size}; staged_chunks={staged_body.chunk_count if staged_body else 0}", task,
                     )
                     self._record_mutation_diagnostic(
                         state, request_id=request_id, protocol_mode=representation, path=path,
                         expected_hash=expected_file_hash, response=error.raw_response,
                         failure_type=error.classification, provider_attempt=error.provider_attempt,
                         response_bytes=error.response_bytes, read_context_size=read_context_size,
-                        write_scope_size=write_scope_size, payload_limit=patch_limit,
-                        decomposition_level=decomposition_attempts, next_scope_size=next_scope_bytes,
-                        outcome=outcome,
+                        write_scope_size=write_scope_size, payload_limit=self.mutation_transport_chunk_bytes,
+                        decomposition_level=staged_body.chunk_count if staged_body else 0,
+                        next_scope_size=0, outcome="TRANSPORT_CHUNK_REJECTED",
                     )
-                    if outcome == "DECOMPOSITION_EXHAUSTED":
-                        self._mark(
-                            state, "CODER", "MUTATION_FRAME_FALLBACK_FAILURE",
-                            f"Adaptive raw mutation could not fit minimum safe scope for {path}; request_id={request_id}", task,
-                        )
-                        self._mark(
-                            state, "CODER", "MUTATION_DECOMPOSITION_EXHAUSTED",
-                            f"Mutation decomposition budget exhausted for {path}; minimum_scope_bytes={raw_scope_bytes}", task,
-                        )
-                        raise MutationProtocolExhaustedError("MUTATION_DECOMPOSITION_EXHAUSTED") from error
-                    decomposition_attempts += 1
-                    raw_scope_bytes = next_scope_bytes
-                    raw_chunk_mode = True
-                    raw_cursor = region_start if was_chunk_mode else 0
-                    # An oversized whole-file response starts from the first
-                    # subregion. An oversized subregion is retried from its
-                    # exact beginning at the smaller controller-owned width.
-                    decomposition_pending = True
-                    self._mark(
-                        state, "CODER", "MUTATION_DECOMPOSITION_ATTEMPT",
-                        f"Shrinking write scope for {path}; level={decomposition_attempts}; previous_scope_bytes={write_scope_size}; next_scope_bytes={raw_scope_bytes}; cursor={raw_cursor}", task,
-                    )
-                    continuation += 1
-                    continue
+                    if staged_body is not None:
+                        self._active_mutation_requests.pop(staged_body.request_id, None)
+                        staged_body = None
+                    self._mark(state, "CODER", "MUTATION_STREAM_FAILURE", f"Provider response exceeded the bounded transport chunk for {path}; file was not changed by this chunk", task)
+                    raise MutationProtocolExhaustedError("MUTATION_TRANSPORT_CHUNK_TOO_LARGE") from error
                 failures += 1
                 self._record_mutation_diagnostic(
                     state, request_id=request_id, protocol_mode=representation, path=path,
@@ -1199,7 +1290,6 @@ class AutonomousRunner:
                     # final transport is now literal bounded source text.
                     fallback_requested = True
                     representation = "raw_replacement"
-                    raw_chunk_mode = len(full_current.encode("utf-8")) > patch_limit
                     recovery_reason = str(error)[:300]
                     continuation += 1
                     self._mark(state, "CODER", "MUTATION_FRAME_FALLBACK", f"Switching once to controller-bounded raw replacement for {path}", task)
@@ -1244,7 +1334,6 @@ class AutonomousRunner:
                 )
                 exists = latest_exists
                 representation = "raw_replacement"
-                raw_chunk_mode = len(latest.encode("utf-8")) > patch_limit
                 fallback_requested = True
                 self._mark(state, "CODER", "MUTATION_CONTEXT_RECOVERY_ATTEMPT", f"Refreshing {path} and regenerating one bounded patch ({context_recoveries}/{context_recovery_budget})", task)
                 self._mark(state, "CODER", "MUTATION_CONTEXT_REFRESH", f"Refreshing patch context for {path}: {error}", task)
@@ -1313,48 +1402,6 @@ class AutonomousRunner:
                 )
         return None
 
-    @staticmethod
-    def _bounded_mutation_region_end(content: str, start: int, max_bytes: int) -> int:
-        """Select an exact controller-owned UTF-8 region, preferring line ends."""
-        if start >= len(content):
-            return len(content)
-        byte_count = 0
-        last_line_end = start
-        last_structural_end = start
-        line_start = start
-        for index in range(start, len(content)):
-            byte_count += len(content[index].encode("utf-8"))
-            if byte_count > max_bytes:
-                break
-            if content[index] == "\n":
-                last_line_end = index + 1
-                line = content[line_start:index].strip()
-                if not line or line.endswith(("}", ");", "]", "*/")):
-                    last_structural_end = index + 1
-                line_start = index + 1
-        if last_structural_end > start:
-            return last_structural_end
-        if last_line_end > start:
-            return last_line_end
-        byte_count = 0
-        end = start
-        for index in range(start, len(content)):
-            size = len(content[index].encode("utf-8"))
-            if byte_count + size > max_bytes:
-                break
-            byte_count += size
-            end = index + 1
-        return end
-
-    @staticmethod
-    def _mutation_read_context(content: str, start: int, end: int, radius: int = 1_200) -> str:
-        """Provide adjacent read-only source around the exact writable slice."""
-        before_start = max(0, start - radius)
-        after_end = min(len(content), end + radius)
-        before = content[before_start:start]
-        after = content[end:after_end]
-        return f"[before write range]\n{before}\n[after write range]\n{after}"
-
     def _mutation_context(self, current: str) -> str:
         if len(current) <= self.mutation_context_characters:
             return current
@@ -1378,6 +1425,7 @@ class AutonomousRunner:
         decomposition_level: int | None = None,
         next_scope_size: int | None = None,
         outcome: str | None = None,
+        details: dict[str, object] | None = None,
     ) -> None:
         """Persist bounded, local-only evidence for an unusable mutation reply."""
         response_payload_bytes = response.encode("utf-8", errors="replace")
@@ -1408,6 +1456,8 @@ class AutonomousRunner:
         ):
             if value is not None:
                 diagnostic[key] = value
+        if details:
+            diagnostic.update(details)
         state.mutation_diagnostics = state.mutation_diagnostics[-100:]
         self.store.save(state)
 
